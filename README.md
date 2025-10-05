@@ -21,7 +21,7 @@ This repository contains the complete codebase and manuscript for our research o
 
 ## Repository Structure
 
-```
+```python
 geoai_veg_map/
 ├── src/
 │   ├── data_prep/          # Data acquisition and preprocessing
@@ -38,8 +38,7 @@ geoai_veg_map/
 │   │   ├── cross_attn_fusion.py             # Cross-attention fusion module
 │   │   └── fusion.py                        # Alternative fusion strategies
 │   ├── training/           # Training scripts
-│   │   ├── multimodal_training.py           # Main training loop & ablation studies
-│   │   └── ddp_training.py                  # Distributed data parallel training
+│   │   └── multimodal_training.py           # Main training loop & ablation studies
 │   ├── evaluation/         # Evaluation and analysis
 │   │   ├── inference_eval.py                # Run inference on test set
 │   │   ├── manuscript_figures.py            # Generate publication figures
@@ -93,14 +92,14 @@ conda activate geoai_env
 
 The workflow requires four primary data sources:
 
-1. **UAV LiDAR** (ground truth): High-density point clouds (>300 pt/m^2) - *User must provide*
+1. **UAV LiDAR** (ground truth): High-density point clouds (>300 pt/m^2)
 2. **3DEP LiDAR** (sparse input): USGS airborne LiDAR from Microsoft Planetary Computer
 3. **NAIP Imagery** (optical): 4-band aerial imagery from Microsoft Planetary Computer
 4. **UAVSAR** (L-band SAR): Fully polarimetric SAR from Alaska Satellite Facility (requires EarthData login)
 
 **Study Areas** (as published):
-- Sedgwick Reserve & Midland School, Santa Barbara County, CA (35.5 km^2)
-- Volcan Mountain Wilderness Preserve, San Diego County, CA (1.97 km^2)
+- Sedgwick Reserve & Midland School, Santa Barbara County, CA
+- Volcan Mountain Wilderness Preserve, San Diego County, CA
 
 ## Reproducing Manuscript Results
 
@@ -164,8 +163,8 @@ python run_model_test.py
 ```
 
 Configuration options in the script:
-- `feature_dim`: Feature dimension (default: 512)
-- `up_ratio`: Upsampling ratio (default: 8)
+- `feature_dim`: Feature dimension (default: 256)
+- `up_ratio`: Upsampling ratio (default: 2)
 - `k`: KNN neighbors (default: 16)
 - `use_naip`, `use_uavsar`: Enable/disable modalities
 
@@ -186,7 +185,6 @@ This trains four models:
 **Expected Output:**
 - Trained model checkpoints in `models/checkpoints/`
 - Training logs with loss curves
-- Validation metrics tracked via WandB (if configured)
 
 ### Step 4: Evaluation
 
@@ -221,7 +219,6 @@ python src/evaluation/manuscript_figures.py \
 - Point cloud visualizations
 - Error distribution plots
 - Statistical comparison figures
-- Spatial error maps
 
 ### Computational Requirements
 
@@ -232,18 +229,16 @@ Training was performed using the following setup (from manuscript Table "Trainin
 - **Batch size**: 15 tiles per GPU (60 total)
 - **Epochs**: 100
 - **Training time**: ~7 hours per model variant
-- **Model selection**: Epoch with lowest validation loss
 
 ## Model Architecture
 
-The model uses a **Local-Global Point Attention Block (LG-PAB)** architecture that combines:
+The model is built around the **Local-Global Point Attention Block (LG-PAB)**, a computational unit that sequentially applies local k-NN attention, optional feature-guided upsampling, and global position-aware attention. The architecture includes:
 
-- **Local k-NN Multi-Head Attention**: Point Transformer layers for fine-scale structural patterns
-- **Global Flash Attention**: Position-aware attention across entire point clouds for long-range coherence
-- **Vision Transformer Encoders**: Separate ViT encoders for NAIP (optical) and UAVSAR (SAR) imagery
+- **LG-PAB Point Feature Extraction**: Captures fine-scale geometry and long-range spatial context from the sparse point cloud
+- **Vision Transformer Encoders**: Separate ViT encoders with temporal GRU aggregation for NAIP (optical) and UAVSAR (SAR) imagery
 - **Cross-Attention Fusion**: Multi-head cross-attention to fuse point features with image patch embeddings
-- **Temporal Aggregation**: Bidirectional GRU for handling multi-temporal image stacks (2-30 images per tile)
-- **MLP Coordinate Decoder**: Final refinement for upsampled point position predictions
+- **LG-PAB Expansion & Refinement**: Feature-guided upsampling (2×) followed by refinement to propagate context across the expanded point cloud
+- **MLP Coordinate Decoder**: Final per-point residual offsets for precise 3D position predictions
 
 The model operates directly on 3D point clouds (not rasters) and outputs enhanced point clouds with increased density and geometric accuracy.
 
@@ -268,7 +263,7 @@ If you use this code or methodology in your research, please cite:
 
 ## Authors
 
-- **Michael Marks** - Department of Geography, San Diego State University (mmarks0561@sdsu.edu) [![ORCID](https://img.shields.io/badge/ORCID-0009--0005--3782--9431-green)](https://orcid.org/0009-0005-3782-9431)
+- **Michael Marks** - Department of Geography, San Diego State University (mmarks0561@sdsu.edu / mmarks13@gmail.com) [![ORCID](https://img.shields.io/badge/ORCID-0009--0005--3782--9431-green)](https://orcid.org/0009-0005-3782-9431)
 - **Daniel Sousa** - Department of Geography, San Diego State University [![ORCID](https://img.shields.io/badge/ORCID-0000--0002--1632--1955-green)](https://orcid.org/0000-0002-1632-1955)
 - **Janet Franklin** - Department of Geography & Center for Open Geographical Sciences, San Diego State University [![ORCID](https://img.shields.io/badge/ORCID-0000--0003--0314--4598-green)](https://orcid.org/0000-0003-0314-4598)
 
@@ -282,5 +277,6 @@ This research utilized:
 - USGS 3D Elevation Program (3DEP) LiDAR data
 - USDA National Agriculture Imagery Program (NAIP) imagery via Microsoft Planetary Computer
 - NASA/JPL UAVSAR data from Alaska Satellite Facility
+- Compute resources from the Technology Infrastructure for Data Exploration (TIDE) at San Diego State University, supported by NSF OAC Award #2346701
 
 For questions or collaboration inquiries, please contact Michael Marks at mmarks0561@sdsu.edu.
