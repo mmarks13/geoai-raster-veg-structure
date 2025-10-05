@@ -13,3 +13,4 @@ data/*
 *.ipynb
 *.json
 *.log
+claude.md

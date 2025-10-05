@@ -279,4 +279,4 @@ This research utilized:
 - NASA/JPL UAVSAR data from Alaska Satellite Facility
 - Compute resources from the Technology Infrastructure for Data Exploration (TIDE) at San Diego State University, supported by NSF OAC Award #2346701
 
-For questions or collaboration inquiries, please contact Michael Marks at mmarks0561@sdsu.edu.
+For questions or collaboration inquiries, please contact Michael Marks at mmarks0561@sdsu.edu or mmarks13@gmail.com.
