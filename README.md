@@ -101,6 +101,16 @@ The workflow requires four primary data sources:
 - Sedgwick Reserve & Midland School, Santa Barbara County, CA
 - Volcan Mountain Wilderness Preserve, San Diego County, CA
 
+### Data Directory Structure
+
+See [data/README.md](data/README.md) for the complete data directory structure, including:
+- Expected directory layout and organization
+- Data provenance (which files are downloaded vs. generated vs. user-provided)
+- File format specifications and typical size ranges
+- Step-by-step instructions for reproducing each data product
+
+The repository includes the directory structure (`.gitkeep` files) but not the actual data files. Run the workflow scripts to populate the directories with data.
+
 ## Reproducing Manuscript Results
 
 Follow these steps to reproduce the published results:
@@ -124,7 +134,7 @@ This will:
 - Download 3DEP LiDAR from Planetary Computer
 - Create STAC catalogs for all datasets
 
-**Expected Output:** STAC catalogs in `data/stac/` with organized imagery and point cloud metadata
+**Expected Output:** STAC catalogs in `data/stac/` with organized imagery and point cloud metadata. See [data/README.md](data/README.md) for complete directory structure and file descriptions.
 
 ### Step 2: Data Preprocessing
 

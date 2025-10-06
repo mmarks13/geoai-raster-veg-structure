@@ -2,6 +2,7 @@
 
 ## 0. Documentation Map (Read These When Needed)
 - [README.md](README.md) - Project overview, repo structure, getting started, workflow
+- [data/README.md](data/README.md) - **Data directory structure** (complete layout, provenance, file formats, storage)
 - [src/README.md](src/README.md) - Source code organization, entry points
 - [scripts/README.md](scripts/README.md) - Data pipeline scripts (get_data.sh, process_data.sh)
 - [src/data_prep/README.md](src/data_prep/README.md) - STAC catalogs, tile generation, train/test splits
@@ -132,10 +133,14 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 - `run_*.py` - **Training entry points (root level)**
 
 ### NEVER Modify/Read
-- `data/` - Large datasets, checkpoints, STAC catalogs
+- `data/stac/` - STAC catalog files (downloaded)
+- `data/raw/` - Raw downloaded datasets
+- `data/processed/training_data_chunks/` - Intermediate HDF5 files
+- `data/output/checkpoints/*.pth` - Model checkpoint weights
+- `data/output/logs/` - Training logs (except for debugging)
 - `.cache/` - Cached intermediate results
-- `models/checkpoints/` - Saved model weights
-- `logs/` - Training logs
+
+**Exception:** `data/README.md` documents the structure and is safe to read.
 
 ### Legacy/Unused Code
 - `src/*/legacy/` - Superseded implementations
@@ -209,7 +214,9 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 ## 9. Git Workflow
 - **Main branch:** `cleanup` (current), not `main`
 - **Commit message format:** Standard descriptive commits
-- **Never commit:** `data/`, `*.pt`, `*.pth`, checkpoints, logs, `.cache/`
+- **Data directory:** Only `.gitkeep`, `README.md`, and critical config files (e.g., `test_val_polygons.geojson`) are tracked
+- **Never commit:** `*.pt`, `*.pth`, `*.las`, `*.laz`, `*.tif`, checkpoints, logs, STAC catalog contents, `.cache/`
+- **Granular .gitignore:** Uses extension-based patterns to allow structure while ignoring data files
 
 ## 10. Environment
 - **Python:** 3.11.11
@@ -243,7 +250,35 @@ run_ablation_study.py                 # Train all variants
 run_model_test.py                     # Train single model
 ```
 
-## 12. Common Issues & Fixes
+## 12. Data Directory Structure
+
+The `data/` directory contains all downloaded, processed, and generated data. See [data/README.md](data/README.md) for complete structure documentation.
+
+**Key locations:**
+- `data/stac/` - STAC catalogs (NAIP, UAVSAR, 3DEP, UAV LiDAR)
+- `data/raw/uavlidar/study_las/` - **USER-PROVIDED** UAV LiDAR ground truth (.las/.laz files)
+- `data/processed/model_data/` - Training-ready `.pt` files
+- `data/processed/test_val_polygons.geojson` - Spatial train/test split polygons (created in QGIS)
+- `data/output/checkpoints/` - Model checkpoints (best by val loss, per-epoch saves)
+- `data/output/cached_shards/` - Per-GPU data shards for DDP training
+
+**Typical storage requirements:**
+- STAC catalogs: <100 MB (metadata)
+- Raw UAVSAR: 500 MB - 10 GB (varies by area)
+- UAV LiDAR (user-provided): 10-100+ GB (varies by coverage)
+- Processed training tiles: 10-50 GB (depends on number of tiles)
+- Model checkpoints: 1-20 GB (depends on experiments)
+- Total: Highly variable, 50-850+ GB depending on study area and workflow
+
+**Git tracking:** Only structure (`.gitkeep`), documentation (`data/README.md`), and critical config files (`test_val_polygons.geojson`) are tracked. All data files are ignored to prevent repo bloat and merge conflicts.
+
+**Data provenance:**
+- **Downloaded:** NAIP (Planetary Computer), UAVSAR (ASF), 3DEP (Planetary Computer or pre-downloaded)
+- **User-provided:** UAV LiDAR ground truth in `data/raw/uavlidar/study_las/`
+- **Generated:** Training tiles, checkpoints, evaluation results
+- **Manual:** `test_val_polygons.geojson` (created in QGIS for spatial splits)
+
+## 13. Common Issues & Fixes
 
 ### CUDA OOM
 - Reduce `batch_size` in entry scripts (default: 15/GPU)
