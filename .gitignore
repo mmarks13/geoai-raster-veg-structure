@@ -7,8 +7,57 @@
 __pycache__/
 *.pyc.ipynb_checkpoints/
 
-# Ignore data files (adjust as needed)
-data/*
+# Data directory - granular ignore patterns for reproducibility
+# Allow directory structure and documentation
+!data/
+!data/README.md
+
+# Allow critical configuration files
+!data/processed/
+!data/processed/test_val_polygons.geojson
+!data/processed/tiles.geojson
+
+# Ignore all data files by extension
+data/**/*.pt
+data/**/*.pth
+data/**/*.h5
+data/**/*.hdf5
+data/**/*.las
+data/**/*.laz
+data/**/*.tif
+data/**/*.tiff
+data/**/*.zip
+data/**/*.tar
+data/**/*.gz
+data/**/*.nc
+data/**/*.npz
+data/**/*.npy
+data/**/*.pkl
+data/**/*.pickle
+
+# Ignore large output directories (but preserve .gitkeep)
+data/output/checkpoints/**/*
+!data/output/checkpoints/.gitkeep
+data/output/cached_shards/**/*
+!data/output/cached_shards/.gitkeep
+data/output/evaluation/**/*
+!data/output/evaluation/.gitkeep
+data/output/reports/**/*
+data/output/tensorboard_logs/**/*
+data/output/optuna_checkpoints/**/*
+data/output/logs/**/*
+!data/output/logs/.gitkeep
+data/stac/**/*
+!data/stac/.gitkeep
+data/raw/**/*
+!data/raw/.gitkeep
+!data/raw/uavsar/.gitkeep
+!data/raw/uavlidar/.gitkeep
+!data/raw/uavlidar/study_las/.gitkeep
+data/processed/training_data_chunks/**/*
+data/processed/model_data/**/*
+!data/processed/model_data/.gitkeep
+data/agg/**/*
 *vsix
 *.ipynb
 *.json
