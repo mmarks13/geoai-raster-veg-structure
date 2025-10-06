@@ -37,7 +37,7 @@ python src/data_prep/pointcloud_footprints_to_geojson.py
 # Combined script that handles splitting and precomputing in one step
 python src/data_prep/train_test_split_and_precompute.py \
     --pt-file data/processed/model_data/combined_training_data_v3.pt \
-    --geojson-file /home/jovyan/geoai_veg_map/data/processed/test_val_polygons.geojson \
+    --geojson-file /geoai_veg_map/data/processed/test_val_polygons.geojson \
     --output-dir data/processed/model_data \
     --min-uav-points 16000 \
     --min-dep-points 200 \
