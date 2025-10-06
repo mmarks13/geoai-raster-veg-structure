@@ -49,6 +49,9 @@ Trains a single model configuration with custom hyperparameters.
 **Batch Size:** 15 tiles per GPU (60 total)
 **Training Time:** ~7 hours per model
 **CUDA Version:** 12.4
+**Optimizer:** ScheduleFreeAdamW (base lr: 5e-4, weight-decay: 1e-4, no external scheduler)
+**Loss Function:** Density-aware Chamfer distance (α=4)
+**Evaluation Metric:** Standard Chamfer distance
 
 **Data:**
 - Input: `data/processed/model_data/precomputed_training_tiles_32bit.pt`

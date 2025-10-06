@@ -101,6 +101,10 @@ The workflow requires four primary data sources:
 - Sedgwick Reserve & Midland School, Santa Barbara County, CA
 - Volcan Mountain Wilderness Preserve, San Diego County, CA
 
+### UAV LiDAR Data Availability
+
+The high-density UAV LiDAR datasets collected for this study (Sedgwick-Midland: 71 ha, Volcan Mountain: 197 ha) are being prepared for publication on OpenTopography.org. Due to file size constraints (>10 GB limit for community contributions), we are working directly with OpenTopography to make these datasets publicly accessible. In the interim, the UAV LiDAR ground truth data may be obtained by contacting the corresponding author at mmarks0561@sdsu.edu or mmarks13@gmail.com.
+
 ### Data Directory Structure
 
 See [data/README.md](data/README.md) for the complete data directory structure, including:
@@ -236,6 +240,8 @@ Training was performed using the following setup (from manuscript Table "Trainin
 
 - **Hardware**: 4 x NVIDIA L40 (48 GB) GPUs
 - **Framework**: PyTorch DDP 2.5.1 (CUDA 12.4)
+- **Optimizer**: ScheduleFreeAdamW (base lr: 5e-4, no external scheduler)
+- **Loss**: Density-aware Chamfer distance (α=4 for meter-scale data)
 - **Batch size**: 15 tiles per GPU (60 total)
 - **Epochs**: 100
 - **Training time**: ~7 hours per model variant

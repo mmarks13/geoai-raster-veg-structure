@@ -97,7 +97,7 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 - **Entry points:** `run_ablation_study.py`, `run_model_test.py` (root level)
 - **Checkpoints:** Saved to `data/output/checkpoints/`, best model by validation loss
 - **Config:** `MultimodalModelConfig` dataclass in `src/models/multimodal_model.py`
-- **Tracking:** Not using Wandb/Tensorboard in published workflow
+- **Tracking:** Not using TensorBoard in published workflow
 - **Device:** Multi-GPU DDP with gradient accumulation, mixed precision (AMP)
 
 ### Data Loading
@@ -117,7 +117,8 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 - `k`: 16 (KNN neighbors for local attention)
 - `up_ratio`: 2 (upsampling ratio, not heavily used)
 - `batch_size`: 15 tiles per GPU (60 total on 4 GPUs)
-- `lr`: 7e-4 max with OneCycleLR scheduler
+- `optimizer`: ScheduleFreeAdamW (base lr: 5e-4, weight-decay: 1e-4, β₁,₂=(0.9,0.999); no external LR schedule)
+- `loss`: Density-aware Chamfer distance (α=4, adapted for meter-scale coordinates)
 - `epochs`: 100-400 depending on experiment
 
 ## 5. Project Structure & Critical Paths
@@ -193,7 +194,7 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 - **Tiles are NOT batched as [B, N, 3]** - use batch indexing tensors like PyTorch Geometric
 - **KNN graphs precomputed** - don't recompute during training (slow)
 - **Imagery dates don't align** - NAIP and UAVSAR have different acquisition dates
-- **Variable point counts** - dep: 1k-10k, uav: up to 20k (downsampled)
+- **Variable point counts** - dep: 1k-10k, uav: up to 50k (downsampled)
 
 ### Training
 - **Best model != final epoch** - save by validation loss, not epoch number
@@ -206,10 +207,14 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 - **Legacy params ignored** - num_lcl_heads, up_attn_hds kept for backward compatibility only
 - **Checkpoint loading selective** - can load specific layers via `layers_to_load` list
 
-### Metrics
-- **Primary metric:** Chamfer Distance (PyTorch3D GPU implementation)
+### Metrics & Coordinates
+- **Training loss:** Density-aware Chamfer distance (α=4, handles meter-scale coordinates)
+- **Evaluation metric:** Standard Chamfer distance (PyTorch3D GPU implementation)
 - **Direction:** Bidirectional nearest neighbor distance
-- **Units:** Meters (point clouds normalized but in metric scale)
+- **Critical:** Point clouds are in **meter-scale coordinates**, NOT normalized to unit cube
+  - x,y ∈ [-5, 5] meters (centered at tile center)
+  - z ∈ [0, tile_height] meters (min z = 0)
+  - This aids interpretability and alignment but requires α=4 (not α=1000) for density-aware loss to prevent gradient saturation
 
 ## 9. Git Workflow
 - **Main branch:** `cleanup` (current), not `main`
@@ -262,14 +267,6 @@ The `data/` directory contains all downloaded, processed, and generated data. Se
 - `data/output/checkpoints/` - Model checkpoints (best by val loss, per-epoch saves)
 - `data/output/cached_shards/` - Per-GPU data shards for DDP training
 
-**Typical storage requirements:**
-- STAC catalogs: <100 MB (metadata)
-- Raw UAVSAR: 500 MB - 10 GB (varies by area)
-- UAV LiDAR (user-provided): 10-100+ GB (varies by coverage)
-- Processed training tiles: 10-50 GB (depends on number of tiles)
-- Model checkpoints: 1-20 GB (depends on experiments)
-- Total: Highly variable, 50-850+ GB depending on study area and workflow
-
 **Git tracking:** Only structure (`.gitkeep`), documentation (`data/README.md`), and critical config files (`test_val_polygons.geojson`) are tracked. All data files are ignored to prevent repo bloat and merge conflicts.
 
 **Data provenance:**
@@ -280,22 +277,7 @@ The `data/` directory contains all downloaded, processed, and generated data. Se
 
 ## 13. Common Issues & Fixes
 
-### CUDA OOM
-- Reduce `batch_size` in entry scripts (default: 15/GPU)
-- Use gradient accumulation (already implemented)
-- Check for memory leaks in data loading
-
-### Slow Training
-- Verify KNN graphs are precomputed (in tile dict)
-- Check if reading from cached shards (`use_cached_shards=True`)
-- Monitor GPU utilization with `nvidia-smi`
-
 ### NaN Losses
 - Check normalization (points should be in [-5, 5] for x,y)
 - Verify no empty point clouds (should be filtered in preprocessing)
 - Reduce learning rate or check gradient clipping
-
-### DDP Hangs
-- Ensure all GPUs execute same number of iterations
-- Check for uneven data sharding
-- Verify network connectivity for multi-node (not used in published work)

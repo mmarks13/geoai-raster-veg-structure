@@ -6,8 +6,9 @@ Core utility functions for point cloud processing and metrics.
 
 - `chamfer_distance.py` - Point cloud reconstruction metric
   - GPU-accelerated Chamfer distance computation using PyTorch3D
-  - Bidirectional nearest neighbor distance between predicted and ground truth point clouds
-  - Primary evaluation metric used throughout training and evaluation
+  - **Training:** Density-aware variant (α=4) for meter-scale coordinates
+  - **Evaluation:** Standard bidirectional Chamfer distance
+  - Computes nearest neighbor distance between predicted and ground truth point clouds
 
 - `knn_graph_gpu.py` - GPU-accelerated KNN graph generation
   - Efficient k-nearest neighbor graph construction on GPU

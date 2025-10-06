@@ -62,4 +62,3 @@ data/agg/**/*
 *.ipynb
 *.json
 *.log
-claude.md
