@@ -1,13 +1,17 @@
 # Attention-Based Enhancement of Airborne LiDAR Across Vegetated Landscapes Using SAR and Optical Imagery Fusion
 
-![Graphical Abstract](manuscript/figures/Graphical_Abstract.png)
-
 [![Paper](https://img.shields.io/badge/Remote%20Sensing-Published-green)](https://www.mdpi.com/2072-4292/17/19/3278)
 [![DOI](https://img.shields.io/badge/DOI-10.3390%2Frs17193278-blue)](https://doi.org/10.3390/rs17193278)
 
+![Graphical Abstract](manuscript/figures/Graphical_Abstract.png)
+
 ## Overview
 
-This repository contains the complete codebase and manuscript for our research on enhancing sparse airborne LiDAR point clouds using deep learning and multi-modal sensor fusion. We introduce a novel framework built on **attention mechanisms—the same fundamental building blocks that power modern large language models**—to upsample sparse USGS 3DEP LiDAR (<22 pt/m^2) by fusing it with multi-temporal optical (NAIP) and L-band SAR (UAVSAR) imagery. The model uses attention to **learn structure directly from the point cloud itself** through a **Local-Global Point Attention Block (LG-PAB)** architecture that captures both fine-scale and long-range spatial patterns. By fusing LiDAR with multi-temporal imagery, our approach helps compensate for vegetation changes that occurred between surveys, extending the utility of historical LiDAR archives for ecological monitoring and land management.
+This repository contains the complete codebase and manuscript for enhancing sparse airborne LiDAR point clouds using deep learning and multi-modal sensor fusion.
+
+**Our Approach:** We introduce a framework built on **attention mechanisms—the same building blocks that power modern large language models**—to upsample sparse USGS 3DEP LiDAR (<22 pt/m²) by fusing it with multi-temporal optical (NAIP) and L-band SAR (UAVSAR) imagery.
+
+**How It Works:** The model learns structure directly from 3D point clouds through a novel **Local-Global Point Attention Block (LG-PAB)** architecture. To fuse imagery with LiDAR, we use **cross-attention**—the same mechanism originally developed for translating between languages—to effectively "translate" between optical/radar imagery and 3D geometry.
 
 **Key Findings:**
 - **Combining multiple data sources** (LiDAR + optical + radar) produces more accurate 3D vegetation maps than using LiDAR alone
@@ -15,13 +19,13 @@ This repository contains the complete codebase and manuscript for our research o
 - **Works directly on 3D point clouds**, preserving fine-scale vegetation structure rather than converting to 2D images
 
 **Novel Contributions:**
-- First application of attention mechanisms (transformer-inspired architecture) for direct LiDAR point cloud enhancement
+- First application of attention mechanisms (transformer-inspired architecture) for direct LiDAR point cloud enhancement in natural landscape
 - Multi-modal fusion of LiDAR, optical, and SAR data for vegetation structure reconstruction
 - Demonstrated effectiveness across fire-prone Southern California ecosystems
 
 ## Repository Structure
 
-```python
+```bash
 geoai_veg_map/
 ├── src/
 │   ├── data_prep/          # Data acquisition and preprocessing
