@@ -1,6 +1,17 @@
 # CLAUDE.md - Project Memory
 
-## 0. Documentation Map (Read These When Needed)
+## 0. CRITICAL: Sensitive Location Data
+
+**FORBIDDEN - Never access (contain true locations):**
+- `data/raw/forest_plot_data/forest_plot_sample.csv`
+- `scripts/reverse_transform_coordinates.py`
+- `.env`
+- `**/*_recovered.csv`
+
+**SAFE - Use for forest plot work:**
+- `data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv` (obfuscated coordinates, geometric properties preserved)
+
+## Documentation Map (Read These When Needed)
 - [README.md](README.md) - Project overview, repo structure, getting started, workflow
 - [data/README.md](data/README.md) - **Data directory structure** (complete layout, provenance, file formats, storage)
 - [src/README.md](src/README.md) - Source code organization, entry points

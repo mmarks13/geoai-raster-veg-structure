@@ -34,6 +34,17 @@ data/**/*.npz
 data/**/*.npy
 data/**/*.pkl
 data/**/*.pickle
+data/**/*.csv
+
+# Allow obfuscated forest plot data (safe to commit)
+!data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv
+
+# Ignore sensitive files
+.env
+.env.local
+**/*_recovered.csv
+data/raw/forest_plot_data/forest_plot_sample.csv
+scripts/reverse_transform_coordinates.py
 
 # Ignore large output directories (but preserve .gitkeep)
 data/output/checkpoints/**/*
@@ -62,3 +73,4 @@ data/agg/**/*
 *.ipynb
 *.json
 *.log
+data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv
