@@ -18,7 +18,7 @@ Transforms UTM coordinates deterministically to obfuscate sensitive locations wh
 python src/raster_mapping/transform_coordinates.py
 ```
 
-**Input:** `data/raw/forest_plot_data/forest_plot_sample.csv`  
+**Input:** `data/raw/forest_plot_data/forest_plot_sample.csv`
 **Output:** `data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv`
 
 ### `reverse_transform_coordinates.py`
@@ -32,7 +32,7 @@ Reverses the obfuscation to recover original UTM coordinates. Only use locally w
 python src/raster_mapping/reverse_transform_coordinates.py
 ```
 
-**Input:** `data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv`  
+**Input:** `data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv`
 **Output:** `data/raw/forest_plot_data/forest_plot_sample_recovered.csv` (NOT tracked in git)
 
 ### `plot_forest_plots.py`

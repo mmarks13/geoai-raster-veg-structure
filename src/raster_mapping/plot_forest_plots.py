@@ -31,7 +31,7 @@ except (ImportError, Exception) as e:
     print(f"Warning: contextily not available ({e}), will skip basemap")
 
 
-def create_plot_map(csv_path: Path, output_dir: Path, site_filter: str = None, 
+def create_plot_map(csv_path: Path, output_dir: Path, site_filter: str = None,
                     obfuscated: bool = True) -> None:
     """
     Create map visualization of forest plots.
@@ -126,7 +126,7 @@ def create_plot_map(csv_path: Path, output_dir: Path, site_filter: str = None,
             ('CartoDB Positron', lambda: ctx.add_basemap(ax, source=ctx.providers.CartoDB.Positron)),
             ('OpenStreetMap', lambda: ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik)),
         ]
-        
+
         for provider_name, add_func in providers_to_try:
             try:
                 add_func()
@@ -135,7 +135,7 @@ def create_plot_map(csv_path: Path, output_dir: Path, site_filter: str = None,
                 break
             except Exception as e:
                 print(f"Could not add {provider_name} basemap: {e}")
-        
+
         if not basemap_added:
             basemap_note = " (no basemap available)"
     else:
@@ -223,11 +223,11 @@ def create_plot_map(csv_path: Path, output_dir: Path, site_filter: str = None,
 def main():
     """Create forest plot maps from data."""
     repo_root = Path(__file__).parent.parent.parent
-    
+
     # Define file paths
     obfuscated_csv = repo_root / 'data' / 'processed' / 'forest_plot_data' / 'forest_plot_sample_obfuscated.csv'
     actual_csv = repo_root / 'data' / 'raw' / 'forest_plot_data' / 'forest_plot_sample.csv'
-    
+
     output_dir_obf = repo_root / 'temp' / 'forest_plots' / 'obfuscated'
     output_dir_actual = repo_root / 'temp' / 'forest_plots' / 'actual'
 
@@ -238,16 +238,16 @@ def main():
     print("=" * 80)
     print("OBFUSCATED DATA - Safe to share")
     print("=" * 80)
-    
+
     if obfuscated_csv.exists():
         # All sites together
         print("\n--- All Sites (Obfuscated) ---")
         create_plot_map(obfuscated_csv, output_dir_obf, site_filter=None, obfuscated=True)
-        
+
         # L and O sites together
         print("\n--- L and O Sites (Obfuscated) ---")
         create_plot_map(obfuscated_csv, output_dir_obf, site_filter='L,O', obfuscated=True)
-        
+
         # T site separately
         print("\n--- T Site (Obfuscated) ---")
         create_plot_map(obfuscated_csv, output_dir_obf, site_filter='T', obfuscated=True)
@@ -258,16 +258,16 @@ def main():
     print("\n" + "=" * 80)
     print("ACTUAL DATA - SENSITIVE - Do not share")
     print("=" * 80)
-    
+
     if actual_csv.exists():
         # All sites together
         print("\n--- All Sites (Actual) ---")
         create_plot_map(actual_csv, output_dir_actual, site_filter=None, obfuscated=False)
-        
+
         # L and O sites together
         print("\n--- L and O Sites (Actual) ---")
         create_plot_map(actual_csv, output_dir_actual, site_filter='L,O', obfuscated=False)
-        
+
         # T site separately
         print("\n--- T Site (Actual) ---")
         create_plot_map(actual_csv, output_dir_actual, site_filter='T', obfuscated=False)
