@@ -74,3 +74,6 @@ data/agg/**/*
 *.json
 *.log
 data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv
+CLAUDE.md
+temp/*
+.venv/*
