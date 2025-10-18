@@ -35,6 +35,10 @@ data/**/*.npy
 data/**/*.pkl
 data/**/*.pickle
 data/**/*.csv
+data/**/*.gpkg
+
+# Ignore forest plot filter configuration (contains site names)
+data/raw/forest_plot_data/site_filter.txt
 
 # Ignore sensitive files
 .env

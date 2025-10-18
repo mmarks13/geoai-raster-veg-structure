@@ -216,8 +216,8 @@ def main():
     """Create forest plot maps from data."""
     repo_root = Path(__file__).parent.parent.parent
 
-    # Define file path
-    csv_path = repo_root / 'data' / 'raw' / 'forest_plot_data' / 'forest_plot_sample.csv'
+    # Define file path (use processed data with filtered sites)
+    csv_path = repo_root / 'data' / 'processed' / 'forest_plot_data' / 'forest_plots_processed.csv'
     output_dir = repo_root / 'temp' / 'forest_plots'
 
     # Create output directory
@@ -225,6 +225,7 @@ def main():
 
     if not csv_path.exists():
         print(f"Error: Forest plot data not found at {csv_path}", file=sys.stderr)
+        print("Run src/raster_mapping/process_forest_plots.py first to generate the processed data")
         sys.exit(1)
 
     print("=" * 80)
@@ -235,13 +236,11 @@ def main():
     print("\n--- All Sites ---")
     create_plot_map(csv_path, output_dir, site_filter=None)
 
-    # L and O sites together
-    print("\n--- L and O Sites ---")
-    create_plot_map(csv_path, output_dir, site_filter='L,O')
-
-    # T site separately
-    print("\n--- T Site ---")
-    create_plot_map(csv_path, output_dir, site_filter='T')
+    # Individual sites
+    sites = ['TecuyaRidge', 'ReyesPeak', 'NorthBigBear', 'BluffMesa', 'Laguna']
+    for site in sites:
+        print(f"\n--- {site} ---")
+        create_plot_map(csv_path, output_dir, site_filter=site)
 
     print("\n" + "=" * 80)
     print("✓ Map generation complete")
