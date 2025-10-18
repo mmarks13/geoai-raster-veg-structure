@@ -1,16 +1,5 @@
 # CLAUDE.md - Project Memory
 
-## 0. CRITICAL: Sensitive Location Data
-
-**FORBIDDEN - Never access (contain true locations):**
-- `data/raw/forest_plot_data/forest_plot_sample.csv`
-- `src/raster_mapping/reverse_transform_coordinates.py`
-- `.env`
-- `**/*_recovered.csv`
-
-**SAFE - Use for forest plot work:**
-- `data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv` (obfuscated coordinates, geometric properties preserved)
-
 ## Documentation Map (Read These When Needed)
 - [README.md](README.md) - Project overview, repo structure, getting started, workflow
 - [data/README.md](data/README.md) - **Data directory structure** (complete layout, provenance, file formats, storage)
@@ -141,7 +130,7 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 - `src/training/` - Training loop (multimodal_training.py, ddp_training.py)
 - `src/evaluation/` - Inference, stats, figures
 - `src/utils/` - Chamfer distance, KNN graphs, point cloud utilities
-- `src/raster_mapping/` - Coordinate transformation utilities (forest plot obfuscation)
+- `src/raster_mapping/` - Forest plot visualization utilities
 - `scripts/` - **Shell scripts only** (get_data.sh, process_data.sh, compress_las_files.sh)
 - `manuscript/` - LaTeX source and figures
 - `run_*.py` - **Training entry points (root level)**
