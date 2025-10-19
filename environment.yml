@@ -457,14 +457,6 @@ dependencies:
   - torchaudio
   - torchvision
   - seaborn
-  # R and spatial packages for LidarForFuel integration
-  - r-base>=4.1
-  - r-lidr>=4.0
-  - r-remotes
-  - r-sf
-  - r-terra
-  - r-raster
-  - r-data.table
-  - r-future
-  - r-future.apply
+  # Note: R packages for LidarForFuel fuel metrics are now in a separate environment
+  # Use environment_r_fuel_metrics.yml for fuel metrics processing
 prefix: /home/jovyan/geoai_env

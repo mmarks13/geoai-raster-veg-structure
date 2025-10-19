@@ -247,12 +247,30 @@ python src/data_prep/process_uav_fuel_metrics.py --list_species
 - **Granular .gitignore:** Uses extension-based patterns to allow structure while ignoring data files
 
 ## 10. Environment
+
+### Main Environment (Python/ML Stack)
+- **Environment name:** `geoai_env`
+- **Environment file:** `environment.yml`
 - **Python:** 3.11.11
 - **PyTorch:** 2.5.1 (CUDA 12.4)
 - **Package manager:** Conda
-- **Environment file:** `environment.yml`
 - **Hardware (published):** 4× NVIDIA L40 (48GB)
 - **CUDA required:** 12.4 toolkit
+- **Usage:** Point cloud upsampling, model training, evaluation
+
+### R Environment (Fuel Metrics)
+- **Environment name:** `r_fuel_metrics`
+- **Environment file:** `environment_r_fuel_metrics.yml`
+- **R:** 4.5.1
+- **Key packages:** r-lidr, r-terra, r-sf, LidarForFuel (from GitHub)
+- **Usage:** Wildfire fuel hazard mapping via LidarForFuel
+- **Note:** Python wrapper automatically uses this environment via `conda run`
+
+**Why separate environments?**
+- Prevents R/Python package conflicts
+- Cleaner dependency management
+- Smaller, faster environment creation
+- R packages won't interfere with PyTorch/CUDA stack
 
 ## 11. Critical File Paths (Frequently Referenced)
 

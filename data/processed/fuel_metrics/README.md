@@ -31,16 +31,24 @@ Pretreated Point Cloud (.laz)
 
 ### Prerequisites
 
+**Note:** R packages are now in a separate conda environment (`r_fuel_metrics`) to avoid conflicts with the main Python environment.
+
 ```bash
-# 1. Install R and lidR packages (if not already in environment)
-conda install -c conda-forge r-base r-lidr r-remotes r-terra
+# 1. Create the R fuel metrics environment
+conda env create -f environment_r_fuel_metrics.yml
 
 # 2. Install LidarForFuel R package
+conda activate r_fuel_metrics
 R -e "remotes::install_github('oliviermartin7/lidarforfuel')"
 
 # 3. Verify installation
 Rscript scripts/r/run_pretreatment.R --help
+
+# 4. Return to main environment for Python work (optional)
+conda activate geoai_env
 ```
+
+The Python wrapper (`src/data_prep/lidarforfuel_wrapper.py`) automatically uses the `r_fuel_metrics` environment via `conda run`, so you don't need to manually activate it when running the fuel metrics pipeline from Python.
 
 ### Single File Processing
 

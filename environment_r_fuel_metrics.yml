@@ -1,0 +1,29 @@
+name: r_fuel_metrics
+channels:
+  - conda-forge
+dependencies:
+  # Core R (matching version from main environment)
+  - r-base=4.5.1
+
+  # Spatial packages for LidarForFuel
+  - r-lidr>=4.0
+  - r-terra
+  - r-sf
+  - r-raster
+
+  # Data manipulation and parallel processing
+  - r-data.table
+  - r-future
+  - r-future.apply
+
+  # Package management (for installing LidarForFuel from GitHub)
+  - r-remotes
+
+  # Minimal Python for wrapper compatibility
+  # This allows running Python scripts that call R via subprocess
+  - python=3.11
+  - pip
+
+  # Note: After creating this environment, install LidarForFuel with:
+  #   conda activate r_fuel_metrics
+  #   R -e "remotes::install_github('oliviermartin7/lidarforfuel')"

@@ -75,3 +75,6 @@ data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv
 CLAUDE.md
 temp/*
 .venv/*
+
+data/processed/dems/*
+data/processed/dem_outlines.geojson

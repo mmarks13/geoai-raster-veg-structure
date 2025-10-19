@@ -105,13 +105,31 @@ def get_default_traits() -> Tuple[float, float, float, float]:
     return (140.0, 591.0, 140.0, 591.0)
 
 
-def check_rscript_available() -> bool:
+def check_rscript_available(r_env_name: str = "r_fuel_metrics") -> bool:
     """
-    Check if Rscript is available in PATH.
+    Check if Rscript is available in the specified conda environment.
+
+    Args:
+        r_env_name: Name of the conda environment containing R (default: r_fuel_metrics)
 
     Returns:
         True if Rscript found, False otherwise
     """
+    try:
+        # First try conda run
+        result = subprocess.run(
+            ['conda', 'run', '-n', r_env_name, 'Rscript', '--version'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            logger.debug(f"Found Rscript in conda environment: {r_env_name}")
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Fallback to PATH (for backwards compatibility)
     try:
         result = subprocess.run(
             ['Rscript', '--version'],
@@ -119,9 +137,13 @@ def check_rscript_available() -> bool:
             text=True,
             timeout=5
         )
-        return result.returncode == 0
+        if result.returncode == 0:
+            logger.debug("Found Rscript in PATH")
+            return True
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+        pass
+
+    return False
 
 
 def run_pretreatment(
@@ -134,7 +156,8 @@ def run_pretreatment(
     h_strata_bush: float = 2.0,
     height_filter: float = 60.0,
     classify: bool = False,
-    timeout: int = 3600
+    timeout: int = 3600,
+    r_env_name: str = "r_fuel_metrics"
 ) -> None:
     """
     Run LidarForFuel fPCpretreatment on a LAS/LAZ file.
@@ -158,6 +181,7 @@ def run_pretreatment(
         height_filter: Maximum height (m) to retain (default: 60.0)
         classify: Whether to classify ground points (default: False)
         timeout: Maximum execution time in seconds (default: 3600)
+        r_env_name: Name of conda environment containing R (default: r_fuel_metrics)
 
     Raises:
         FileNotFoundError: If input file or Rscript not found
@@ -168,10 +192,12 @@ def run_pretreatment(
     if not input_las.exists():
         raise FileNotFoundError(f"Input LAS file not found: {input_las}")
 
-    if not check_rscript_available():
+    if not check_rscript_available(r_env_name):
         raise FileNotFoundError(
-            "Rscript not found in PATH. Please install R and ensure it's in your environment:\n"
-            "  conda install -c conda-forge r-base r-lidr r-remotes"
+            f"Rscript not found in conda environment '{r_env_name}'. Please ensure the environment exists:\n"
+            f"  conda env create -f environment_r_fuel_metrics.yml\n"
+            f"  conda activate {r_env_name}\n"
+            f"  R -e \"remotes::install_github('oliviermartin7/lidarforfuel')\""
         )
 
     if not PRETREAT_SCRIPT.exists():
@@ -180,9 +206,9 @@ def run_pretreatment(
     # Ensure output directory exists
     output_laz.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build command
+    # Build command (use conda run to execute in r_fuel_metrics environment)
     cmd = [
-        'Rscript',
+        'conda', 'run', '-n', r_env_name, 'Rscript',
         str(PRETREAT_SCRIPT),
         str(input_las),
         str(output_laz),
@@ -239,7 +265,8 @@ def run_fuel_metrics(
     height_cover: float = 2.0,
     threshold: float = 0.02,
     export_mode: str = "full",
-    timeout: int = 7200
+    timeout: int = 7200,
+    r_env_name: str = "r_fuel_metrics"
 ) -> None:
     """
     Run LidarForFuel fCBDprofile_fuelmetrics to compute fuel metrics.
@@ -257,6 +284,7 @@ def run_fuel_metrics(
         threshold: Bulk density threshold for strata detection (default: 0.02)
         export_mode: 'full' (173 bands) or 'summary' (23 bands) (default: 'full')
         timeout: Maximum execution time in seconds (default: 7200)
+        r_env_name: Name of conda environment containing R (default: r_fuel_metrics)
 
     Raises:
         FileNotFoundError: If input file or Rscript not found
@@ -267,8 +295,8 @@ def run_fuel_metrics(
     if not input_laz.exists():
         raise FileNotFoundError(f"Input LAZ file not found: {input_laz}")
 
-    if not check_rscript_available():
-        raise FileNotFoundError("Rscript not found in PATH")
+    if not check_rscript_available(r_env_name):
+        raise FileNotFoundError(f"Rscript not found in conda environment '{r_env_name}'")
 
     if not METRICS_SCRIPT.exists():
         raise FileNotFoundError(f"R metrics script not found: {METRICS_SCRIPT}")
@@ -279,9 +307,9 @@ def run_fuel_metrics(
     # Ensure output directory exists
     output_tif.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build command
+    # Build command (use conda run to execute in r_fuel_metrics environment)
     cmd = [
-        'Rscript',
+        'conda', 'run', '-n', r_env_name, 'Rscript',
         str(METRICS_SCRIPT),
         str(input_laz),
         str(output_tif),
