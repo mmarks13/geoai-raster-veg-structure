@@ -11,6 +11,7 @@
 - [src/evaluation/README.md](src/evaluation/README.md) - Inference, statistical tests, figure generation
 - [src/utils/README.md](src/utils/README.md) - Point cloud utilities, Chamfer distance, KNN graphs
 - [src/training/model_data_readme.md](src/training/model_data_readme.md) - **Data structure spec** (read before working with training data)
+- [data/processed/fuel_metrics/README.md](data/processed/fuel_metrics/README.md) - **Fuel metrics pipeline** (LidarForFuel integration, wildfire hazard mapping)
 
 ## 1. Project Overview
 Multi-modal LiDAR point cloud enhancement using attention mechanisms. Fuses sparse 3DEP LiDAR with NAIP optical and UAVSAR L-band SAR imagery to upsample vegetation structure. Published in Remote Sensing 2025.
@@ -49,6 +50,24 @@ python src/evaluation/RQ_test_v2.py --eval_data <eval_df.pt>
 
 # Generate manuscript figures
 python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
+```
+
+### Fuel Metrics (Wildfire Hazard Mapping)
+```bash
+# Single file (uses LidarForFuel R package via Python wrapper)
+python src/data_prep/process_uav_fuel_metrics.py \
+    --input data/raw/uavlidar/study_las/20241025_151528.las
+
+# Batch processing with species traits
+python src/data_prep/process_uav_fuel_metrics.py \
+    --input_dir data/raw/uavlidar/study_las \
+    --species "Mixed" \
+    --resolution 1.0
+
+# List available species/traits
+python src/data_prep/process_uav_fuel_metrics.py --list_species
+
+# See data/processed/fuel_metrics/README.md for complete documentation
 ```
 
 ## 3. Code Standards & Style
@@ -125,13 +144,15 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 ## 5. Project Structure & Critical Paths
 
 ### Key Directories
-- `src/data_prep/` - STAC downloads, tile generation, train/test split
+- `src/data_prep/` - STAC downloads, tile generation, train/test split, **fuel metrics pipeline**
 - `src/models/` - Model architecture (multimodal_model.py, encoders.py, cross_attn_fusion.py, fusion.py)
 - `src/training/` - Training loop (multimodal_training.py, ddp_training.py)
 - `src/evaluation/` - Inference, stats, figures
 - `src/utils/` - Chamfer distance, KNN graphs, point cloud utilities
 - `src/raster_mapping/` - Forest plot visualization utilities
 - `scripts/` - **Shell scripts only** (get_data.sh, process_data.sh, compress_las_files.sh)
+- `scripts/r/` - **R wrapper scripts** (run_pretreatment.R, run_fuel_metrics.R for LidarForFuel)
+- `data/processed/fuel_metrics/` - Wildfire fuel hazard mapping outputs (pretreated LAZ, 173-band rasters)
 - `manuscript/` - LaTeX source and figures
 - `run_*.py` - **Training entry points (root level)**
 
@@ -277,7 +298,57 @@ The `data/` directory contains all downloaded, processed, and generated data. Se
 - **Generated:** Training tiles, checkpoints, evaluation results
 - **Manual:** `test_val_polygons.geojson` (created in QGIS for spatial splits)
 
-## 13. Common Issues & Fixes
+## 13. Fuel Metrics Pipeline (LidarForFuel Integration)
+
+**Purpose:** Compute wildfire fuel hazard metrics from UAV LiDAR using physics-based Beer-Lambert inversion.
+
+**Key components:**
+- `src/data_prep/lidarforfuel_wrapper.py` - Python-R interface
+- `src/data_prep/process_uav_fuel_metrics.py` - Main orchestration script
+- `scripts/r/run_pretreatment.R` - R wrapper for fPCpretreatment (normalization + trait attribution)
+- `scripts/r/run_fuel_metrics.R` - R wrapper for fCBDprofile_fuelmetrics (bulk density profiles)
+- `data/processed/fuel_metrics/trait_lookup.csv` - LMA/WD values by species
+
+**Workflow:**
+1. **Pretreatment**: Normalize point cloud, add LMA (Leaf Mass Area) and WD (Wood Density) attributes
+2. **Fuel metrics**: Compute 173-band raster (23 summary metrics + 150 bulk density layers)
+
+**Outputs:**
+- Pretreated LAZ: `data/processed/fuel_metrics/volcan/pretreated/*.laz`
+- Fuel rasters: `data/processed/fuel_metrics/volcan/rasters/*.tif`
+
+**Key metrics:**
+- Canopy height, Canopy Base Height (CBH), Fuel Strata Gap (FSG)
+- Fuel loads (Canopy, Total, Midstorey, Surface)
+- Cover percentages (Canopy, Midstorey, Understory)
+- Vertical Complexity Index (VCI), entropy
+- Bulk density profile (150 vertical layers)
+
+**Trait values (default: Mixed woodland):**
+- LMA: 140 g/m² (canopy), 130 g/m² (understory <2m)
+- WD: 591 kg/m³ (canopy), 550 kg/m³ (understory)
+- Species-specific values in `trait_lookup.csv` (Coast live oak, Black oak, Ceanothus, Coulter pine, Incense cedar)
+
+**R package:** [LidarForFuel](https://github.com/oliviermartin7/LidarForFuel) (Martin-Ducup & Pimont 2024)
+
+**Documentation:** [data/processed/fuel_metrics/README.md](data/processed/fuel_metrics/README.md)
+
+**Installation:**
+```bash
+# R and packages
+conda install -c conda-forge r-base r-lidr r-remotes r-terra
+
+# LidarForFuel from GitHub
+R -e "remotes::install_github('oliviermartin7/lidarforfuel')"
+```
+
+**Critical notes:**
+- Requires R runtime (not pure Python)
+- Uses Beer-Lambert radiative transfer model (physics-based, not ML)
+- Complements existing point cloud metrics in `src/utils/point_cloud_utils.py`
+- Designed for wildfire hazard mapping, not point cloud upsampling
+
+## 14. Common Issues & Fixes
 
 ### NaN Losses
 - Check normalization (points should be in [-5, 5] for x,y)
