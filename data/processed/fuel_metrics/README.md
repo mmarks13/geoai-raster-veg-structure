@@ -1,93 +1,344 @@
-## Fuel Metrics Pipeline
+# Fuel Metrics Pipeline
 
-Fuel metrics computation from UAV LiDAR point clouds using the [LidarForFuel](https://github.com/oliviermartin7/LidarForFuel) R package. Generates comprehensive wildfire fuel characterization rasters including bulk density profiles, canopy structure, and standardized fuel layers.
+Complete workflow for processing UAV LiDAR point clouds into wildfire fuel hazard raster maps using the [LidarForFuel](https://github.com/oliviermartin7/LidarForFuel) R package. Generates comprehensive fuel characterization including bulk density profiles, canopy structure, and standardized fuel layers.
 
 ---
 
 ## Overview
 
-This pipeline integrates LidarForFuel into the Python-based workflow through thin R wrappers. It maintains parity with the published method (Martin-Ducup & Pimont, 2024) while minimizing re-implementation complexity.
+This pipeline integrates LidarForFuel into a Python-based workflow through thin R wrappers while maintaining parity with the published methods (Martin-Ducup & Pimont, 2024).
 
 **Workflow:**
 ```
-Raw UAV LiDAR (.las)
+Raw UAV LiDAR → Ground Classification + Tiling → Pretreatment → Fuel Metrics → Merge → Visualization
+```
+
+**Data Flow:**
+```
+input.las (unclassified point cloud)
     ↓
-[fPCpretreatment]  ← Normalization + Trait Attribution
+[PDAL: SMRF ground classification + tiling in single pass]
     ↓
-Pretreated Point Cloud (.laz)
+tiles/tile_*.laz (ground-classified tiles, 200m × 200m)
     ↓
-[fCBDprofile_fuelmetrics]  ← Beer-Lambert Inversion + Fuel Metrics
+[LidarForFuel: Pretreatment - fPCpretreatment]
     ↓
-173-Band Fuel Raster (.tif)
+pretreated/tile_*_pretreated.laz (normalized, with LMA/WD attributes)
+    ↓
+[LidarForFuel: Fuel Metrics - fCBDprofile_fuelmetrics]
+    ↓
+rasters/tile_*_fuel_metrics.tif (173 bands per tile)
+    ↓
+[GDAL Merge]
+    ↓
+merged/my_site_fuel_metrics_5m.tif (seamless mosaic)
+    ↓
+[Visualization]
+    ↓
+merged/my_site_visualization.png (6-panel figure)
 ```
 
 **Key Outputs:**
 - **23 summary metrics**: Canopy height, CBH, fuel loads, cover, vertical complexity
 - **150 bulk density layers**: Vertical distribution profile (1m resolution by default)
 
+**Note:** PDAL ground classification is enabled by default to handle unclassified UAV LiDAR. LidarForFuel's built-in classification has a bug where it checks for ground points before performing classification. Use `--no-pdal-classification` to disable if your data is already classified.
+
 ---
 
 ## Quick Start
 
-### Prerequisites
+### Single Command (Recommended)
 
-**Note:** R packages are now in a separate conda environment (`r_fuel_metrics`) to avoid conflicts with the main Python environment.
+Process any UAV LiDAR file with the main orchestrator script:
 
 ```bash
-# 1. Create the R fuel metrics environment
+bash scripts/fuel_metrics/run_fuel_metrics_pipeline.sh \
+  --input data/raw/uavlidar/my_site.las \
+  --output-name my_site \
+  --species "Mixed" \
+  --resolution 5.0 \
+  --tile-size 200 \
+  --parallel-jobs 6
+```
+
+This runs the complete pipeline automatically:
+1. Ground classification (SMRF filter)
+2. Tiling (200m × 200m chunks)
+3. Pretreatment (normalization + trait attribution)
+4. Fuel metrics computation (173-band rasters)
+5. Merge into seamless mosaic
+6. Generate visualization
+
+**Output:** `data/processed/fuel_metrics/my_site/` with organized subdirectories
+
+---
+
+## Installation
+
+### One-Time Setup
+
+1. **Create R environment:**
+```bash
 conda env create -f environment_r_fuel_metrics.yml
-
-# 2. Install LidarForFuel R package
-conda activate r_fuel_metrics
-R -e "remotes::install_github('oliviermartin7/lidarforfuel')"
-
-# 3. Verify installation
-Rscript scripts/r/run_pretreatment.R --help
-
-# 4. Return to main environment for Python work (optional)
-conda activate geoai_env
 ```
 
-The Python wrapper (`src/data_prep/lidarforfuel_wrapper.py`) automatically uses the `r_fuel_metrics` environment via `conda run`, so you don't need to manually activate it when running the fuel metrics pipeline from Python.
-
-### Single File Processing
-
+2. **Install LidarForFuel package:**
 ```bash
-# Using default trait values (Mixed woodland)
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input data/raw/uavlidar/study_las/20241025_151528.las
-
-# Specify species from trait lookup
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input data/raw/uavlidar/study_las/20241025_151528.las \
-    --species "Quercus agrifolia" \
-    --resolution 1.0
-
-# Export summary metrics only (23 bands instead of 173)
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input data/raw/uavlidar/study_las/20241025_151528.las \
-    --export_mode summary
+bash scripts/fuel_metrics/install_lidarforfuel.sh
 ```
 
-### Batch Processing
+This installs:
+- R base packages (lidR, terra, sf, remotes)
+- Rfast (CRAN)
+- VoxR (CRAN, auto-installed)
+- lidarforfuel (GitHub)
 
+3. **Verify installation:**
 ```bash
-# Process all LAS files in directory
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input_dir data/raw/uavlidar/study_las \
-    --pattern "*.las" \
-    --species "Mixed"
-
-# Test on first 3 files
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input_dir data/raw/uavlidar/study_las \
-    --max_files 3
+conda run -n r_fuel_metrics R -e "library(lidarforfuel); packageVersion('lidarforfuel')"
 ```
 
-### List Available Species
+The Python wrapper automatically uses the `r_fuel_metrics` environment via `conda run`, so you don't need to manually activate it.
+
+---
+
+## Step-by-Step Workflow
+
+### Step 1: Ground Classification + Tiling
+
+**Script:** `scripts/fuel_metrics/pdal/run_ground_classification_and_tiling.sh`
+
+**What it does:**
+- Classifies ground points using SMRF (Simple Morphological Filter)
+- Tiles point cloud into manageable chunks (default: 200m × 200m)
+- Saves ground-classified tiles with 1cm precision
+- **Single I/O pass** (no intermediate large temporary file)
+
+**Usage:**
+```bash
+bash scripts/fuel_metrics/pdal/run_ground_classification_and_tiling.sh \
+  data/raw/uavlidar/my_site.las \
+  data/processed/fuel_metrics/my_site/tiles \
+  200 \
+  10
+```
+
+**Parameters:**
+- `input_las`: Path to input LAS/LAZ file (classified or unclassified)
+- `output_tiles_dir`: Directory for output tiles
+- `tile_size`: Tile size in meters (default: 200)
+- `buffer`: Buffer overlap in meters (default: 10)
+
+**SMRF Parameters** (PDAL defaults):
+```json
+{
+  "type": "filters.smrf",
+  "cell": 1.0,
+  "slope": 0.15,
+  "threshold": 0.5,
+  "window": 18.0
+}
+```
+
+**Output:**
+- `tiles/tile_0_1cm.laz`, `tile_1_1cm.laz`, ... (ground-classified)
+- Expected tiles: ~75 for 200m spacing on 1.4km × 2.1km area
+
+---
+
+### Step 2: Pretreatment + Fuel Metrics (Batch)
+
+**Script:** `scripts/fuel_metrics/run_batch_fuel_metrics.sh`
+
+**What it does:**
+- Processes all tiles in parallel (default: 6 jobs)
+- For each tile:
+  1. **Pretreatment** (fPCpretreatment):
+     - Normalize height above ground
+     - Add LMA (Leaf Mass Area) attribute
+     - Add WD (Wood Density) attribute
+     - Filter by height (<60m)
+  2. **Fuel Metrics** (fCBDprofile_fuelmetrics):
+     - Compute 23 summary metrics
+     - Compute 150 bulk density layers
+     - Output 173-band GeoTIFF
+- Tracks progress via summary CSV
+- Per-tile logging for debugging
+
+**Usage:**
+```bash
+bash scripts/fuel_metrics/run_batch_fuel_metrics.sh \
+  data/processed/fuel_metrics/my_site/tiles \
+  data/processed/fuel_metrics/my_site \
+  "Mixed" \
+  5.0 \
+  6
+```
+
+**Parameters:**
+- `tiles_dir`: Directory containing tile LAZ files
+- `output_base_dir`: Base output directory
+- `species`: Species name for trait lookup (see below)
+- `resolution`: Output raster resolution in meters (default: 5.0)
+- `parallel_jobs`: Number of parallel jobs (default: 6)
+- `clumping`: Clumping factor Ω for Beer-Lambert model (default: 0.77)
+- `projection_factor`: Projection factor G for fuel metrics (default: 0.5)
+
+**Species Trait Values (TRY Database, Updated 2025-10-31):**
+
+| Species | LMA (canopy) | WD (canopy) | LMA (understory) | WD (understory) | Source |
+|---------|--------------|-------------|------------------|-----------------|--------|
+| Mixed | 182 g/m² | 600 kg/m³ | 130 g/m² | 550 kg/m³ | TRY mean |
+| Quercus agrifolia | 182 g/m² | 643 kg/m³ | 182 g/m² | 550 kg/m³ | TRY (n=19) |
+| Quercus kelloggii | 109 g/m² | 580 kg/m³ | 109 g/m² | 550 kg/m³ | TRY (n=8) |
+| Ceanothus palmeri | 130 g/m² | 550 kg/m³ | 130 g/m² | 550 kg/m³ | Literature |
+| Pinus coulteri | 282 g/m² | 381 kg/m³ | 130 g/m² | 550 kg/m³ | TRY (n=11) |
+| Pinus jeffreyi | 282 g/m² | 381 kg/m³ | 130 g/m² | 550 kg/m³ | TRY (n=11) |
+| Calocedrus decurrens | 282 g/m² | 434 kg/m³ | 130 g/m² | 550 kg/m³ | TRY/Pinus proxy |
+| Eriogonum fasciculatum | 115 g/m² | 625 kg/m³ | 115 g/m² | 625 kg/m³ | TRY (n=17) |
+
+**Trait Value Sources:**
+- **TRY Plant Trait Database** (https://www.try-db.org): Primary source for California species
+- **LMA conversions**: SLA ↔ LMA using standard leaf area/mass relationship
+- **Wood Density**: TRY database where available, literature where needed
+
+**Monitoring Progress:**
+```bash
+# Watch summary CSV (updates every 5 seconds)
+watch -n 5 'tail -10 data/processed/fuel_metrics/my_site/logs/tile_processing_summary.csv'
+
+# Check individual tile log
+tail -f data/processed/fuel_metrics/my_site/logs/tile_0_1cm.log
+```
+
+**Output:**
+- `pretreated/tile_*_pretreated.laz` (normalized LAZ with traits)
+- `rasters/tile_*_fuel_metrics.tif` (173 bands per tile)
+- `logs/tile_processing_summary.csv` (success/failure tracking)
+- `logs/tile_*.log` (per-tile processing logs)
+
+---
+
+### Step 3: Merge Tiles into Seamless Mosaic
+
+**Tool:** GDAL `gdal_merge.py`
+
+**What it does:**
+- Mosaics all tile rasters into single seamless GeoTIFF
+- Preserves all 173 bands
+- Applies LZW compression and tiled layout
+- **CRITICAL:** Uses explicit file list (not wildcards) to avoid data loss
+
+**Usage (Recommended with --optfile):**
+```bash
+find data/processed/fuel_metrics/my_site/rasters -name "*.tif" | sort > /tmp/tiles.txt
+
+conda run -p /home/jovyan/geoai_env gdal_merge.py \
+  -o data/processed/fuel_metrics/my_site/merged/my_site_fuel_metrics_5m.tif \
+  -a_nodata nan \
+  -co COMPRESS=LZW \
+  -co TILED=YES \
+  -co BIGTIFF=YES \
+  --optfile /tmp/tiles.txt
+```
+
+**Critical Flags:**
+- `-a_nodata nan`: Set output nodata value to NaN
+- **DO NOT use `-n nan`**: This ignores all NaN pixels from input (causes data loss)
+- `-co COMPRESS=LZW`: LZW compression
+- `-co TILED=YES`: Tiled layout for faster access
+- `-co BIGTIFF=YES`: Support files >4GB
+- `--optfile`: Read file list from text file (avoids shell glob expansion issues)
+
+**⚠️ Common Pitfall:**
+```bash
+# ❌ WRONG (loses ~60% of data with 70+ tiles):
+gdal_merge.py -o output.tif rasters/tile_*_fuel_metrics.tif
+
+# ✓ CORRECT (preserves all data):
+gdal_merge.py -o output.tif --optfile <(find rasters -name "*.tif" | sort)
+```
+
+Why: Shell glob expansion has file count limits. With 70+ tiles, only first ~28-30 files match. No error message—silently loses entire regions.
+
+**Output:**
+- `merged/my_site_fuel_metrics_5m.tif` (173 bands, seamless mosaic)
+
+---
+
+### Step 4: Visualization
+
+**Script:** `src/fuel_metrics/visualize_metrics.py`
+
+**Usage:**
+```bash
+conda run -p /home/jovyan/geoai_env python src/fuel_metrics/visualize_metrics.py \
+  data/processed/fuel_metrics/my_site/merged/my_site_fuel_metrics_5m.tif \
+  data/processed/fuel_metrics/my_site/merged/my_site_visualization.png
+```
+
+**Output Panels:**
+1. Canopy Height (H)
+2. Canopy Base Height (CBH)
+3. Fuel Strata Gap (FSG)
+4. Canopy Fuel Load
+5. Total Fuel Load
+6. Vertical Complexity Index (VCI)
+
+---
+
+## Complete Pipeline Example
+
+### Method 1: Single Command (Recommended)
 
 ```bash
-python src/data_prep/process_uav_fuel_metrics.py --list_species
+bash scripts/fuel_metrics/run_fuel_metrics_pipeline.sh \
+  --input data/raw/uavlidar/volcan_mountain.las \
+  --output-name volcan_mountain \
+  --species "Mixed" \
+  --resolution 5.0 \
+  --tile-size 200 \
+  --parallel-jobs 6 \
+  --clumping 0.77 \
+  --projection-factor 0.5
+```
+
+### Method 2: Individual Steps
+
+```bash
+# 1. Ground classification + tiling (single pass)
+bash scripts/fuel_metrics/pdal/run_ground_classification_and_tiling.sh \
+  data/raw/uavlidar/volcan_mountain.las \
+  data/processed/fuel_metrics/volcan_mountain/tiles \
+  200 \
+  10
+
+# 2. Batch pretreatment + fuel metrics
+bash scripts/fuel_metrics/run_batch_fuel_metrics.sh \
+  data/processed/fuel_metrics/volcan_mountain/tiles \
+  data/processed/fuel_metrics/volcan_mountain \
+  "Mixed" \
+  5.0 \
+  6 \
+  0.77 \
+  0.5
+
+# 3. Merge tiles (after all tiles complete)
+find data/processed/fuel_metrics/volcan_mountain/rasters -name "*.tif" | sort > /tmp/tiles.txt
+
+conda run -p /home/jovyan/geoai_env gdal_merge.py \
+  -o data/processed/fuel_metrics/volcan_mountain/merged/volcan_mountain_fuel_metrics_5m.tif \
+  -a_nodata nan \
+  -co COMPRESS=LZW \
+  -co TILED=YES \
+  -co BIGTIFF=YES \
+  --optfile /tmp/tiles.txt
+
+# 4. Generate visualization
+conda run -p /home/jovyan/geoai_env python src/fuel_metrics/visualize_metrics.py \
+  data/processed/fuel_metrics/volcan_mountain/merged/volcan_mountain_fuel_metrics_5m.tif \
+  data/processed/fuel_metrics/volcan_mountain/merged/volcan_mountain_visualization.png
 ```
 
 ---
@@ -96,70 +347,24 @@ python src/data_prep/process_uav_fuel_metrics.py --list_species
 
 ```
 data/processed/fuel_metrics/
-├── README.md                    # This file
-├── trait_lookup.csv             # LMA/WD values by species
-├── volcan/                      # Volcan Mountain outputs
-│   ├── pretreated/              # Intermediate: pretreated LAZ files
-│   │   └── 20241025_151528_pretreated.laz
-│   └── rasters/                 # Final: fuel metrics GeoTIFFs
-│       └── 20241025_151528_fuel_metrics.tif  (173 bands)
-└── [site_name]/                 # Additional sites
-    ├── pretreated/
-    └── rasters/
+├── README.md                       # This file
+├── TRAIT_VALUE_RESOURCES.md        # Database references for updating traits
+├── trait_lookup.csv                # LMA/WD values by species
+├── volcan_mtn/                     # Example site outputs
+│   ├── tiles/                      # Ground-classified LAZ tiles
+│   ├── pretreated/                 # Intermediate: pretreated LAZ files
+│   ├── rasters/                    # Final: fuel metrics GeoTIFFs (173 bands)
+│   ├── merged/                     # Seamless mosaic + visualization
+│   ├── logs/                       # Processing logs + summary CSV
+│   └── validation/                 # Spatial validation checks
+└── [site_name]/                    # Additional sites follow same structure
 ```
 
 ---
 
-## Trait Lookup Table
-
-The `trait_lookup.csv` file defines Leaf Mass Area (LMA) and Wood Density (WD) values for different vegetation types. These traits are critical for converting Plant Area Density (PAD) to bulk density.
-
-**Species included:**
-- **Quercus agrifolia** (Coast live oak): LMA 150, WD 750
-- **Quercus kelloggii** (California black oak): LMA 100, WD 650
-- **Ceanothus spp.** (Ceanothus chaparral): LMA 130, WD 550
-- **Pinus coulteri** (Coulter pine): LMA 180, WD 450
-- **Calocedrus decurrens** (Incense cedar): LMA 140, WD 384
-- **Mixed** woodland: LMA 140, WD 591 (recommended default)
-
-**Trait sources:**
-- Mediterranean sclerophyll literature (evergreen oaks)
-- USFS Silvics Manual (incense cedar)
-- Chaparral fire ecology literature
-- LidarForFuel package defaults
-
-### Adding Custom Species
-
-Edit `trait_lookup.csv`:
-
-```csv
-species,common_name,lma_gm2,wd_kgm3,lma_understory_gm2,wd_understory_kgm3,notes,references
-Pinus ponderosa,Ponderosa pine,150,420,130,550,Moderate LMA; WD from global database,Wood density database
-```
-
-**Guidelines:**
-- **LMA (Leaf Mass Area)**: g/m² (typical range: 50-250)
-  - Evergreen sclerophylls: 120-180
-  - Deciduous broadleaf: 60-120
-  - Conifers: 120-200
-- **WD (Wood Density)**: kg/m³ (typical range: 300-800)
-  - Softwoods (pines, cedars): 350-500
-  - Hardwoods (oaks): 600-800
-  - Shrubs: 450-650
-- **Understory values**: Often lower LMA, similar/higher WD
-
-**Resources:**
-- [TRY Plant Trait Database](https://www.try-db.org)
-- [Global Wood Density Database](https://doi.org/10.5061/dryad.234)
-- Published trait studies for your region
-
----
-
-## Output Raster Bands
+## Output Reference
 
 ### Summary Metrics (Bands 1-23)
-
-LidarForFuel produces 23 summary fuel metrics (always included):
 
 | Band | Name | Description | Units |
 |------|------|-------------|-------|
@@ -198,9 +403,8 @@ LidarForFuel produces 23 summary fuel metrics (always included):
 
 **Units**: kg/m³ (kilograms of vegetation per cubic meter)
 
-### Profile Types
+### Profile Types (Band 2: Profil_Type_L)
 
-**Profil_Type_L** (Band 2) classifies vertical structure:
 - **A**: Surface fuel only (no canopy)
 - **B**: Canopy only (no surface fuel)
 - **C**: Canopy + surface, with gap (discontinuous)
@@ -208,11 +412,75 @@ LidarForFuel produces 23 summary fuel metrics (always included):
 
 ---
 
+## Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Tile size | 200m | Grid spacing for tiling |
+| Buffer | 10m | Overlap between adjacent tiles |
+| Species | Mixed | Species trait lookup |
+| Resolution | 5.0m | Output raster pixel size |
+| Clumping (Ω) | 0.77 | Clumping factor for Beer-Lambert model |
+| Projection factor (G) | 0.5 | Projection factor for fuel metrics |
+| Export mode | summary | Output format (summary=23 bands, full=173 bands) |
+| Parallel jobs | 6 | Concurrent tile processing jobs |
+| Height filter | 60m | Maximum vegetation height to retain |
+| Understory threshold | 2m | Height threshold for understory traits |
+
+---
+
+## Trait Values & Customization
+
+### Where Trait Values Come From
+
+Trait values (LMA and WD) are critical parameters that determine how the Beer-Lambert inversion converts Plant Area Density (PAD) to fuel mass density (CBD). They come from:
+
+1. **TRY Plant Trait Database** (https://www.try-db.org)
+   - Primary source for California species
+   - Provides species-specific LMA and wood density measurements
+   - Sample sizes documented in trait table above
+
+2. **Global Wood Density Database** (https://doi.org/10.5061/dryad.234)
+   - Zanne et al. (2009) compilation of wood density measurements
+
+3. **Literature estimates**
+   - Used for species/regions with limited TRY data
+   - References documented in trait_lookup.csv
+
+### How to Customize Trait Values
+
+Edit `trait_lookup.csv`:
+
+```csv
+species,common_name,lma_gm2,wd_kgm3,lma_understory_gm2,wd_understory_kgm3,lma_source,wd_source,data_quality,notes
+Pinus ponderosa,Ponderosa pine,150,420,130,550,TRY study,Wood density database,High,Moderate LMA
+```
+
+**Guidelines:**
+- **LMA (Leaf Mass Area)**: g/m² (typical range: 50-250)
+  - Evergreen sclerophylls: 120-180
+  - Deciduous broadleaf: 60-120
+  - Conifers: 120-200
+- **WD (Wood Density)**: kg/m³ (typical range: 300-800)
+  - Softwoods (pines, cedars): 350-500
+  - Hardwoods (oaks): 600-800
+  - Shrubs: 450-650
+- **Understory values**: Often lower LMA, similar/higher WD
+
+### External Resources
+
+- **TRY Plant Trait Database**: https://www.try-db.org (requires registration for data access)
+- **Global Wood Density Database**: Zanne et al. (2009) doi:10.5061/dryad.234
+- **USFS Silvics Manual**: https://www.srs.fs.usda.gov/pubs/misc/ag_654/
+- See TRAIT_VALUE_RESOURCES.md for detailed database access instructions
+
+---
+
 ## Methodology
 
 LidarForFuel uses a physics-based approach to derive fuel metrics from LiDAR:
 
-### 1. Pretreatment (`fPCpretreatment`)
+### Pretreatment (fPCpretreatment)
 
 **Normalization:**
 - Height above ground (HAG) computed via DTM subtraction
@@ -220,20 +488,18 @@ LidarForFuel uses a physics-based approach to derive fuel metrics from LiDAR:
 - Height filtering (retain points <60m by default)
 
 **Trait Attribution:**
-- LMA and WD assigned to each point via:
-  - **Constant values** (current implementation): Lookup table by species
-  - **Raster maps** (future): Spatial intersection with species/trait maps
+- LMA and WD assigned to each point via lookup table by species
 - Understory (<2m) can have different traits than canopy
 
 **Outputs:**
 - Normalized point cloud with attributes: `LMA`, `WD`, `Zref`, `Easting`, `Northing`, `Elevation`
 
-### 2. Fuel Metrics Computation (`fCBDprofile_fuelmetrics`)
+### Fuel Metrics Computation (fCBDprofile_fuelmetrics)
 
 **Beer-Lambert Inversion:**
 - **Plant Area Density (PAD)**: Estimated from point density using radiative transfer model
 - Formula: `PAD(z) = -ln(P_gap(z)) / ΔZ`, where `P_gap` is gap probability
-- Accounts for scanning angle, clumping (ω=0.77), and extinction (G=0.5)
+- Accounts for scanning angle, clumping (ω, default 0.77), and extinction (G, default 0.5)
 
 **Bulk Density Conversion:**
 - `CBD(z) = PAD(z) × LMA / 2`
@@ -252,198 +518,105 @@ LidarForFuel uses a physics-based approach to derive fuel metrics from LiDAR:
 
 ---
 
-## Performance & Scalability
-
-### Resource Requirements
-
-**Memory:**
-- R/lidR is RAM-intensive for large point clouds
-- Estimate: 8-16 GB per parallel worker
-- Volcan Mountain full dataset (~36 GB compressed): 64-128 GB recommended
-
-**Runtime (single file, ~1M points):**
-- Pretreatment: 30-90 seconds
-- Fuel metrics (1m resolution): 2-5 minutes
-- **Total**: ~3-6 minutes per file
-
-**Disk:**
-- Pretreated LAZ: ~same size as input (compression efficient)
-- Fuel metrics GeoTIFF: 50-200 MB per file (full 173 bands, LZW compressed)
-- Summary mode (23 bands): ~10-30 MB
-
-### Scaling Strategies
-
-**For large datasets:**
-
-1. **Batch processing** (current implementation):
-   ```bash
-   python src/data_prep/process_uav_fuel_metrics.py \
-       --input_dir data/raw/uavlidar/study_las \
-       --pattern "*.las"
-   ```
-
-2. **LAScatalog** (future enhancement):
-   - Process tiled point clouds in parallel via lidR
-   - Automatic chunking and stitching
-   - Requires R script modification
-
-3. **Cleanup intermediate files**:
-   ```bash
-   python src/data_prep/process_uav_fuel_metrics.py \
-       --input file.las \
-       --cleanup  # Deletes pretreated LAZ after metrics computation
-   ```
-
-4. **Summary mode** (reduce output size):
-   ```bash
-   python src/data_prep/process_uav_fuel_metrics.py \
-       --input file.las \
-       --export_mode summary  # Only 23 bands
-   ```
-
----
-
-## Parameter Tuning
-
-### Resolution Trade-offs
-
-| Resolution | Detail | File Size | Runtime | Use Case |
-|------------|--------|-----------|---------|----------|
-| 0.5 m | Very high | Large | Slow | Individual tree analysis |
-| 1.0 m | High (default) | Moderate | Moderate | Stand-level fuel mapping |
-| 2.0 m | Moderate | Small | Fast | Landscape-scale assessment |
-| 5.0 m | Coarse | Very small | Very fast | Regional overview |
-
-### Layer Depth
-
-- **1.0 m** (default): Standard for wildfire modeling
-- **0.5 m**: Fine-scale vertical structure analysis
-- **2.0 m**: Coarser profiles (reduces band count to 75)
-
-### Threshold (Strata Detection)
-
-- **0.02 kg/m³** (default): Standard threshold for canopy base
-- **0.01**: More sensitive (lower CBH estimates)
-- **0.05**: More conservative (higher CBH estimates)
-
-### Height Cover
-
-- **2.0 m** (default): Standard threshold for "cover" computation
-- **1.5 m**: Include shorter vegetation
-- **3.0 m**: Only taller vegetation
-
----
-
-## Validation & Interpretation
-
-### Expected Value Ranges (Volcan Mountain)
-
-Based on California oak woodland/chaparral:
-
-| Metric | Typical Range | Notes |
-|--------|---------------|-------|
-| Height | 5-25 m | Oaks 10-20m, chaparral 1-5m |
-| CBH | 1-8 m | Higher for pine/oak, lower for chaparral |
-| FSG | 0-10 m | Stratified stands have larger gaps |
-| CFL | 0.2-2.0 kg/m² | Higher in dense oak woodland |
-| TFL | 0.5-5.0 kg/m² | Includes all strata |
-| Canopy cover | 20-80% | Variable by stand type |
-
-**Sanity checks:**
-- CBH < Height (always)
-- CFL < TFL (always)
-- max_CBD typically 0.1-0.5 kg/m³ for forests
-
-### Comparison with Existing Metrics
-
-Your existing pipeline ([point_cloud_utils.py](../../src/utils/point_cloud_utils.py)) computes simpler metrics:
-- Max/mean/percentile heights → Compare with LidarForFuel **Height** (band 3)
-- Canopy/midstory density → Compare with **Canopy_cover** (band 12)
-- Foliage Height Diversity (FHD) → Compare with **entropy_PAD** (band 18) or **VCI_PAD** (band 6)
-
-**Differences:**
-- LidarForFuel uses Beer-Lambert inversion (physics-based) vs. simple binning
-- Bulk density profiles vs. point count ratios
-- Species-specific traits vs. uniform assumptions
-
-**Recommended:**
-- Run both pipelines on same tiles
-- Document correlation and systematic differences
-- Use for cross-validation or fusion
-
----
-
 ## Troubleshooting
 
-### "Rscript not found in PATH"
+### Incomplete spatial coverage after merge
 
+**Symptoms:** Merged GeoTIFF covers only ~40% of expected area
+
+**Root Cause:** Shell glob expansion of wildcard pattern hits argument limits, processing only first ~28-30 tiles
+
+**Solution:** Use explicit file list or --optfile:
 ```bash
-# Check R installation
-which Rscript
-R --version
+# ❌ WRONG (loses ~60% of data):
+gdal_merge.py -o output.tif data/rasters/tile_*_fuel_metrics.tif
 
-# Install R if missing
-conda install -c conda-forge r-base
-
-# Verify
-Rscript --version
+# ✓ CORRECT (preserves all data):
+gdal_merge.py -o output.tif --optfile <(find data/rasters -name "*.tif" | sort)
 ```
 
-### "Error loading libraries: there is no package called 'lidarforfuel'"
+### NaN values in merged output
 
+**Symptoms:** Large NaN regions where tiles should have data
+
+**Cause:** Using `-n nan` flag which ignores all NaN pixels
+
+**Solution:** Remove `-n nan`; only use `-a_nodata nan`:
 ```bash
-# Install lidR and dependencies
-conda install -c conda-forge r-lidr r-remotes r-terra
+# ❌ WRONG (ignores NaN pixels, creates gaps):
+gdal_merge.py -o output.tif -n nan -a_nodata nan tiles/*.tif
 
-# Install LidarForFuel from GitHub
-R -e "remotes::install_github('oliviermartin7/lidarforfuel')"
-
-# Test installation
-R -e "library(lidarforfuel)"
+# ✓ CORRECT (preserves data, sets nodata value):
+gdal_merge.py -o output.tif -a_nodata nan tiles/*.tif
 ```
 
-### "Missing required attributes: gpstime"
+### Fewer output tiles than expected
 
-**Cause:** Input LAS file lacks GPS time stamps
+**Symptoms:** Only 50 tiles generated when expecting 75
 
-**Solutions:**
-1. Use original LAS files (not processed/stripped versions)
-2. Add synthetic timestamps via PDAL:
-   ```bash
-   pdal translate input.las output.las --writers.las.system_id="FAKED" \
-       --writers.las.a_srs="EPSG:32611" --metadata gpstime="1"
-   ```
-3. Modify R script to set `start_date` and `season_filter` to disable time filtering
+**Cause:** Edge tiles with sparse vegetation fail processing
 
-### "Pretreatment failed: not enough points"
+**Solution:** This is normal. Check `tile_processing_summary.csv` for failed tiles and verify they're at dataset edges.
 
-**Cause:** Very sparse point cloud or aggressive height filtering
+### Memory errors during processing
 
-**Solutions:**
-1. Check input density: `pdal info input.las --stats`
-2. Increase `height_filter` in R script (default 60m)
-3. Use coarser resolution for metrics computation
+**Symptoms:** Process killed, "Killed" message in logs
 
-### Memory errors during metrics computation
+**Cause:** Insufficient RAM for large tiles (>50M points per tile)
 
-**Cause:** Large point clouds exceed available RAM
+**Solution:**
+1. Reduce tile size: Use 100m instead of 200m
+2. Reduce parallel jobs: Use 3 instead of 6
+3. Increase system swap space
 
-**Solutions:**
-1. Reduce resolution (e.g., 2m instead of 1m)
-2. Process smaller tiles/chunks
-3. Increase available RAM
-4. Use LAScatalog approach (future enhancement)
+**Memory requirements:**
+- Pretreatment: ~4GB RAM per tile
+- Fuel metrics: ~8GB RAM per tile
+- Safe configuration for 64GB system: 6 parallel jobs with 200m tiles
 
-### Output raster has many NA/nodata pixels
+### Missing bulk density layers in output
 
-**Causes:**
-- Insufficient points per pixel (`limit_N_points = 400` threshold)
-- Point cloud gaps or coverage issues
+**Symptoms:** Output raster has only 23 bands instead of 173
 
-**Solutions:**
-1. Reduce resolution (larger pixels → more points)
-2. Lower `limit_N_points` in R script (caution: less reliable)
-3. Check input coverage: `pdal info input.las --boundary`
+**Cause:** Using `--export_mode summary` (default)
+
+**Solution:** Use `--export_mode full` for all 173 bands (creates larger files ~2-3x)
+
+---
+
+## File Size Estimates
+
+| Dataset | Size | Resolution | Extent |
+|---------|------|------------|--------|
+| Raw UAV LiDAR | 24 GB | 1cm point spacing | 1.4 × 2.1 km |
+| Tile LAZ (200m) | 50-150 MB each | 1cm point spacing | 200 × 200 m |
+| Pretreated LAZ | Similar to input | 1cm point spacing | 200 × 200 m |
+| Fuel metrics TIF (summary) | 20-40 KB each | 5m pixels | 40 × 40 pixels |
+| Fuel metrics TIF (full) | 60-120 KB each | 5m pixels | 40 × 40 pixels |
+| Merged TIF (compressed) | 2-3 MB | 5m pixels | 1.4 × 1.5 km |
+
+---
+
+## Performance Benchmarks
+
+**Volcan Mountain Dataset:**
+- Input: 24GB LAS, 1.66 billion points, 1.4 × 2.1 km
+- Tiles: 70 tiles (200m × 200m)
+- Hardware: 8-core CPU, 64GB RAM
+
+| Step | Time | Parallelization |
+|------|------|-----------------|
+| Ground classification + tiling | 45 min | Single-threaded (PDAL) |
+| Pretreatment (70 tiles) | 90 min | 6 parallel jobs |
+| Fuel metrics (70 tiles) | 120 min | 6 parallel jobs |
+| Merge tiles | 2 min | Single-threaded (GDAL) |
+| Visualization | 30 sec | Single-threaded |
+| **Total** | **~4 hours** | Mixed |
+
+**Scaling:**
+- Larger datasets: Time scales linearly with point count and area
+- More cores: Increase parallel jobs (watch RAM usage)
+- Smaller tiles (100m): 4× more tiles, ~1.5× longer total time
 
 ---
 
@@ -458,7 +631,9 @@ R -e "library(lidarforfuel)"
 
 - **Beer-Lambert Law**: Radiative transfer model for canopy structure estimation
 - **lidR Package**: Roussel, J.-R., et al. (2020). lidR: An R package for analysis of Airborne Laser Scanning (ALS) data. *Remote Sensing of Environment*, 251, 112061.
-- **PAD/CBD**: Plant Area Density and Canopy Bulk Density concepts in fire ecology
+- **SMRF ground classification**: Pingel, T.J., Clarke, K.C., McBride, W.A. (2013). An improved simple morphological filter for the terrain classification of airborne LIDAR data.
+- **PDAL filters.smrf**: https://pdal.io/en/stable/stages/filters.smrf.html
+- **GDAL gdal_merge**: https://gdal.org/programs/gdal_merge.html
 
 ### Trait Databases
 
@@ -492,4 +667,5 @@ For issues with:
 
 ---
 
-**Last updated:** 2025-10-19
+**Last updated:** 2025-11-02
+**Pipeline version:** 2.1 (Consolidated documentation, configurable Beer-Lambert parameters)

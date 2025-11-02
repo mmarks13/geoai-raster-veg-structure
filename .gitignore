@@ -3,9 +3,16 @@
 
 **/*.cpython-311..pyc
 *.ipynb_checkpoints/
+
+# Node.js dependencies (Claude Code CLI)
+node_modules/
+package-lock.json
+
 # Ignore temporary files and directories
 __pycache__/
 *.pyc.ipynb_checkpoints/
+temp*/
+*_diagnostics/
 
 # Data directory - granular ignore patterns for reproducibility
 # Allow directory structure and documentation
@@ -16,6 +23,11 @@ __pycache__/
 !data/processed/
 !data/processed/test_val_polygons.geojson
 !data/processed/tiles.geojson
+
+# Fuel metrics structure - preserve documentation and trait lookup
+!data/processed/fuel_metrics/
+!data/processed/fuel_metrics/README.md
+!data/processed/fuel_metrics/trait_lookup.csv
 
 # Ignore all data files by extension
 data/**/*.pt
@@ -36,6 +48,12 @@ data/**/*.pkl
 data/**/*.pickle
 data/**/*.csv
 data/**/*.gpkg
+
+# GDAL auxiliary files (auto-generated metadata)
+*.aux.xml
+
+# Research papers and references (track separately or in docs/)
+scripts/*.pdf
 
 # Ignore forest plot filter configuration (contains site names)
 data/raw/forest_plot_data/site_filter.txt
@@ -72,9 +90,27 @@ data/agg/**/*
 *.json
 *.log
 data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv
-CLAUDE.md
 temp/*
 .venv/*
 
 data/processed/dems/*
 data/processed/dem_outlines.geojson
+
+# Fuel metrics data outputs - ignore all processed data
+data/processed/fuel_metrics/**/tiles/**/*
+!data/processed/fuel_metrics/**/tiles/.gitkeep
+data/processed/fuel_metrics/**/pretreated/**/*
+!data/processed/fuel_metrics/**/pretreated/.gitkeep
+data/processed/fuel_metrics/**/rasters/**/*
+!data/processed/fuel_metrics/**/rasters/.gitkeep
+data/processed/fuel_metrics/**/merged/**/*
+!data/processed/fuel_metrics/**/merged/.gitkeep
+data/processed/fuel_metrics/**/logs/**/*
+!data/processed/fuel_metrics/**/logs/.gitkeep
+data/processed/fuel_metrics/**/validation/**/*
+!data/processed/fuel_metrics/**/validation/.gitkeep
+data/processed/fuel_metrics/**_full/**/*
+!data/processed/fuel_metrics/**_full/.gitkeep
+
+# Fuel metrics backup archives
+fuel_metrics_dev_backup_*.tar.gz

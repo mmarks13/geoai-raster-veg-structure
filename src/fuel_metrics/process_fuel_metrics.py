@@ -5,22 +5,29 @@ Main orchestration script for computing fuel metrics from UAV LiDAR point clouds
 Uses LidarForFuel R package via Python wrapper.
 
 Usage:
-    # Single file
-    python process_uav_fuel_metrics.py --input data/raw/uavlidar/study_las/file.las
+    # Single tile
+    python src/fuel_metrics/process_fuel_metrics.py \
+      --input data/processed/fuel_metrics/my_site/tiles/tile_0_1cm.laz \
+      --output_dir data/processed/fuel_metrics/my_site \
+      --species "Mixed" \
+      --resolution 5.0 \
+      --export_mode summary
 
-    # Multiple files
-    python process_uav_fuel_metrics.py --input_dir data/raw/uavlidar/study_las --pattern "*.las"
-
-    # Custom species and resolution
-    python process_uav_fuel_metrics.py --input file.las --species "Quercus agrifolia" --resolution 0.5
-
-    # Summary metrics only (23 bands instead of 173)
-    python process_uav_fuel_metrics.py --input file.las --export_mode summary
+    # Batch with parallel (use run_batch_fuel_metrics.sh instead)
+    ls data/processed/fuel_metrics/my_site/tiles/tile_*_1cm.laz | \
+      parallel -j 6 \
+      "python src/fuel_metrics/process_fuel_metrics.py \
+        --input {} \
+        --output_dir data/processed/fuel_metrics/my_site \
+        --species Mixed \
+        --resolution 5.0 \
+        --export_mode summary"
 """
 
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List
 import time
@@ -28,22 +35,14 @@ import time
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parents[2]))
 
-from src.data_prep.lidarforfuel_wrapper import (
+from src.fuel_metrics.lidarforfuel_wrapper import (
     process_point_cloud,
     load_trait_lookup,
     check_rscript_available,
     LidarForFuelError
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('fuel_metrics_processing.log')
-    ]
-)
+# Initialize logger (will be reconfigured in main)
 logger = logging.getLogger(__name__)
 
 
@@ -117,8 +116,8 @@ def main():
     parser.add_argument(
         '--output_dir',
         type=Path,
-        default=Path('data/processed/fuel_metrics/volcan'),
-        help='Output directory (default: data/processed/fuel_metrics/volcan)'
+        required=True,
+        help='Output directory (e.g., data/processed/fuel_metrics/my_site)'
     )
     parser.add_argument(
         '--species',
@@ -133,6 +132,18 @@ def main():
         help='Output raster resolution in meters (default: 1.0)'
     )
     parser.add_argument(
+        '--clumping',
+        type=float,
+        default=0.77,
+        help='Clumping factor Ω for Beer-Lambert model (default: 0.77)'
+    )
+    parser.add_argument(
+        '--projection_factor',
+        type=float,
+        default=0.5,
+        help='Projection factor G for fuel metrics (default: 0.5)'
+    )
+    parser.add_argument(
         '--export_mode',
         type=str,
         choices=['full', 'summary'],
@@ -143,6 +154,24 @@ def main():
         '--cleanup',
         action='store_true',
         help='Delete intermediate pretreated LAZ files after processing'
+    )
+    parser.add_argument(
+        '--no-pdal-classification',
+        action='store_false',
+        dest='use_pdal_classification',
+        help='Disable PDAL classification (use LidarForFuel classify=TRUE instead, may fail on unclassified data)'
+    )
+    parser.add_argument(
+        '--min-hag',
+        type=float,
+        default=0.0,
+        help='Minimum height above ground for PDAL filtering in meters (default: 0.0, keeps ground points)'
+    )
+    parser.add_argument(
+        '--max-hag',
+        type=float,
+        default=80.0,
+        help='Maximum height above ground for PDAL filtering in meters (default: 80.0)'
     )
     parser.add_argument(
         '--max_files',
@@ -158,10 +187,25 @@ def main():
         print_available_species()
         return 0
 
+    # Configure logging
+    log_dir = Path("data/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"fuel_metrics_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    # Configure logger handlers
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
     # Pre-flight checks
     logger.info("=" * 80)
     logger.info("UAV LiDAR Fuel Metrics Processing")
     logger.info("=" * 80)
+    logger.info(f"Log file: {log_file}")
+    logger.info(f"Command-line arguments:")
+    for arg_name, arg_value in vars(args).items():
+        logger.info(f"  {arg_name}: {arg_value}")
 
     if not check_rscript_available():
         logger.error("Rscript not found in PATH")
@@ -195,7 +239,12 @@ def main():
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Species: {args.species}")
     logger.info(f"Resolution: {args.resolution} m")
+    logger.info(f"Clumping (Ω): {args.clumping}")
+    logger.info(f"Projection factor (G): {args.projection_factor}")
     logger.info(f"Export mode: {args.export_mode}")
+    logger.info(f"Classification: {'PDAL' if args.use_pdal_classification else 'LidarForFuel'}")
+    if args.use_pdal_classification:
+        logger.info(f"HAG range: [{args.min_hag}, {args.max_hag}] meters")
     logger.info("=" * 80)
 
     # Process each file
@@ -212,8 +261,13 @@ def main():
                 output_dir=args.output_dir,
                 species=args.species,
                 resolution=args.resolution,
+                clumping=args.clumping,
+                projection_factor=args.projection_factor,
                 export_mode=args.export_mode,
-                cleanup_intermediate=args.cleanup
+                cleanup_intermediate=args.cleanup,
+                use_pdal_classification=args.use_pdal_classification,
+                min_hag=args.min_hag,
+                max_hag=args.max_hag
             )
 
             elapsed = time.time() - start_time

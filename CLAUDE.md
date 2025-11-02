@@ -54,20 +54,52 @@ python src/evaluation/manuscript_figures.py --eval_data <eval_df.pt>
 
 ### Fuel Metrics (Wildfire Hazard Mapping)
 ```bash
-# Single file (uses LidarForFuel R package via Python wrapper)
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input data/raw/uavlidar/study_las/20241025_151528.las
-
-# Batch processing with species traits
-python src/data_prep/process_uav_fuel_metrics.py \
-    --input_dir data/raw/uavlidar/study_las \
+# Complete pipeline (recommended) - Single command for entire workflow
+bash scripts/fuel_metrics/run_fuel_metrics_pipeline.sh \
+    --input data/raw/uavlidar/my_site.las \
+    --output-name my_site \
     --species "Mixed" \
-    --resolution 1.0
+    --resolution 5.0 \
+    --tile-size 200 \
+    --parallel-jobs 6
+
+# Installation (one-time setup)
+conda env create -f environment_r_fuel_metrics.yml
+bash scripts/fuel_metrics/install_lidarforfuel.sh
+
+# Individual pipeline steps:
+
+# Step 1: Ground classification + tiling (consolidated PDAL pipeline)
+bash scripts/fuel_metrics/pdal/run_ground_classification_and_tiling.sh \
+    data/raw/uavlidar/my_site.las \
+    data/processed/fuel_metrics/my_site/tiles \
+    200 \
+    10
+
+# Step 2: Batch pretreatment + fuel metrics
+bash scripts/fuel_metrics/run_batch_fuel_metrics.sh \
+    data/processed/fuel_metrics/my_site/tiles \
+    data/processed/fuel_metrics/my_site \
+    "Mixed" \
+    5.0 \
+    6
+
+# Step 3: Merge tiles (CRITICAL: use explicit file list, NOT wildcards)
+conda run -p /home/jovyan/geoai_env gdal_merge.py \
+    -o data/processed/fuel_metrics/my_site/merged/my_site_fuel_metrics_5m.tif \
+    -a_nodata nan \
+    -co COMPRESS=LZW -co TILED=YES -co BIGTIFF=YES \
+    --optfile <(find data/processed/fuel_metrics/my_site/rasters -name "*.tif" | sort)
+
+# Step 4: Generate visualization
+conda run -p /home/jovyan/geoai_env python src/fuel_metrics/visualize_metrics.py \
+    data/processed/fuel_metrics/my_site/merged/my_site_fuel_metrics_5m.tif \
+    data/processed/fuel_metrics/my_site/merged/my_site_visualization.png
 
 # List available species/traits
-python src/data_prep/process_uav_fuel_metrics.py --list_species
+python src/fuel_metrics/process_fuel_metrics.py --list_species
 
-# See data/processed/fuel_metrics/README.md for complete documentation
+# See data/processed/fuel_metrics/PIPELINE.md for complete documentation
 ```
 
 ## 3. Code Standards & Style
@@ -77,6 +109,7 @@ python src/data_prep/process_uav_fuel_metrics.py --list_species
 - **Ask before assuming** - Present options when ambiguous; flag assumptions explicitly
 - **Optimize for readability** - Clear code over micro-optimizations unless performance is critical
 - **No secrets in code/config** - All credentials via environment variables or secret managers
+- **Examine data first, theorize second** - Always check actual data values and distributions before forming hypotheses about bugs; assumptions about what "should" be happening often blind you to what's actually in the data
 
 ### Python Language Standards
 - **Descriptive names** - Full words: `customer_email` over `cust_email` or `ce`
@@ -86,11 +119,14 @@ python src/data_prep/process_uav_fuel_metrics.py --list_species
 
 ### Code Organization
 - **Organize by purpose** - Top-level folders by system purpose, flat files within, subfolders only for 3-4+ files
-- **Python scripts go in `src/`** - Organized by purpose (data_prep, models, training, etc.); `scripts/` is for shell scripts only
+- **Python scripts go in `src/`** - Organized by purpose (data_prep, models, training, etc.)
+- **Shell and R scripts go in `scripts/`** - Use appropriate subdirectories (`scripts/r/` for R, root of `scripts/` for shell)
 - **Target <40 lines per function** - Split on distinct responsibilities, not just line counts; 50+ acceptable if readable
 - **Abstract on second use** - Extract truly identical logic on second occurrence; wait for patterns if purposes differ
 - **Named constants** - Config thresholds, timeouts, business values; skip obvious one-offs
 - **Return early** - Guard clauses for edge cases first, reduces nesting
+
+**Note on directory separation:** This strict organization prevents mixing languages and keeps dependencies clean. Python ecosystem (pip/conda) is separate from R packages, and shell scripts are configuration/orchestration only.
 
 ### Error Handling & Validation
 - **Fail fast** - Let exceptions propagate; specific catches (`except SpecificError`), re-raise with context
@@ -144,15 +180,18 @@ python src/data_prep/process_uav_fuel_metrics.py --list_species
 ## 5. Project Structure & Critical Paths
 
 ### Key Directories
-- `src/data_prep/` - STAC downloads, tile generation, train/test split, **fuel metrics pipeline**
+- `src/data_prep/` - STAC downloads, tile generation, train/test split
+- `src/fuel_metrics/` - **Wildfire fuel hazard mapping module** (Python-R interface, batch processing, visualization)
 - `src/models/` - Model architecture (multimodal_model.py, encoders.py, cross_attn_fusion.py, fusion.py)
 - `src/training/` - Training loop (multimodal_training.py, ddp_training.py)
 - `src/evaluation/` - Inference, stats, figures
 - `src/utils/` - Chamfer distance, KNN graphs, point cloud utilities
 - `src/raster_mapping/` - Forest plot visualization utilities
 - `scripts/` - **Shell scripts only** (get_data.sh, process_data.sh, compress_las_files.sh)
-- `scripts/r/` - **R wrapper scripts** (run_pretreatment.R, run_fuel_metrics.R for LidarForFuel)
-- `data/processed/fuel_metrics/` - Wildfire fuel hazard mapping outputs (pretreated LAZ, 173-band rasters)
+- `scripts/fuel_metrics/` - **Fuel metrics pipeline scripts** (run_fuel_metrics_pipeline.sh, PDAL/R wrappers)
+- `scripts/fuel_metrics/pdal/` - Consolidated PDAL pipeline (ground classification + tiling)
+- `scripts/fuel_metrics/r/` - R wrapper scripts (run_pretreatment.R, run_fuel_metrics.R)
+- `data/processed/fuel_metrics/<site_name>/` - Per-site fuel metrics outputs (tiles, pretreated, rasters, merged, logs, validation)
 - `manuscript/` - LaTeX source and figures
 - `run_*.py` - **Training entry points (root level)**
 
@@ -239,6 +278,11 @@ python src/data_prep/process_uav_fuel_metrics.py --list_species
   - z ∈ [0, tile_height] meters (min z = 0)
   - This aids interpretability and alignment but requires α=4 (not α=1000) for density-aware loss to prevent gradient saturation
 
+### LAS Coordinate Precision
+- PDAL automatically adjusts coordinate scale based on data extent
+- When using PDAL to create new LAS/LAZ files, include precision suffix in filename (e.g., `_1cm.laz`, `_1mm.laz`)
+- Check precision with: `pdal info --summary file.las | grep scale_`
+
 ## 9. Git Workflow
 - **Main branch:** `cleanup` (current), not `main`
 - **Commit message format:** Standard descriptive commits
@@ -320,51 +364,97 @@ The `data/` directory contains all downloaded, processed, and generated data. Se
 
 **Purpose:** Compute wildfire fuel hazard metrics from UAV LiDAR using physics-based Beer-Lambert inversion.
 
+**Module location:** `src/fuel_metrics/` (separate from point cloud upsampling work)
+
 **Key components:**
-- `src/data_prep/lidarforfuel_wrapper.py` - Python-R interface
-- `src/data_prep/process_uav_fuel_metrics.py` - Main orchestration script
-- `scripts/r/run_pretreatment.R` - R wrapper for fPCpretreatment (normalization + trait attribution)
-- `scripts/r/run_fuel_metrics.R` - R wrapper for fCBDprofile_fuelmetrics (bulk density profiles)
+- `src/fuel_metrics/lidarforfuel_wrapper.py` - Python-R interface (preserves SMRF ground classification params)
+- `src/fuel_metrics/process_fuel_metrics.py` - Main orchestration script (renamed from process_uav_fuel_metrics.py)
+- `src/fuel_metrics/batch_processing.py` - Parallel batch processing with progress tracking
+- `src/fuel_metrics/visualize_bounds.py` - Spatial coverage validation
+- `src/fuel_metrics/visualize_metrics.py` - Fuel metrics visualization
+- `scripts/fuel_metrics/run_fuel_metrics_pipeline.sh` - **Main entry point** (complete pipeline orchestrator)
+- `scripts/fuel_metrics/pdal/run_ground_classification_and_tiling.sh` - **Consolidated PDAL pipeline** (ground classification + tiling in single pass)
+- `scripts/fuel_metrics/r/run_pretreatment.R` - R wrapper for fPCpretreatment
+- `scripts/fuel_metrics/r/run_fuel_metrics.R` - R wrapper for fCBDprofile_fuelmetrics
+- `scripts/fuel_metrics/install_lidarforfuel.sh` - R package installation script
 - `data/processed/fuel_metrics/trait_lookup.csv` - LMA/WD values by species
 
-**Workflow:**
-1. **Pretreatment**: Normalize point cloud, add LMA (Leaf Mass Area) and WD (Wood Density) attributes
-2. **Fuel metrics**: Compute 173-band raster (23 summary metrics + 150 bulk density layers)
+**Complete workflow (single command):**
+```bash
+bash scripts/fuel_metrics/run_fuel_metrics_pipeline.sh \
+  --input data/raw/uavlidar/my_site.las \
+  --output-name my_site \
+  --species "Mixed" \
+  --resolution 5.0 \
+  --tile-size 200 \
+  --parallel-jobs 6
+```
 
-**Outputs:**
-- Pretreated LAZ: `data/processed/fuel_metrics/volcan/pretreated/*.laz`
-- Fuel rasters: `data/processed/fuel_metrics/volcan/rasters/*.tif`
+**Pipeline steps:**
+1. **Ground classification + tiling** (PDAL, single I/O pass): SMRF filter + 200m tiles
+2. **Pretreatment** (LidarForFuel): Normalize point cloud, add LMA/WD attributes
+3. **Fuel metrics** (LidarForFuel): Compute 173-band raster (23 summary + 150 bulk density)
+4. **Merge** (GDAL): Seamless mosaic using explicit file list (NOT wildcards - glob expansion fails with 70+ files)
+5. **Visualization**: 6-panel figure (H, CBH, FSG, fuel loads, VCI)
+
+**Data organization (per site):**
+```
+data/processed/fuel_metrics/<site_name>/
+├── tiles/              # Ground-classified LAZ tiles (200m × 200m)
+├── pretreated/         # Normalized LAZ with LMA/WD attributes
+├── rasters/            # 173-band fuel metric TIFFs (per tile)
+├── merged/             # Seamless mosaic + visualization
+├── logs/               # Processing logs and summary CSV
+└── validation/         # Spatial coverage checks
+```
 
 **Key metrics:**
 - Canopy height, Canopy Base Height (CBH), Fuel Strata Gap (FSG)
 - Fuel loads (Canopy, Total, Midstorey, Surface)
 - Cover percentages (Canopy, Midstorey, Understory)
 - Vertical Complexity Index (VCI), entropy
-- Bulk density profile (150 vertical layers)
+- Bulk density profile (150 vertical layers at 1.5m resolution)
 
 **Trait values (default: Mixed woodland):**
 - LMA: 140 g/m² (canopy), 130 g/m² (understory <2m)
 - WD: 591 kg/m³ (canopy), 550 kg/m³ (understory)
 - Species-specific values in `trait_lookup.csv` (Coast live oak, Black oak, Ceanothus, Coulter pine, Incense cedar)
 
-**R package:** [LidarForFuel](https://github.com/oliviermartin7/LidarForFuel) (Martin-Ducup & Pimont 2024)
-
-**Documentation:** [data/processed/fuel_metrics/README.md](data/processed/fuel_metrics/README.md)
-
-**Installation:**
-```bash
-# R and packages
-conda install -c conda-forge r-base r-lidr r-remotes r-terra
-
-# LidarForFuel from GitHub
-R -e "remotes::install_github('oliviermartin7/lidarforfuel')"
+**Ground classification method:** SMRF (Simple Morphological Filter) via PDAL with default parameters:
+```json
+{
+  "type": "filters.smrf",
+  "cell": 1.0,
+  "slope": 0.15,
+  "threshold": 0.5,
+  "window": 18.0
+}
 ```
 
+**R environment:** Separate conda environment (`r_fuel_metrics`) to avoid conflicts with PyTorch stack
+```bash
+# Installation
+conda env create -f environment_r_fuel_metrics.yml
+bash scripts/fuel_metrics/install_lidarforfuel.sh
+```
+
+**R package:** [LidarForFuel](https://github.com/oliviermartin7/LidarForFuel) (Martin-Ducup & Pimont 2024)
+
+**Documentation:**
+- **Complete pipeline guide:** [data/processed/fuel_metrics/PIPELINE.md](data/processed/fuel_metrics/PIPELINE.md) (fully rewritten for v2.0)
+- **Module README:** [src/fuel_metrics/README.md](src/fuel_metrics/README.md)
+- **Trait lookup:** [data/processed/fuel_metrics/trait_lookup.csv](data/processed/fuel_metrics/trait_lookup.csv)
+
 **Critical notes:**
-- Requires R runtime (not pure Python)
-- Uses Beer-Lambert radiative transfer model (physics-based, not ML)
-- Complements existing point cloud metrics in `src/utils/point_cloud_utils.py`
-- Designed for wildfire hazard mapping, not point cloud upsampling
+- **Separate feature:** Fuel metrics is distinct from point cloud upsampling (different use case, different methods)
+- **Requires R runtime:** Uses LidarForFuel R package (not pure Python)
+- **Physics-based:** Beer-Lambert radiative transfer model (not ML)
+- **Consolidated pipeline:** Ground classification + tiling in single PDAL pass (eliminates 24GB intermediate file)
+- **Dynamic:** Works with any UAV LiDAR file (not site-specific like original implementation)
+- **Production-ready:** Comprehensive logging, validation, error handling, parallel processing
+
+**Common pitfall:**
+- **gdal_merge wildcards:** Using `tile_*_fuel_metrics.tif` pattern with 70+ tiles loses ~60% of data due to shell glob expansion limits. **Always use explicit file lists or --optfile**
 
 ## 14. Common Issues & Fixes
 

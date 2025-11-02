@@ -36,6 +36,12 @@ geoai_veg_map/
 │   │   ├── generate_training_data.py        # Generate 10m x 10m training tiles
 │   │   ├── train_test_split_and_precompute.py  # Split & precompute features
 │   │   └── data_augmentation.py             # Geometric & point perturbations
+│   ├── fuel_metrics/       # Wildfire fuel hazard mapping (NEW)
+│   │   ├── lidarforfuel_wrapper.py          # Python-R interface
+│   │   ├── process_fuel_metrics.py          # Main orchestration script
+│   │   ├── batch_processing.py              # Parallel batch processing
+│   │   ├── visualize_bounds.py              # Spatial coverage validation
+│   │   └── visualize_metrics.py             # Fuel metrics visualization
 │   ├── models/             # Model architectures
 │   │   ├── multimodal_model.py              # Main model with LG-PAB blocks
 │   │   ├── encoders.py                      # Vision Transformer encoders
@@ -54,13 +60,23 @@ geoai_veg_map/
 │       └── point_cloud_utils.py             # Point cloud processing utilities
 ├── scripts/                # End-to-end workflow scripts
 │   ├── get_data.sh                          # Download all datasets
-│   └── process_data.sh                      # Preprocess & prepare training data
+│   ├── process_data.sh                      # Preprocess & prepare training data
+│   └── fuel_metrics/       # Fuel metrics pipeline scripts (NEW)
+│       ├── run_fuel_metrics_pipeline.sh     # Main orchestrator
+│       ├── run_batch_fuel_metrics.sh        # Batch processing
+│       ├── install_lidarforfuel.sh          # R package installation
+│       ├── pdal/
+│       │   └── run_ground_classification_and_tiling.sh  # PDAL pipeline
+│       └── r/
+│           ├── run_pretreatment.R           # fPCpretreatment wrapper
+│           └── run_fuel_metrics.R           # Fuel metrics wrapper
 ├── manuscript/             # LaTeX manuscript and figures
 │   ├── remote_sensing_submission.tex        # Published manuscript source
 │   └── figures/                             # All manuscript figures
 ├── run_model_test.py       # Train a single model configuration
 ├── run_ablation_study.py   # Run ablation experiments (baseline, NAIP, UAVSAR, fused)
-└── environment.yml         # Conda environment specification
+├── environment.yml         # Conda environment (PyTorch/CUDA stack)
+└── environment_r_fuel_metrics.yml  # R environment (LidarForFuel)
 ```
 
 ## Published Paper
@@ -261,6 +277,60 @@ The model is built around the **Local-Global Point Attention Block (LG-PAB)**, a
 - **MLP Coordinate Decoder**: Final per-point residual offsets for precise 3D position predictions
 
 The model operates directly on 3D point clouds (not rasters) and outputs enhanced point clouds with increased density and geometric accuracy.
+
+## Fuel Metrics Pipeline
+
+In addition to the point cloud enhancement framework described above, this repository includes a complete pipeline for computing wildfire fuel hazard metrics from UAV LiDAR using the [LidarForFuel](https://github.com/oliviermartin7/lidarforfuel) R package.
+
+### Overview
+
+The fuel metrics module (`src/fuel_metrics/`) provides physics-based fuel mapping using Beer-Lambert radiative transfer modeling to generate 173-band rasters containing:
+- **23 summary metrics**: Canopy height, canopy base height (CBH), fuel strata gap (FSG), fuel loads, cover percentages, vertical complexity index (VCI)
+- **150 bulk density layers**: Vertical fuel density profile at 1.5m resolution
+
+### Quick Start
+
+```bash
+# One-time setup: Install R environment and LidarForFuel package
+conda env create -f environment_r_fuel_metrics.yml
+bash scripts/fuel_metrics/install_lidarforfuel.sh
+
+# Process any UAV LiDAR file with single command
+bash scripts/fuel_metrics/run_fuel_metrics_pipeline.sh \
+  --input data/raw/uavlidar/my_site.las \
+  --output-name my_site \
+  --species "Mixed" \
+  --resolution 5.0
+```
+
+The pipeline automatically:
+1. Ground classifies using SMRF filter (PDAL)
+2. Tiles into 200m × 200m chunks
+3. Computes pretreatment (normalization + trait attribution)
+4. Generates fuel metrics for each tile
+5. Merges into seamless mosaic
+6. Creates 6-panel visualization
+
+**Output:** Organized subdirectories in `data/processed/fuel_metrics/my_site/` with tiles, pretreated LAZ files, rasters, merged GeoTIFF, and logs.
+
+### Key Features
+
+- **Consolidated pipeline**: Ground classification + tiling in single pass (no 24GB intermediate file)
+- **Dynamic**: Works with any UAV LiDAR file (not site-specific)
+- **Species-specific traits**: Configurable LMA/WD values for different vegetation types
+- **Parallel processing**: Batch processing with progress tracking
+- **Production-ready**: Comprehensive logging, validation, and error handling
+
+### Documentation
+
+- **Complete pipeline guide**: [`data/processed/fuel_metrics/PIPELINE.md`](data/processed/fuel_metrics/PIPELINE.md)
+- **Module README**: [`src/fuel_metrics/README.md`](src/fuel_metrics/README.md)
+- **Trait lookup table**: [`data/processed/fuel_metrics/trait_lookup.csv`](data/processed/fuel_metrics/trait_lookup.csv)
+
+### Reference
+
+The fuel metrics computation uses:
+- Martin-Ducup, O. & Pimont, F. (2024). LidarForFuel: Physics-based fuel mapping from UAV LiDAR. GitHub repository: https://github.com/oliviermartin7/lidarforfuel
 
 ## Citation
 
