@@ -114,3 +114,4 @@ data/processed/fuel_metrics/**_full/**/*
 
 # Fuel metrics backup archives
 fuel_metrics_dev_backup_*.tar.gz
+.github/copilot-instructions.md

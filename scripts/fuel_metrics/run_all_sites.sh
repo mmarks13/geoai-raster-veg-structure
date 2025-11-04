@@ -24,7 +24,7 @@ SPECIES="Mixed"
 RESOLUTION=5.0
 TILE_SIZE=200
 PARALLEL_JOBS=6
-CLUMPING=0.65
+CLUMPING=0.6
 PROJECTION_FACTOR=0.5
 
 # Define sites as array of "input_file|output_name" pairs
@@ -134,7 +134,6 @@ for i in "${!SITES[@]}"; do
     SITE_START=$(date +%s)
 
     # Run pipeline (don't exit on error, capture result)
-    # Use --skip-interactive-prompts to prevent mid-processing confirmations
     set +e
     bash "$PIPELINE_SCRIPT" \
         --input "$input_file" \
@@ -144,8 +143,7 @@ for i in "${!SITES[@]}"; do
         --tile-size "$TILE_SIZE" \
         --parallel-jobs "$PARALLEL_JOBS" \
         --clumping "$CLUMPING" \
-        --projection-factor "$PROJECTION_FACTOR" \
-        --skip-interactive-prompts
+        --projection-factor "$PROJECTION_FACTOR"
 
     PIPELINE_EXIT_CODE=$?
     set -e
