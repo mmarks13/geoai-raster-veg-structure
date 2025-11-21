@@ -30,10 +30,13 @@ Example: python src/data_prep/make_local_uavsar_stac.py
 """
 
 import os
+import shutil
 import argparse
 import subprocess
 import logging
 from datetime import datetime
+import signal
+from contextlib import contextmanager
 
 import rasterio
 import rioxarray
@@ -49,7 +52,26 @@ from uavsar_pytools.uavsar_tools import create_netrc  # for netrc generation
 from uavsar_pytools import UavsarScene
 
 # Configure logging
-logging.basicConfig(level=print, format="%(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# Timeout exception
+class TimeoutError(Exception):
+    pass
+
+@contextmanager
+def timeout(seconds):
+    """Context manager for timing out operations."""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    
+    # Set the signal handler and alarm
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 # Fixed polarization keys (order is fixed)
 REQUIRED_POLS = ["HHHH", "HHHV", "VVVV", "HVVV", "HVHV", "HHVV"]
@@ -149,10 +171,9 @@ def crop_to_bbox(input_tif, bbox_geom, temp_cropped_path):
     bounds = cropped_ds.rio.bounds()
     return bounds
 
-def search_and_download(aoi_bbox_str, start_date, end_date, temp_dir, session):
+def search_uavsar_scenes(aoi_bbox_str, start_date, end_date):
     """
-    For the given bounding box string, search for UAVSAR scenes using asf_search,
-    and for each returned GRD zip URL, extract TIFF files via UavsarScene into temp_dir.
+    Search for UAVSAR scenes using asf_search and return the list of GRD URLs.
     """
     wkt = bbox_to_wkt(aoi_bbox_str)
     print(f"Searching for UAVSAR scenes in area: {wkt}")
@@ -161,31 +182,81 @@ def search_and_download(aoi_bbox_str, start_date, end_date, temp_dir, session):
         intersectsWith=wkt,
         start=start_date,
         end=end_date,
-        #
-        beamMode=asf.BEAMMODE.POL, #https://github.com/asfadmin/Discovery-asf_search/blob/master/asf_search/constants/BEAMMODE.py
-        processingLevel=asf.PRODUCT_TYPE.PROJECTED, #see https://github.com/asfadmin/Discovery-asf_search/blob/master/asf_search/constants/PRODUCT_TYPE.py
-        maxResults=300  # adjust if needed
+        beamMode=asf.BEAMMODE.POL,
+        processingLevel=asf.PRODUCT_TYPE.PROJECTED,
+        maxResults=300
     )
     results = list(results)
     if not results:
         print("No UAVSAR scenes found for this bounding box.")
-        return
+        return []
 
     print(f"Found {len(results)} UAVSAR scene(s) for this area.")
-
     grd_urls = [res.properties.get('url') for res in results]
+    return grd_urls
 
-    # Process GRD files (unzipping as before):
-    if grd_urls:
-        print(f"Starting download: {len(grd_urls)} GRD file(s) will be processed.")
-        for i, zip_url in enumerate(grd_urls, 1):
-            print(f"Processing GRD file {i} of {len(grd_urls)}: {zip_url}")
-            print(f"Processing GRD URL: {zip_url}")
-            scene = UavsarScene(url=zip_url, work_dir=temp_dir)
-            try:
+
+def download_and_process_scene(zip_url, temp_dir, output_dir, input_bbox_str, catalog, max_retries=3, timeout_seconds=3600):
+    """
+    Download one scene, extract it, process it (crop & convert to COG),
+    add to catalog, then cleanup the extracted directory.
+    Includes timeout and retry logic.
+    Returns updated catalog.
+    """
+    print(f"Processing GRD URL: {zip_url}")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Step 1: Download and extract with timeout
+            print(f"  Attempt {attempt}/{max_retries}: Downloading and extracting...")
+            with timeout(timeout_seconds):
+                scene = UavsarScene(url=zip_url, work_dir=temp_dir)
                 scene.url_to_tiffs()
-            except Exception as e:
-                logging.error(f"Error processing {zip_url}: {e}")
+            
+            # Step 2: Process the extracted scene directory
+            print(f"  Processing scene directory...")
+            catalog = process_scene_directories(temp_dir, output_dir, input_bbox_str, catalog)
+            
+            # Step 3: Cleanup is handled inside process_scene_directories after each scene
+            print(f"  ✓ Successfully processed scene")
+            return catalog
+            
+        except TimeoutError as e:
+            logging.error(f"  ✗ Timeout on attempt {attempt}/{max_retries}: {e}")
+            # Clean up any partial downloads
+            cleanup_temp_dir(temp_dir)
+            if attempt == max_retries:
+                logging.error(f"  ✗ Failed after {max_retries} attempts, skipping scene")
+                return catalog
+            print(f"  Retrying in 5 seconds...")
+            import time
+            time.sleep(5)
+            
+        except Exception as e:
+            logging.error(f"  ✗ Error on attempt {attempt}/{max_retries}: {e}")
+            cleanup_temp_dir(temp_dir)
+            if attempt == max_retries:
+                logging.error(f"  ✗ Failed after {max_retries} attempts, skipping scene")
+                return catalog
+            print(f"  Retrying in 5 seconds...")
+            import time
+            time.sleep(5)
+    
+    return catalog
+
+
+def cleanup_temp_dir(temp_dir):
+    """Clean up all contents of temp directory."""
+    try:
+        for item in os.listdir(temp_dir):
+            item_path = os.path.join(temp_dir, item)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+        print(f"  Cleaned up temp directory: {temp_dir}")
+    except Exception as e:
+        logging.warning(f"  Failed to clean up {temp_dir}: {e}")
                 
 
 
@@ -319,6 +390,13 @@ def process_scene_directories(temp_dir, output_dir, input_bbox_str, catalog):
             print(f"Added STAC item {item.id} to catalog.")
         else:
             print(f"Item {item.id} already exists in catalog; skipping addition.")
+        
+        # Clean up the scene directory immediately after processing to free disk space.
+        print(f"  Cleaning up scene directory: {scene_path}")
+        try:
+            shutil.rmtree(scene_path)
+        except Exception as e:
+            logging.warning(f"Failed to clean up {scene_path}: {e}")
 
     return catalog
 
@@ -389,10 +467,16 @@ def main():
         # Create a dedicated temporary subdirectory for this bbox.
         temp_subdir = os.path.join(args.temp, f"bbox_{i}")
         os.makedirs(temp_subdir, exist_ok=True)
-        # Search and download scenes for this bounding box.
-        search_and_download(bbox_str, args.start, args.end, temp_subdir, session)
-        # Process the downloaded scenes (crop to the bbox, convert to COG, add to catalog).
-        catalog = process_scene_directories(temp_subdir, args.output, bbox_str, catalog)
+        
+        # Step 1: Search for scenes
+        grd_urls = search_uavsar_scenes(bbox_str, args.start, args.end)
+        
+        # Step 2: Process each scene one at a time (download -> extract -> process -> cleanup)
+        if grd_urls:
+            print(f"Starting download: {len(grd_urls)} GRD file(s) will be processed.")
+            for idx, zip_url in enumerate(grd_urls, 1):
+                print(f"Processing GRD file {idx} of {len(grd_urls)}: {zip_url}")
+                catalog = download_and_process_scene(zip_url, temp_subdir, args.output, bbox_str, catalog)
 
     # Save the final STAC catalog (self-contained) in the output directory.
     catalog.normalize_and_save(root_href=args.output, catalog_type=CatalogType.SELF_CONTAINED)

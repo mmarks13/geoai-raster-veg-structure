@@ -128,36 +128,36 @@ def choose_area_bbox(tile_bbox, tile_properties=None):
     """
     Choose the appropriate area bbox for 3DEP caching.
 
-    For forest plot tiles (have 'site' field): Use site-based bbox
-    For training tiles (no 'site' field): Use legacy geographic bbox
+    For forest plot tiles (site in FOREST_PLOT_SITE_BBOXES): Use site-based bbox
+    For raster prediction tiles (site not in dict or no site): Use geographic fallback
 
     Parameters
     ----------
     tile_bbox : tuple
         Tile bounding box in WGS84 (xmin, ymin, xmax, ymax)
     tile_properties : dict, optional
-        Tile properties from GeoJSON. If contains 'site' field, treated as forest plot tile.
+        Tile properties from GeoJSON. If contains 'site' field and site is in
+        FOREST_PLOT_SITE_BBOXES, use site-based bbox. Otherwise fallback to geographic.
 
     Returns
     -------
     tuple
         Area bounding box for 3DEP caching
     """
-    # Check if this is a forest plot tile (has 'site' field)
+    # Check if this is a forest plot tile (has 'site' field and site is in dict)
     if tile_properties and 'site' in tile_properties:
         site = tile_properties['site']
         if site in FOREST_PLOT_SITE_BBOXES:
             return FOREST_PLOT_SITE_BBOXES[site]
-        else:
-            raise ValueError(f"Unknown forest plot site: {site}")
+        # Site not in dict - fallback to geographic bbox (for raster prediction tiles)
+
+    # Use geographic fallback (for training tiles or sites not in dict)
+    cx = (tile_bbox[0] + tile_bbox[2]) / 2
+    cy = (tile_bbox[1] + tile_bbox[3]) / 2
+    if AREA_A_BBOX[0] <= cx <= AREA_A_BBOX[2] and AREA_A_BBOX[1] <= cy <= AREA_A_BBOX[3]:
+        return AREA_A_BBOX
     else:
-        # Training mode: Use legacy hardcoded bboxes (backwards compatible)
-        cx = (tile_bbox[0] + tile_bbox[2]) / 2
-        cy = (tile_bbox[1] + tile_bbox[3]) / 2
-        if AREA_A_BBOX[0] <= cx <= AREA_A_BBOX[2] and AREA_A_BBOX[1] <= cy <= AREA_A_BBOX[3]:
-            return AREA_A_BBOX
-        else:
-            return AREA_B_BBOX
+        return AREA_B_BBOX
 
 # Cache for one search per area
 CACHED_3DEP_ITEMS = {}
@@ -630,6 +630,116 @@ def process_imagery_data(bbox, start_date, end_date, stac_source, assets=None, o
     return convert_stack_to_tensors(data_stack, metadata_list, bbox, out_resolution)
 
 
+def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:32611"):
+    """
+    Extract fuel metrics raster patch for a given tile bbox.
+
+    Uses rasterio's one-step window + out_shape approach:
+    - Creates window from bbox (restricts source pixels to bbox)
+    - Uses out_shape to resample to exact dimensions
+    - Guarantees exact dimensions (e.g., 10m tile at 5m res → exactly 2×2 pixels)
+
+    Parameters
+    ----------
+    bbox : tuple or list
+        Bounding box (minx, miny, maxx, maxy) in bbox_crs coordinates
+    fuel_metrics_raster_path : str
+        Path to fuel metrics GeoTIFF (173 bands: 23 summary + 150 bulk density)
+    bbox_crs : str, optional
+        CRS of the bounding box (default: EPSG:32611)
+
+    Returns
+    -------
+    dict or None
+        Dictionary containing:
+        - 'fuel_metrics': numpy array of shape [23, h, w] (summary bands only)
+        - 'resolution': float (raster resolution in meters)
+        - 'patch_shape': tuple (h, w)
+        - 'nodata_stats': dict with NA counts per band
+        Returns None if tile is outside raster bounds or has no valid data
+
+    Notes
+    -----
+    - Only extracts bands 1-23 (summary metrics), ignoring bands 24-173 (bulk density profile)
+    - Patch dimensions h=w=tile_size/resolution (e.g., 10m tile at 2m res → 5×5 pixels)
+    - Uses src.read(window=..., out_shape=...) for one-step crop + resample
+    - Window restricts source pixels to bbox, preventing neighbor contamination
+    """
+    import rasterio
+    from rasterio.windows import from_bounds
+    from rasterio.enums import Resampling
+    from pyproj import CRS
+
+    try:
+        with rasterio.open(fuel_metrics_raster_path) as src:
+            # Get raster resolution (assuming square pixels)
+            resolution = src.res[0]
+
+            # Validate CRS match (use same logic as create_tile_grid.py)
+            expected_crs = CRS.from_epsg(32611)
+            actual_crs = CRS.from_user_input(src.crs)
+
+            # Accept both 2D EPSG:32611 and 3D variants
+            is_valid_crs = False
+            epsg_code = actual_crs.to_epsg()
+            if epsg_code == 32611:
+                is_valid_crs = True
+            elif 'UTM zone 11N' in actual_crs.name and 'WGS 84' in actual_crs.name:
+                is_valid_crs = True
+
+            if not is_valid_crs:
+                raise ValueError(
+                    f"Fuel metrics raster CRS mismatch. "
+                    f"Expected EPSG:32611, got {actual_crs.name}"
+                )
+
+            # Calculate target dimensions
+            minx, miny, maxx, maxy = bbox
+            width = math.ceil((maxx - minx) / resolution)
+            height = math.ceil((maxy - miny) / resolution)
+
+            # Create window from bbox (restricts source pixels)
+            window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+
+            # One-step read with window + out_shape + resampling
+            # This crops to bbox AND resamples to exact dimensions
+            data = src.read(
+                indexes=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23],  # Skip Band 22 (corrupted PAI_understory)
+                window=window,               # Restricts to bbox pixels
+                out_shape=(22, height, width),  # 22 bands (Band 22 removed)
+                resampling=Resampling.bilinear,  # Bilinear interpolation
+                boundless=False,             # Don't read outside raster bounds
+                fill_value=np.nan            # Use NaN for nodata
+            )
+
+            # Check if patch has any valid data
+            if np.all(np.isnan(data)):
+                return None
+
+            # Calculate NA statistics per band for monitoring
+            nodata_stats = {}
+            for i, band_idx in enumerate([3, 8, 12]):  # Height, TFL, Canopy_cover
+                band_data = data[band_idx - 1, :, :]
+                n_total = band_data.size
+                n_na = np.isnan(band_data).sum()
+                nodata_stats[f'band_{band_idx}'] = {
+                    'n_total': n_total,
+                    'n_na': n_na,
+                    'pct_na': 100 * n_na / n_total if n_total > 0 else 0
+                }
+
+            return {
+                'fuel_metrics': data,
+                'resolution': resolution,
+                'patch_shape': (height, width),
+                'nodata_stats': nodata_stats
+            }
+
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error processing fuel metrics for bbox {bbox}: {e}")
+        return None
 
 
 def bounding_box_to_geojson(bbox):
@@ -1434,6 +1544,7 @@ def process_bbox(args):
     skip_uav_lidar = args[17] if len(args) > 17 else False
     dep_stac_source = args[18] if len(args) > 18 else None
     tile_properties = args[19] if len(args) > 19 else None
+    fuel_metrics_raster = args[20] if len(args) > 20 else None
 
     # Calculate the overall tile number for progress reporting
     overall_tile_index = current_tile_index + i
@@ -1655,11 +1766,36 @@ def process_bbox(args):
             if naip_data:
                 result['has_naip'] = True
                 result['has_imagery'] = True
-                
+
                 # Add each key from naip_data with 'naip_' prefix
                 for key, value in naip_data.items():
                     result[f'naip_{key}'] = value
-        
+
+        # Process fuel metrics raster if path is provided
+        if fuel_metrics_raster:
+            if verbose:
+                print(f"Processing fuel metrics for tile {tile_id}")
+
+            fuel_metrics_data = process_fuel_metrics_data(
+                bbox=bbox,
+                fuel_metrics_raster_path=fuel_metrics_raster,
+                bbox_crs=bbox_crs
+            )
+
+            # Add fuel metrics data to the result dict with flattened structure
+            if fuel_metrics_data:
+                result['has_fuel_metrics'] = True
+
+                # Add each key from fuel_metrics_data with 'fuel_metrics_' prefix
+                # Avoid duplication: if key is already 'fuel_metrics', don't add prefix
+                for key, value in fuel_metrics_data.items():
+                    if key == 'fuel_metrics':
+                        result['fuel_metrics'] = value  # Just 'fuel_metrics', not 'fuel_metrics_fuel_metrics'
+                    else:
+                        result[f'fuel_metrics_{key}'] = value
+            else:
+                result['has_fuel_metrics'] = False
+
         # Print progress with overall count if total_tiles is provided
         if total_tiles > 0:
             imagery_status = []
@@ -1743,9 +1879,9 @@ def process_chunk(
     lidar_stac_source,
     bbox_crs,
     max_threads,
-    output_dir, 
+    output_dir,
     results_tracker,
-    max_api_retries, 
+    max_api_retries,
     initial_retry_delay,
     current_tile_index=0,
     total_tiles=0,
@@ -1756,7 +1892,8 @@ def process_chunk(
     max_points_list=[20000, 30000, 40000],
     min_uav_points=1000,
     skip_uav_lidar=False,
-    dep_stac_source=None
+    dep_stac_source=None,
+    fuel_metrics_raster=None
 ):
     """
     Process a single chunk of tiles and save results as HDF5 files.
@@ -1764,11 +1901,11 @@ def process_chunk(
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] Processing chunk {chunk_index}/{total_chunks}...")
-    
+
     # Prepare arguments for parallel processing, including voxel downsampling parameters
     args_list = [
         (i, tile_id, bbox, start_date, end_date, lidar_stac_source, bbox_crs, max_api_retries, initial_retry_delay,
-         current_tile_index + i, total_tiles, verbose, uavsar_stac_source, naip_stac_source, initial_voxel_size_cm, max_points_list, min_uav_points, skip_uav_lidar, dep_stac_source, tile_properties)
+         current_tile_index + i, total_tiles, verbose, uavsar_stac_source, naip_stac_source, initial_voxel_size_cm, max_points_list, min_uav_points, skip_uav_lidar, dep_stac_source, tile_properties, fuel_metrics_raster)
         for i, (tile_id, bbox, tile_properties) in enumerate(chunk, start=1)
     ]
     
@@ -1998,10 +2135,10 @@ def print_summary_report(results_tracker, total_tiles):
 
 def process_tiles_from_geojson(
     tiles_geojson,
-    start_date, 
-    end_date, 
-    lidar_stac_source, 
-    bbox_crs="EPSG:32611", 
+    start_date,
+    end_date,
+    lidar_stac_source,
+    bbox_crs="EPSG:32611",
     max_threads=2,
     chunk_size=20,
     output_dir="training_data_chunks",
@@ -2016,7 +2153,8 @@ def process_tiles_from_geojson(
     max_points_list=None,
     min_uav_points=1000,
     skip_uav_lidar=False,
-    dep_stac_source=None
+    dep_stac_source=None,
+    fuel_metrics_raster=None
 ):
     """
     Process LiDAR and imagery data using pre-defined tiles from a GeoJSON file.
@@ -2131,17 +2269,17 @@ def process_tiles_from_geojson(
         current_tile_index = (chunk_index - 1) * chunk_size
         
         process_chunk(
-            chunk, 
-            chunk_index, 
+            chunk,
+            chunk_index,
             len(chunks),
-            start_date, 
-            end_date, 
-            lidar_stac_source, 
-            bbox_crs, 
-            max_threads, 
-            output_dir, 
+            start_date,
+            end_date,
+            lidar_stac_source,
+            bbox_crs,
+            max_threads,
+            output_dir,
             results_tracker,
-            max_api_retries, 
+            max_api_retries,
             initial_retry_delay,
             current_tile_index,
             total_tiles,
@@ -2152,7 +2290,8 @@ def process_tiles_from_geojson(
             max_points_list,
             min_uav_points,
             skip_uav_lidar,
-            dep_stac_source
+            dep_stac_source,
+            fuel_metrics_raster
         )
         
         # Give the system a moment to recover between chunks
@@ -2209,15 +2348,15 @@ def process_tiles_from_geojson(
         retry_start_time = datetime.now()
         for chunk_index, chunk in enumerate(retry_chunks, start=1):
             process_chunk(
-                chunk, 
-                chunk_index, 
+                chunk,
+                chunk_index,
                 len(retry_chunks),
-                start_date, 
-                end_date, 
-                lidar_stac_source, 
-                bbox_crs, 
+                start_date,
+                end_date,
+                lidar_stac_source,
+                bbox_crs,
                 max(max_threads // 2, 1),  # Use fewer threads for retries
-                retry_output_dir, 
+                retry_output_dir,
                 retry_results_tracker,
                 max_api_retries * 2,  # Double the retry attempts for failed tiles
                 initial_retry_delay * 2,  # Use longer initial delay for retries
@@ -2230,7 +2369,8 @@ def process_tiles_from_geojson(
                 max_points_list,
                 min_uav_points,
                 skip_uav_lidar,
-                dep_stac_source
+                dep_stac_source,
+                fuel_metrics_raster
             )
             
             # Give the system more time to recover between retry chunks
@@ -2423,15 +2563,22 @@ if __name__ == "__main__":
         help="Skip UAV LiDAR processing (for test-only data without ground truth)"
     )
 
+    parser.add_argument(
+        "--fuel-metrics-raster",
+        type=str,
+        default=None,
+        help="Path to fuel metrics GeoTIFF raster (173 bands: 23 summary + 150 bulk density)"
+    )
+
     args = parser.parse_args()
 
     # Call processing function with the given tiles and other parameters
     process_tiles_from_geojson(
-        tiles_geojson=args.tiles_geojson, 
-        start_date=args.start_date, 
-        end_date=args.end_date, 
-        lidar_stac_source=args.lidar_stac_source, 
-        bbox_crs="EPSG:32611", 
+        tiles_geojson=args.tiles_geojson,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        lidar_stac_source=args.lidar_stac_source,
+        bbox_crs="EPSG:32611",
         max_threads=args.threads,
         chunk_size=args.chunk_size,
         output_dir=args.outdir,
@@ -2446,5 +2593,6 @@ if __name__ == "__main__":
         max_points_list=args.max_points,
         min_uav_points=args.min_uav_points,
         skip_uav_lidar=args.skip_uav_lidar,
-        dep_stac_source=args.dep_stac_source
+        dep_stac_source=args.dep_stac_source,
+        fuel_metrics_raster=args.fuel_metrics_raster
     )

@@ -137,6 +137,27 @@ python src/fuel_metrics/process_fuel_metrics.py --list_species
 - **Comment flow/context** - One-line labels for multi-step processes; "why" for non-obvious decisions/trade-offs
 - **Clarify complex logic** - Explain what isn't self-evident; avoid restating obvious code
 
+### CRS & Geospatial Data Standards
+
+**Core Principle:** CRS mismatches must fail immediately with clear errors - never silently propagate.
+
+- **Explicit CRS declaration** - All geospatial files MUST include CRS metadata in file format
+- **Fail fast validation** - Check CRS on file read, reject mismatches immediately with clear error
+- **No silent reprojection** - Fix CRS issues in source files/scripts upstream, not in processing code
+- **Clear error messages** - State expected CRS, actual CRS, and which file to fix
+- **Datum awareness** - Never assume datum shifts (WGS84 vs NAD83) are acceptable - verify requirements explicitly
+- **User control** - Provide `--crs` arguments with documented defaults; fail if input doesn't match
+
+**Example validation pattern:**
+```python
+expected_crs = 'EPSG:32611'
+if str(gdf.crs) != expected_crs:
+    raise ValueError(
+        f"CRS mismatch! Expected: {expected_crs}, Got: {gdf.crs}. "
+        f"Reproject input file {input_path} to {expected_crs} before processing."
+    )
+```
+
 ### Testing & Dependencies
 - **Test critical paths** - Complex logic, edge cases, public APIs after implementation; skip trivial code
 - **Use established libraries** - Prefer mature, maintained libraries over custom implementations

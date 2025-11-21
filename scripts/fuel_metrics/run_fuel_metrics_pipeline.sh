@@ -31,7 +31,7 @@ TILE_SIZE=200
 BUFFER=10
 PARALLEL_JOBS=6
 OUTPUT_BASE="data/processed/fuel_metrics"
-CLUMPING=0.77
+CLUMPING=0.6
 PROJECTION_FACTOR=0.5
 
 # Color codes for output

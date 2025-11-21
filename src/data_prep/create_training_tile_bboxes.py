@@ -447,23 +447,45 @@ def main():
                 "properties": {"filename": filename}
             })
     
-    # Convert the tiles to GeoJSON format
-    geojson_tiles = {
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "geometry": tile["geometry"],
-                "properties": tile["properties"]
-            } for tile in all_tiles
-        ]
-    }
-    
-    # Save the GeoJSON to a file
+    # --- OLD CODE (11/11/2025): Manual GeoJSON creation without CRS declaration ---
+    # This caused tiles.geojson to be saved without explicit CRS metadata, leading to
+    # GeoPandas assuming EPSG:4326 when the coordinates are actually EPSG:32611.
+    # Replaced with GeoPandas .to_file() to properly preserve CRS information.
+    #
+    # # Convert the tiles to GeoJSON format
+    # geojson_tiles = {
+    #     "type": "FeatureCollection",
+    #     "features": [
+    #         {
+    #             "type": "Feature",
+    #             "geometry": tile["geometry"],
+    #             "properties": tile["properties"]
+    #         } for tile in all_tiles
+    #     ]
+    # }
+    #
+    # # Save the GeoJSON to a file
+    # print(f"\n--- Saving tiles to GeoJSON ---")
+    # with open(tiles_output_file, 'w') as f:
+    #     json.dump(geojson_tiles, f)
+    #
+    # print(f"Tile creation completed. {len(all_tiles)} tiles saved to {tiles_output_file}")
+
+    # --- NEW CODE (11/11/2025): Use GeoPandas to preserve CRS ---
     print(f"\n--- Saving tiles to GeoJSON ---")
-    with open(tiles_output_file, 'w') as f:
-        json.dump(geojson_tiles, f)
-    
+    from shapely.geometry import shape
+
+    # Convert tiles to GeoDataFrame with explicit CRS
+    geometries = [shape(tile["geometry"]) for tile in all_tiles]
+    properties = [tile["properties"] for tile in all_tiles]
+
+    gdf = gpd.GeoDataFrame(
+        properties,
+        geometry=geometries,
+        crs="EPSG:32611"  # Explicitly set CRS matching extraction (line 425)
+    )
+
+    gdf.to_file(tiles_output_file, driver='GeoJSON')
     print(f"Tile creation completed. {len(all_tiles)} tiles saved to {tiles_output_file}")
 
 
