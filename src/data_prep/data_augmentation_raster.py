@@ -44,6 +44,65 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
+def denormalize_to_physical_space(tile):
+    """
+    Convert z-score normalized points back to bbox-normalized (physical space).
+
+    Denormalization: x_bbox_norm = x_zscore * std + mean
+
+    Returns tile with dep_points_norm temporarily replaced with bbox-normalized values.
+    Stores original z-score normalized points for later restoration.
+    """
+    if 'dep_points_norm' not in tile or 'norm_params' not in tile:
+        return tile
+
+    tile_copy = tile.copy()
+    zscore_points = tile_copy['dep_points_norm']
+    norm_params = tile_copy['norm_params']
+
+    # Extract denormalization parameters
+    coord_mean = torch.tensor(norm_params['coord_mean'], dtype=zscore_points.dtype, device=zscore_points.device)
+    coord_std = torch.tensor(norm_params['coord_std'], dtype=zscore_points.dtype, device=zscore_points.device)
+
+    # Denormalize: x_physical = x_zscore * std + mean
+    bbox_norm_points = zscore_points * coord_std + coord_mean
+
+    # Store original z-score points and replace with physical space version
+    tile_copy['_original_zscore_points'] = zscore_points
+    tile_copy['dep_points_norm'] = bbox_norm_points
+
+    return tile_copy
+
+
+def renormalize_from_physical_space(tile):
+    """
+    Convert augmented bbox-normalized (physical space) points back to z-score normalized.
+
+    Normalization: x_zscore = (x_bbox_norm - mean) / std
+
+    Restores z-score normalized representation after augmentation.
+    """
+    if 'norm_params' not in tile or '_original_zscore_points' not in tile:
+        return tile
+
+    tile_copy = tile.copy()
+    bbox_norm_points = tile_copy['dep_points_norm']
+    norm_params = tile_copy['norm_params']
+
+    # Extract normalization parameters
+    coord_mean = torch.tensor(norm_params['coord_mean'], dtype=bbox_norm_points.dtype, device=bbox_norm_points.device)
+    coord_std = torch.tensor(norm_params['coord_std'], dtype=bbox_norm_points.dtype, device=bbox_norm_points.device)
+
+    # Re-normalize: x_zscore = (x_physical - mean) / std
+    zscore_points = (bbox_norm_points - coord_mean) / coord_std
+
+    # Restore z-score normalization and clean up temporary storage
+    tile_copy['dep_points_norm'] = zscore_points
+    del tile_copy['_original_zscore_points']
+
+    return tile_copy
+
+
 def rotate_fuel_metrics(tile, angle_degrees=None):
     """
     Rotate fuel metrics raster [22, h, w] by specified angle.
@@ -176,6 +235,10 @@ def augment_tile_with_rasters(tile, config=None):
     augmented_tile = copy.deepcopy(tile)
 
     try:
+        # CRITICAL: Convert from z-score normalized space to physical (bbox-normalized) space
+        # All augmentations happen in physical space, then convert back at the end
+        augmented_tile = denormalize_to_physical_space(augmented_tile)
+
         # Store original fuel_metrics for synchronized transforms
         original_fm = augmented_tile.get('fuel_metrics')
 
@@ -264,6 +327,9 @@ def augment_tile_with_rasters(tile, config=None):
                 effect_strength=config['sensor_effect_strength'],
                 speckle_variance=config['uavsar_noise_variance']
             )
+
+        # CRITICAL: Convert back from physical (bbox-normalized) space to z-score normalized space
+        augmented_tile = renormalize_from_physical_space(augmented_tile)
 
         # Regenerate KNN indices
         if 'knn_edge_indices' in augmented_tile:

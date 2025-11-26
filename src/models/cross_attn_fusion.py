@@ -203,21 +203,26 @@ class CrossAttentionFusion(nn.Module):
         return attn_output
     
     def forward(self, point_features, edge_index, point_positions, naip_embeddings=None, uavsar_embeddings=None,
-                main_bbox=None, naip_bbox=None, uavsar_bbox=None, center=None, scale=None):
+                main_bbox=None, naip_bbox=None, uavsar_bbox=None, center=None, scale=None, norm_params=None):
         """
         Fuse point features with patch embeddings using cross-attention
         with implicit positional encodings and PointTransformerConv for final feature extraction
-        
+
         Args:
             point_features: Point features [N, D_p]
             edge_index: Edge indices for graph connectivity [2, E]
             point_positions: Point positions in 3D space [N, 3]
+                          For point cloud model: bbox-normalized (X,Y ∈ [-5,5]m)
+                          For raster model: z-score normalized (mean≈0, std≈1)
             naip_embeddings: NAIP patch embeddings [P, D_patch] or None
             uavsar_embeddings: UAVSAR patch embeddings [P, D_patch] or None
             main_bbox: Bounding box of the point cloud [xmin, ymin, xmax, ymax]
             naip_bbox: Bounding box of NAIP imagery [minx, miny, maxx, maxy]
             uavsar_bbox: Bounding box of UAVSAR imagery [minx, miny, maxx, maxy]
-            
+            norm_params: Optional dict with 'coord_mean' and 'coord_std' for denormalization
+                       If provided, point_positions will be denormalized before distance computation
+                       (z-score → bbox-normalized space in meters)
+
         Returns:
             fused_features: Point features enhanced with patch information [N, D_p]
         """
@@ -233,12 +238,24 @@ class CrossAttentionFusion(nn.Module):
         # Get device
         device = point_features.device
         point_positions = point_positions.to(device)  # [N, 3]
-        
+
+        # Denormalize point positions if norm_params provided (raster model)
+        # For raster model: z-score → bbox-normalized (meters)
+        # For point cloud model: already bbox-normalized, norm_params=None (backward compatible)
+        if norm_params is not None:
+            # norm_params values are already tensors, just move to device/dtype
+            coord_mean = norm_params['coord_mean'].to(device=device, dtype=point_positions.dtype)  # [3]
+            coord_std = norm_params['coord_std'].to(device=device, dtype=point_positions.dtype)  # [3]
+            point_pos_phys = point_positions * coord_std + coord_mean  # [N, 3] in bbox-normalized (meter) space
+        else:
+            point_pos_phys = point_positions  # [N, 3] already in bbox-normalized space
+
         # Normalize and prepare inputs
         N = point_features.size(0)  # Number of points
         point_features = self.norm1(point_features)  # [N, D_p]
-        
+
         # Encode point positions using sinusoidal encoding
+        # Use z-score normalized positions for encoding (better numerical properties)
         point_pos_encoded = self.positional_encoding(point_positions, self.position_encoding_dim)  # [N, pos_dim]
         
         # Create point queries with implicit position information
@@ -260,11 +277,12 @@ class CrossAttentionFusion(nn.Module):
             mask = None
             if self.use_distance_mask:
                 # Calculate distances between points and patches - only when masking is used
+                # Use denormalized positions (meters) for distance computation
                 squared_diffs = (
-                    point_positions[:, :2].unsqueeze(1) -  # [N, 1, 2]
-                    naip_patch_positions.unsqueeze(0)      # [1, P, 2]
+                    point_pos_phys[:, :2].unsqueeze(1) -  # [N, 1, 2] in meters
+                    naip_patch_positions.unsqueeze(0)      # [1, P, 2] in meters
                 ).pow(2)  # [N, P, 2]
-                
+
                 distances = torch.sqrt(squared_diffs.sum(dim=-1))  # [N, P]
                 mask = distances > self.max_dist_ratio  # [N, P], True where attention should be masked
             
@@ -295,11 +313,12 @@ class CrossAttentionFusion(nn.Module):
             mask = None
             if self.use_distance_mask:
                 # Calculate distances between points and patches - only when masking is used
+                # Use denormalized positions (meters) for distance computation
                 squared_diffs = (
-                    point_positions[:, :2].unsqueeze(1) -  # [N, 1, 2]
-                    uavsar_patch_positions.unsqueeze(0)    # [1, P, 2]
+                    point_pos_phys[:, :2].unsqueeze(1) -  # [N, 1, 2] in meters
+                    uavsar_patch_positions.unsqueeze(0)    # [1, P, 2] in meters
                 ).pow(2)  # [N, P, 2]
-                
+
                 distances = torch.sqrt(squared_diffs.sum(dim=-1))  # [N, P]
                 mask = distances > self.max_dist_ratio  # [N, P], True where attention should be masked
             

@@ -189,6 +189,251 @@ def normalize_point_clouds_with_bbox(dep_points: torch.Tensor,
     return dep_points_norm, uav_points_norm, center, scale
 
 
+def compute_global_coordinate_and_attribute_statistics(all_tiles):
+    """
+    Compute global mean and std for BBOX-NORMALIZED coordinates (X,Y,Z) and attributes.
+
+    CRITICAL: This computes stats on coordinates AFTER normalize_point_clouds_with_bbox(),
+    not on raw coordinates. This maintains spatial structure while standardizing distribution.
+
+    Args:
+        all_tiles: List of tile dicts with 'dep_points' and 'dep_pnt_attr'
+
+    Returns:
+        dict with keys:
+            'coord_mean': [x_mean, y_mean, z_mean] (of bbox-normalized coords)
+            'coord_std': [x_std, y_std, z_std] (of bbox-normalized coords)
+            'attr_mean': [intensity_mean, return_num_mean, num_returns_mean]
+            'attr_std': [intensity_std, return_num_std, num_returns_std]
+            'total_points': int
+            'total_tiles': int
+    """
+    logger.info("Computing global statistics on bbox-normalized coordinates...")
+
+    all_coords_norm = []
+    all_attrs = []
+    total_points = 0
+
+    for tile_idx, tile in enumerate(all_tiles):
+        if 'dep_points' not in tile or tile['dep_points'] is None:
+            continue
+
+        dep_points = tile['dep_points'].clone()
+        dep_pnt_attr = tile.get('dep_pnt_attr', None)
+        bbox = tile.get('bbox', None)
+
+        if bbox is None:
+            continue
+
+        # Step 1: Apply bbox normalization (existing function)
+        # This brings coords to meter-scale: X,Y ∈ [-5,5]m, Z ∈ [0,max]m (relative to ground)
+        uav_dummy = torch.empty((0, 3), dtype=torch.float32)
+        dep_points_norm, _, _, _ = normalize_point_clouds_with_bbox(
+            dep_points, uav_dummy, bbox, dtype=torch.float32
+        )
+
+        # Step 2: Clamp bbox-normalized Z to [0, 150] to remove bird returns
+        dep_points_norm[:, 2] = torch.clamp(dep_points_norm[:, 2], 0, 150)
+
+        # Collect bbox-normalized coordinates
+        all_coords_norm.append(dep_points_norm)
+        total_points += dep_points_norm.shape[0]
+
+        # Collect attributes if present
+        if dep_pnt_attr is not None:
+            all_attrs.append(dep_pnt_attr)
+
+        if (tile_idx + 1) % 50 == 0:
+            logger.info(f"  Processed {tile_idx + 1}/{len(all_tiles)} tiles for stats computation...")
+
+    if len(all_coords_norm) == 0:
+        raise ValueError("No valid tiles found for statistics computation!")
+
+    # Concatenate all bbox-normalized coordinates
+    all_coords_norm = torch.cat(all_coords_norm, dim=0)  # [N_total, 3]
+
+    # Compute coordinate statistics
+    coord_mean = all_coords_norm.mean(dim=0).numpy()  # [3]
+    coord_std = all_coords_norm.std(dim=0).numpy()    # [3]
+
+    logger.info(f"  Coordinate stats (bbox-normalized):")
+    logger.info(f"    X: mean={coord_mean[0]:.4f}, std={coord_std[0]:.4f}")
+    logger.info(f"    Y: mean={coord_mean[1]:.4f}, std={coord_std[1]:.4f}")
+    logger.info(f"    Z: mean={coord_mean[2]:.4f}, std={coord_std[2]:.4f}")
+
+    # Compute attribute statistics if available
+    attr_mean = None
+    attr_std = None
+
+    if len(all_attrs) > 0:
+        all_attrs = torch.cat(all_attrs, dim=0)  # [N_total, 3]
+
+        attr_mean = torch.zeros(3, dtype=torch.float64)
+        attr_std = torch.zeros(3, dtype=torch.float64)
+
+        for attr_idx in range(3):
+            values = all_attrs[:, attr_idx]
+            # Handle NaN/Inf
+            valid_mask = ~(torch.isnan(values) | torch.isinf(values))
+            valid_values = values[valid_mask]
+
+            if len(valid_values) > 0:
+                attr_mean[attr_idx] = valid_values.mean()
+                attr_std[attr_idx] = valid_values.std()
+            else:
+                attr_mean[attr_idx] = 0.0
+                attr_std[attr_idx] = 1.0
+
+        attr_mean = attr_mean.numpy()
+        attr_std = attr_std.numpy()
+
+        logger.info(f"  Attribute stats:")
+        logger.info(f"    Intensity: mean={attr_mean[0]:.4f}, std={attr_std[0]:.4f}")
+        logger.info(f"    ReturnNumber: mean={attr_mean[1]:.4f}, std={attr_std[1]:.4f}")
+        logger.info(f"    NumberOfReturns: mean={attr_mean[2]:.4f}, std={attr_std[2]:.4f}")
+
+    # Convert to tensors (not lists) for weights_only=True compatibility
+    return {
+        'coord_mean': torch.from_numpy(coord_mean).float(),  # Tensor[3]
+        'coord_std': torch.from_numpy(coord_std).float(),    # Tensor[3]
+        'attr_mean': torch.from_numpy(attr_mean).float() if attr_mean is not None else None,  # Tensor[3]
+        'attr_std': torch.from_numpy(attr_std).float() if attr_std is not None else None,     # Tensor[3]
+        'total_points': int(total_points),
+        'total_tiles': len([t for t in all_tiles if 'dep_points' in t])
+    }
+
+
+def remove_z_outliers_from_tile(tile, z_mean_bbox_norm, z_std_bbox_norm, n_std=4.0, log_file=None):
+    """
+    Remove points where bbox-normalized Z value exceeds mean + n_std * std.
+
+    CRITICAL: Operates on bbox-normalized coordinates, not raw coords.
+
+    Args:
+        tile: Tile dict with 'dep_points' and 'dep_pnt_attr'
+        z_mean_bbox_norm: Mean of Z after bbox normalization
+        z_std_bbox_norm: Std of Z after bbox normalization
+        n_std: Number of std devs for threshold (default 4.0)
+        log_file: File handle for logging
+
+    Returns:
+        tile: Modified tile with outliers removed
+        n_removed: Number of points removed
+    """
+    if 'dep_points' not in tile or tile['dep_points'] is None:
+        return tile, 0
+
+    dep_points = tile['dep_points'].clone()
+    dep_pnt_attr = tile.get('dep_pnt_attr', None)
+    bbox = tile.get('bbox', None)
+    tile_id = tile.get('tile_id', 'unknown')
+
+    if bbox is None:
+        return tile, 0
+
+    # Apply bbox normalization to get Z in same space as stats
+    uav_dummy = torch.empty((0, 3), dtype=torch.float32)
+    dep_points_norm, _, _, _ = normalize_point_clouds_with_bbox(
+        dep_points, uav_dummy, bbox, dtype=torch.float32
+    )
+
+    # Clamp bbox-normalized Z to [0, 150]
+    dep_points_norm[:, 2] = torch.clamp(dep_points_norm[:, 2], 0, 150)
+
+    # Identify outliers based on bbox-normalized Z
+    z_norm = dep_points_norm[:, 2]
+    threshold = z_mean_bbox_norm + n_std * z_std_bbox_norm
+    outlier_mask = z_norm > threshold
+    n_removed = outlier_mask.sum().item()
+
+    if n_removed > 0:
+        # Log each outlier
+        if log_file is not None:
+            outlier_indices = torch.where(outlier_mask)[0]
+            for idx in outlier_indices:
+                z_val = z_norm[idx].item()
+                n_std_above = (z_val - z_mean_bbox_norm) / z_std_bbox_norm if z_std_bbox_norm > 0 else 0
+                log_file.write(
+                    f"Tile {tile_id}, point {idx.item()}: "
+                    f"Z_bbox_norm={z_val:.3f} ({n_std_above:.2f} std above mean)\n"
+                )
+
+        # Remove outliers from ORIGINAL coordinates
+        keep_mask = ~outlier_mask
+        tile['dep_points'] = dep_points[keep_mask]
+
+        if dep_pnt_attr is not None:
+            tile['dep_pnt_attr'] = dep_pnt_attr[keep_mask]
+
+    return tile, n_removed
+
+
+def apply_zscore_to_bbox_normalized_coords(dep_points_bbox_norm, coord_mean, coord_std):
+    """
+    Apply z-score normalization to bbox-normalized coordinates.
+
+    CRITICAL: Input coordinates are ALREADY bbox-normalized (X,Y ∈ [-5,5]m, Z ∈ [0,max]m).
+    This function standardizes the distribution to mean=0, std=1.
+
+    Args:
+        dep_points_bbox_norm: [N, 3] bbox-normalized coordinates
+        coord_mean: [3] means of bbox-normalized coords (from global stats)
+        coord_std: [3] stds of bbox-normalized coords (from global stats)
+
+    Returns:
+        dep_points_zscore: [N, 3] z-score normalized coordinates
+    """
+    coord_mean_t = torch.tensor(coord_mean, dtype=dep_points_bbox_norm.dtype, device=dep_points_bbox_norm.device)
+    coord_std_t = torch.tensor(coord_std, dtype=dep_points_bbox_norm.dtype, device=dep_points_bbox_norm.device)
+
+    # Z-score: (x - mean) / std
+    dep_points_zscore = (dep_points_bbox_norm - coord_mean_t) / coord_std_t
+
+    return dep_points_zscore
+
+
+def normalize_attributes_zscore(dep_pnt_attr, attr_mean, attr_std, dtype=torch.float16):
+    """
+    Normalize point attributes using z-score.
+
+    Handles NaN/Inf by setting to mean before normalization.
+
+    Args:
+        dep_pnt_attr: [N, 3] raw attributes
+        attr_mean: [3] global means
+        attr_std: [3] global stds
+        dtype: Output dtype (default float16 for memory)
+
+    Returns:
+        dep_points_attr_norm: [N, 3] normalized attributes
+    """
+    if dep_pnt_attr is None:
+        return None
+
+    dep_points_attr_norm = dep_pnt_attr.clone()
+
+    # Handle invalid values → set to mean
+    invalid_mask = torch.isnan(dep_points_attr_norm) | torch.isinf(dep_points_attr_norm)
+
+    attr_mean_t = torch.tensor(attr_mean, dtype=dep_points_attr_norm.dtype, device=dep_points_attr_norm.device)
+    attr_std_t = torch.tensor(attr_std, dtype=dep_points_attr_norm.dtype, device=dep_points_attr_norm.device)
+
+    for attr_idx in range(3):
+        if invalid_mask[:, attr_idx].any():
+            dep_points_attr_norm[:, attr_idx][invalid_mask[:, attr_idx]] = attr_mean_t[attr_idx]
+
+    # Z-score normalization
+    dep_points_attr_norm = (dep_points_attr_norm - attr_mean_t) / attr_std_t
+
+    # Set remaining invalid to 0
+    dep_points_attr_norm[torch.isnan(dep_points_attr_norm) | torch.isinf(dep_points_attr_norm)] = 0.0
+
+    # Convert to specified dtype
+    dep_points_attr_norm = dep_points_attr_norm.to(dtype)
+
+    return dep_points_attr_norm
+
+
 ##########################################
 # Date and Imagery Preprocessing (NAIP/UAVSAR)
 # IDENTICAL to: src/data_prep/train_test_split_and_precompute.py
@@ -598,6 +843,68 @@ def replace_remaining_nans_with_sentinel(tile, sentinel_value=-999.0):
     return tile
 
 
+def report_distribution_shift(train_stats, val_stats, dataset_name="Validation"):
+    """
+    Report distribution shift between training and validation/test sets.
+
+    Large shifts (>1.0 std) indicate potential domain mismatch.
+
+    Args:
+        train_stats: Dict with 'coord_mean', 'coord_std', 'attr_mean', 'attr_std'
+        val_stats: Dict with same structure
+        dataset_name: Name of comparison dataset (e.g., "Validation", "Forest Plots")
+
+    Returns:
+        dict with shift metrics
+    """
+    logger.info("\n" + "="*80)
+    logger.info(f"DISTRIBUTION SHIFT ANALYSIS ({dataset_name} vs Training)")
+    logger.info("="*80)
+
+    # Coordinate shift
+    coord_shift = []
+    for dim, name in enumerate(['X', 'Y', 'Z']):
+        mean_diff = abs(val_stats['coord_mean'][dim] - train_stats['coord_mean'][dim])
+        std_diff = abs(val_stats['coord_std'][dim] - train_stats['coord_std'][dim])
+
+        # Normalize by training std
+        shift_in_std = mean_diff / train_stats['coord_std'][dim]
+        std_ratio = val_stats['coord_std'][dim] / train_stats['coord_std'][dim]
+        coord_shift.append(shift_in_std)
+
+        logger.info(f"  {name}: mean shift = {shift_in_std:.3f} std, "
+                   f"std ratio = {std_ratio:.3f}")
+
+    # Attribute shift (if available)
+    attr_shift = []
+    if train_stats.get('attr_mean') is not None and val_stats.get('attr_mean') is not None:
+        for dim, name in enumerate(['Intensity', 'ReturnNumber', 'NumberOfReturns']):
+            mean_diff = abs(val_stats['attr_mean'][dim] - train_stats['attr_mean'][dim])
+            shift_in_std = mean_diff / train_stats['attr_std'][dim]
+            attr_shift.append(shift_in_std)
+
+            logger.info(f"  {name}: mean shift = {shift_in_std:.3f} std")
+
+    # Overall assessment
+    max_coord_shift = max(coord_shift)
+    if max_coord_shift > 1.0:
+        logger.warning(f"  ⚠️  SEVERE coordinate shift detected ({max_coord_shift:.2f} std)")
+        logger.warning(f"      {dataset_name} distribution differs significantly from training!")
+    elif max_coord_shift > 0.5:
+        logger.warning(f"  ⚠️  Moderate coordinate shift detected ({max_coord_shift:.2f} std)")
+        logger.warning(f"      Monitor {dataset_name.lower()} performance carefully")
+    else:
+        logger.info(f"  ✓ Acceptable coordinate shift ({max_coord_shift:.2f} std)")
+
+    logger.info("="*80)
+
+    return {
+        'coord_shift': coord_shift,
+        'attr_shift': attr_shift,
+        'max_shift': max_coord_shift
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train/validation split and precomputation for raster model"
@@ -670,56 +977,71 @@ def main():
     all_tiles = combined_data if isinstance(combined_data, list) else combined_data['tiles']
     logger.info(f"Loaded {len(all_tiles)} tiles")
 
-    # Fix key naming issues and normalize point clouds
+    # ============================================================================
+    # STEP 1: FIX KEY NAMING AND CONVERT TO TENSORS
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 1: FIX KEY NAMING AND CONVERT TO TENSORS")
+    logger.info("="*80)
+
+    # Convert numpy scalars to Python native types for weights_only=True compatibility
+    numpy_scalar_fields = [
+        'fuel_metrics_resolution',
+        'has_fuel_metrics',
+        'has_imagery',
+        'has_naip',
+        'has_pointcloud',
+        'has_uavsar',
+        'initial_voxel_size_cm',
+        'naip_resolution',
+        'uavsar_resolution'
+    ]
+
     for tile in all_tiles:
-        # Fix fuel_metrics_fuel_metrics → fuel_metrics
         if 'fuel_metrics_fuel_metrics' in tile and 'fuel_metrics' not in tile:
             tile['fuel_metrics'] = tile.pop('fuel_metrics_fuel_metrics')
 
-        # Normalize point cloud coordinates (matches original train_test_split_and_precompute.py)
-        if 'dep_points' in tile and 'dep_points_norm' not in tile:
-            dep_points = tile.pop('dep_points')
-            if isinstance(dep_points, np.ndarray):
-                dep_points = torch.from_numpy(dep_points).float()
+        # Convert numpy arrays to tensors
+        if 'dep_points' in tile and isinstance(tile['dep_points'], np.ndarray):
+            tile['dep_points'] = torch.from_numpy(tile['dep_points']).float()
+        if 'dep_pnt_attr' in tile and isinstance(tile['dep_pnt_attr'], np.ndarray):
+            tile['dep_pnt_attr'] = torch.from_numpy(tile['dep_pnt_attr']).float()
+        if 'bbox' in tile and isinstance(tile['bbox'], np.ndarray):
+            tile['bbox'] = torch.from_numpy(tile['bbox']).float()
 
-            # Get UAV points if available, otherwise create empty tensor
-            uav_points = tile.get('uav_points', torch.empty((0, 3), dtype=torch.float32))
-            if isinstance(uav_points, np.ndarray):
-                uav_points = torch.from_numpy(uav_points).float()
+        # Convert numpy scalar types to Python native types
+        for field in numpy_scalar_fields:
+            if field in tile:
+                value = tile[field]
+                if isinstance(value, (np.integer, np.floating)):
+                    # Convert numpy scalars to Python float/int
+                    tile[field] = float(value) if isinstance(value, np.floating) else int(value)
+                elif isinstance(value, np.bool_):
+                    # Convert numpy bool to Python bool
+                    tile[field] = bool(value)
 
-            # Get bbox for normalization
-            if 'bbox' in tile:
-                bbox = tile['bbox']
-                if isinstance(bbox, np.ndarray):
-                    bbox = torch.from_numpy(bbox).float()
+    logger.info("Fixed key naming, converted arrays to tensors, and converted numpy scalars to Python types")
 
-                # Normalize point clouds using the same function as the original version
-                dep_points_norm, uav_points_norm, center, scale = normalize_point_clouds_with_bbox(
-                    dep_points, uav_points, bbox, dtype=torch.float32
-                )
+    # ============================================================================
+    # STEP 3: PRE-FILTER TILES (on raw data, before normalization)
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 3: PRE-FILTER TILES BY QUALITY")
+    logger.info("="*80)
+    logger.info(f"Filtering criteria: min_dep_points={args.min_dep_points}, max_na_ratio={args.max_na_ratio}")
 
-                tile['dep_points_norm'] = dep_points_norm
-                tile['uav_points'] = uav_points_norm
-                tile['center'] = center
-                tile['scale'] = scale
-            else:
-                logger.warning(f"No bbox found for tile {tile.get('tile_id', 'unknown')}, skipping point normalization")
-                tile['dep_points_norm'] = dep_points
-
-    # Filter tiles by quality
-    logger.info(f"\nFiltering tiles (min_dep_points={args.min_dep_points}, max_na_ratio={args.max_na_ratio})...")
     filtered_tiles = []
     filtered_out_count = 0
     total_na_replaced = 0
     na_per_band = {i: 0 for i in range(1, 24)}
 
     for tile_idx, tile in enumerate(all_tiles):
-        # Check DEP points
-        if 'dep_points_norm' not in tile or tile['dep_points_norm'] is None:
+        # Check DEP points (use raw dep_points, not normalized)
+        if 'dep_points' not in tile or tile['dep_points'] is None:
             filtered_out_count += 1
             continue
 
-        dep_count = tile['dep_points_norm'].shape[0]
+        dep_count = tile['dep_points'].shape[0]
         if dep_count < args.min_dep_points:
             filtered_out_count += 1
             continue
@@ -745,20 +1067,14 @@ def main():
         logger.error("No valid tiles found after filtering!")
         return
 
-    # Compute normalization statistics
-    logger.info("\nComputing normalization statistics...")
-    stats = compute_normalization_stats(filtered_tiles)
+    # ============================================================================
+    # STEP 4: RANDOM SHUFFLE AND TRAIN/VAL SPLIT
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info(f"STEP 4: RANDOM TRAIN/VAL SPLIT ({args.train_val_ratio*100:.0f}/{(1-args.train_val_ratio)*100:.0f})")
+    logger.info("="*80)
 
-    # Save normalization stats to JSON
-    stats_json_path = output_dir / 'fuel_metrics_normalization_stats.json'
-    with open(stats_json_path, 'w') as f:
-        json.dump(stats, f, indent=2)
-    logger.info(f"Saved normalization stats to {stats_json_path}")
-
-    # Random shuffle and split
-    logger.info(f"\nPerforming random 90/10 train/val split...")
     random.shuffle(filtered_tiles)
-
     split_idx = int(len(filtered_tiles) * args.train_val_ratio)
     training_tiles = filtered_tiles[:split_idx]
     validation_tiles = filtered_tiles[split_idx:]
@@ -766,16 +1082,260 @@ def main():
     logger.info(f"Training tiles: {len(training_tiles)}")
     logger.info(f"Validation tiles: {len(validation_tiles)}")
 
-    # Normalize fuel metrics
-    logger.info("\nNormalizing fuel metrics...")
+    # ============================================================================
+    # STEP 5: COMPUTE COORDINATE/ATTRIBUTE STATISTICS (on TRAINING tiles only)
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 5: COMPUTE COORDINATE/ATTRIBUTE STATISTICS (TRAINING ONLY)")
+    logger.info("="*80)
+
+    norm_stats_train = compute_global_coordinate_and_attribute_statistics(training_tiles)
+
+    # Save TRAINING coordinate normalization stats (convert tensors to lists for JSON)
+    coord_stats_path = output_dir / 'coordinate_normalization_stats_train.json'
+    norm_stats_json = {
+        'coord_mean': norm_stats_train['coord_mean'].tolist(),
+        'coord_std': norm_stats_train['coord_std'].tolist(),
+        'attr_mean': norm_stats_train['attr_mean'].tolist() if norm_stats_train['attr_mean'] is not None else None,
+        'attr_std': norm_stats_train['attr_std'].tolist() if norm_stats_train['attr_std'] is not None else None,
+        'total_points': norm_stats_train['total_points'],
+        'total_tiles': norm_stats_train['total_tiles']
+    }
+    with open(coord_stats_path, 'w') as f:
+        json.dump(norm_stats_json, f, indent=2)
+    logger.info(f"Saved TRAINING coordinate normalization stats to {coord_stats_path}")
+
+    # ============================================================================
+    # STEP 6: COMPUTE FUEL METRICS STATISTICS (on TRAINING tiles only)
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 6: COMPUTE FUEL METRICS STATISTICS (TRAINING ONLY)")
+    logger.info("="*80)
+
+    fuel_stats_train = compute_normalization_stats(training_tiles)
+
+    # Save TRAINING fuel metrics normalization stats
+    fuel_stats_path = output_dir / 'fuel_metrics_normalization_stats_train.json'
+    with open(fuel_stats_path, 'w') as f:
+        json.dump(fuel_stats_train, f, indent=2)
+    logger.info(f"Saved TRAINING fuel metrics normalization stats to {fuel_stats_path}")
+
+    # ============================================================================
+    # STEP 7: COMPUTE VALIDATION STATISTICS (for distribution shift analysis)
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 7: COMPUTE VALIDATION STATISTICS (diagnostic only)")
+    logger.info("="*80)
+
+    norm_stats_val = compute_global_coordinate_and_attribute_statistics(validation_tiles)
+    fuel_stats_val = compute_normalization_stats(validation_tiles)
+
+    # Save validation statistics (diagnostic only, NOT used for normalization)
+    # Convert tensors to lists for JSON
+    coord_stats_val_path = output_dir / 'coordinate_normalization_stats_val.json'
+    norm_stats_val_json = {
+        'coord_mean': norm_stats_val['coord_mean'].tolist(),
+        'coord_std': norm_stats_val['coord_std'].tolist(),
+        'attr_mean': norm_stats_val['attr_mean'].tolist() if norm_stats_val['attr_mean'] is not None else None,
+        'attr_std': norm_stats_val['attr_std'].tolist() if norm_stats_val['attr_std'] is not None else None,
+        'total_points': norm_stats_val['total_points'],
+        'total_tiles': norm_stats_val['total_tiles']
+    }
+    with open(coord_stats_val_path, 'w') as f:
+        json.dump(norm_stats_val_json, f, indent=2)
+    logger.info(f"Saved validation coordinate stats (diagnostic) to {coord_stats_val_path}")
+
+    fuel_stats_val_path = output_dir / 'fuel_metrics_normalization_stats_val.json'
+    with open(fuel_stats_val_path, 'w') as f:
+        json.dump(fuel_stats_val, f, indent=2)
+    logger.info(f"Saved validation fuel metrics stats (diagnostic) to {fuel_stats_val_path}")
+
+    # Report distribution shift
+    report_distribution_shift(norm_stats_train, norm_stats_val, dataset_name="Validation")
+
+    # ============================================================================
+    # STEP 8: APPLY COORDINATE NORMALIZATION TO TRAINING TILES
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 8: APPLY COORDINATE NORMALIZATION TO TRAINING TILES")
+    logger.info("="*80)
 
     for tile_idx, tile in enumerate(training_tiles):
-        normalize_fuel_metrics(tile, stats)
+        if 'dep_points' in tile and 'dep_points_norm' not in tile:
+            # Load coordinates AND attributes
+            dep_points = tile.pop('dep_points')
+            dep_pnt_attr = tile.get('dep_pnt_attr', None)
+
+            # Convert to tensors
+            if isinstance(dep_points, np.ndarray):
+                dep_points = torch.from_numpy(dep_points).float()
+            if dep_pnt_attr is not None and isinstance(dep_pnt_attr, np.ndarray):
+                dep_pnt_attr = torch.from_numpy(dep_pnt_attr).float()
+
+            # Get UAV points and bbox
+            uav_points = tile.get('uav_points', torch.empty((0, 3), dtype=torch.float32))
+            if isinstance(uav_points, np.ndarray):
+                uav_points = torch.from_numpy(uav_points).float()
+
+            bbox = tile.get('bbox', None)
+
+            if bbox is not None:
+                if isinstance(bbox, np.ndarray):
+                    bbox = torch.from_numpy(bbox).float()
+
+                # Step 1: Apply bbox normalization
+                dep_points_bbox_norm, uav_points_norm, center, scale = normalize_point_clouds_with_bbox(
+                    dep_points, uav_points, bbox, dtype=torch.float32
+                )
+
+                # Step 1b: Clamp bbox-normalized Z to [0, 150]
+                dep_points_bbox_norm[:, 2] = torch.clamp(dep_points_bbox_norm[:, 2], 0, 150)
+
+                # Step 2: Apply z-score normalization using TRAINING stats
+                dep_points_norm = apply_zscore_to_bbox_normalized_coords(
+                    dep_points_bbox_norm,
+                    norm_stats_train['coord_mean'],
+                    norm_stats_train['coord_std']
+                )
+
+                # Step 3: Normalize attributes using TRAINING stats
+                dep_points_attr_norm = None
+                if dep_pnt_attr is not None and norm_stats_train['attr_mean'] is not None:
+                    dep_points_attr_norm = normalize_attributes_zscore(
+                        dep_pnt_attr,
+                        norm_stats_train['attr_mean'],
+                        norm_stats_train['attr_std'],
+                        dtype=torch.float16
+                    )
+
+                # Store all normalized versions
+                tile['dep_points_norm'] = dep_points_norm
+                tile['dep_points_bbox_norm'] = dep_points_bbox_norm
+                tile['uav_points'] = uav_points_norm
+                tile['dep_points_attr_norm'] = dep_points_attr_norm
+                tile['center'] = center
+                tile['scale'] = scale
+
+                # Store norm_params using TRAINING stats (tensors, not lists)
+                tile['norm_params'] = {
+                    'coord_mean': norm_stats_train['coord_mean'],  # Tensor[3] float32
+                    'coord_std': norm_stats_train['coord_std'],    # Tensor[3] float32
+                    'attr_mean': norm_stats_train['attr_mean'],    # Tensor[3] float32
+                    'attr_std': norm_stats_train['attr_std']       # Tensor[3] float32
+                }
+            else:
+                logger.warning(f"No bbox found for tile {tile.get('tile_id', 'unknown')}, skipping normalization")
+                tile['dep_points_norm'] = dep_points
+                tile['dep_points_attr_norm'] = None
+
         if (tile_idx + 1) % 100 == 0:
             logger.info(f"  Normalized {tile_idx + 1}/{len(training_tiles)} training tiles...")
 
+    logger.info("Training coordinate normalization complete")
+
+    # ============================================================================
+    # STEP 9: APPLY COORDINATE NORMALIZATION TO VALIDATION TILES (using TRAINING stats)
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 9: APPLY COORDINATE NORMALIZATION TO VALIDATION TILES (using TRAINING stats)")
+    logger.info("="*80)
+
     for tile_idx, tile in enumerate(validation_tiles):
-        normalize_fuel_metrics(tile, stats)
+        if 'dep_points' in tile and 'dep_points_norm' not in tile:
+            # Load coordinates AND attributes
+            dep_points = tile.pop('dep_points')
+            dep_pnt_attr = tile.get('dep_pnt_attr', None)
+
+            # Convert to tensors
+            if isinstance(dep_points, np.ndarray):
+                dep_points = torch.from_numpy(dep_points).float()
+            if dep_pnt_attr is not None and isinstance(dep_pnt_attr, np.ndarray):
+                dep_pnt_attr = torch.from_numpy(dep_pnt_attr).float()
+
+            # Get UAV points and bbox
+            uav_points = tile.get('uav_points', torch.empty((0, 3), dtype=torch.float32))
+            if isinstance(uav_points, np.ndarray):
+                uav_points = torch.from_numpy(uav_points).float()
+
+            bbox = tile.get('bbox', None)
+
+            if bbox is not None:
+                if isinstance(bbox, np.ndarray):
+                    bbox = torch.from_numpy(bbox).float()
+
+                # Step 1: Apply bbox normalization
+                dep_points_bbox_norm, uav_points_norm, center, scale = normalize_point_clouds_with_bbox(
+                    dep_points, uav_points, bbox, dtype=torch.float32
+                )
+
+                # Step 1b: Clamp bbox-normalized Z to [0, 150]
+                dep_points_bbox_norm[:, 2] = torch.clamp(dep_points_bbox_norm[:, 2], 0, 150)
+
+                # Step 2: Apply z-score normalization using TRAINING stats
+                dep_points_norm = apply_zscore_to_bbox_normalized_coords(
+                    dep_points_bbox_norm,
+                    norm_stats_train['coord_mean'],  # TRAINING stats!
+                    norm_stats_train['coord_std']    # TRAINING stats!
+                )
+
+                # Step 3: Normalize attributes using TRAINING stats
+                dep_points_attr_norm = None
+                if dep_pnt_attr is not None and norm_stats_train['attr_mean'] is not None:
+                    dep_points_attr_norm = normalize_attributes_zscore(
+                        dep_pnt_attr,
+                        norm_stats_train['attr_mean'],  # TRAINING stats!
+                        norm_stats_train['attr_std'],   # TRAINING stats!
+                        dtype=torch.float16
+                    )
+
+                # Store all normalized versions
+                tile['dep_points_norm'] = dep_points_norm
+                tile['dep_points_bbox_norm'] = dep_points_bbox_norm
+                tile['uav_points'] = uav_points_norm
+                tile['dep_points_attr_norm'] = dep_points_attr_norm
+                tile['center'] = center
+                tile['scale'] = scale
+
+                # Store norm_params using TRAINING stats (tensors, not lists)
+                tile['norm_params'] = {
+                    'coord_mean': norm_stats_train['coord_mean'],  # Tensor[3] float32
+                    'coord_std': norm_stats_train['coord_std'],    # Tensor[3] float32
+                    'attr_mean': norm_stats_train['attr_mean'],    # Tensor[3] float32
+                    'attr_std': norm_stats_train['attr_std']       # Tensor[3] float32
+                }
+            else:
+                logger.warning(f"No bbox found for tile {tile.get('tile_id', 'unknown')}, skipping normalization")
+                tile['dep_points_norm'] = dep_points
+                tile['dep_points_attr_norm'] = None
+
+        if (tile_idx + 1) % 50 == 0:
+            logger.info(f"  Normalized {tile_idx + 1}/{len(validation_tiles)} validation tiles...")
+
+    logger.info("Validation coordinate normalization complete")
+
+    # ============================================================================
+    # STEP 10: APPLY FUEL METRICS NORMALIZATION TO TRAINING TILES
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 10: APPLY FUEL METRICS NORMALIZATION TO TRAINING TILES")
+    logger.info("="*80)
+
+    for tile_idx, tile in enumerate(training_tiles):
+        normalize_fuel_metrics(tile, fuel_stats_train)
+        if (tile_idx + 1) % 100 == 0:
+            logger.info(f"  Normalized {tile_idx + 1}/{len(training_tiles)} training tiles...")
+
+    logger.info("Training fuel metrics normalization complete")
+
+    # ============================================================================
+    # STEP 11: APPLY FUEL METRICS NORMALIZATION TO VALIDATION TILES (using TRAINING stats)
+    # ============================================================================
+    logger.info("\n" + "="*80)
+    logger.info("STEP 11: APPLY FUEL METRICS NORMALIZATION TO VALIDATION TILES (using TRAINING stats)")
+    logger.info("="*80)
+
+    for tile_idx, tile in enumerate(validation_tiles):
+        normalize_fuel_metrics(tile, fuel_stats_train)  # Use TRAINING stats!
         if (tile_idx + 1) % 50 == 0:
             logger.info(f"  Normalized {tile_idx + 1}/{len(validation_tiles)} validation tiles...")
 
@@ -870,9 +1430,15 @@ def main():
     logger.info(f"Training tiles: {len(training_tiles)}")
     logger.info(f"Validation tiles: {len(validation_tiles)}")
     logger.info(f"Total: {len(training_tiles) + len(validation_tiles)}")
-    logger.info(f"Normalization stats: {stats_json_path}")
-    logger.info(f"Training output: {train_output_path}")
-    logger.info(f"Validation output: {val_output_path}")
+    logger.info(f"\nNormalization statistics (TRAINING - used for both train/val):")
+    logger.info(f"  Coordinate stats: {coord_stats_path}")
+    logger.info(f"  Fuel metrics stats: {fuel_stats_path}")
+    logger.info(f"\nValidation statistics (diagnostic only):")
+    logger.info(f"  Coordinate stats: {coord_stats_val_path}")
+    logger.info(f"  Fuel metrics stats: {fuel_stats_val_path}")
+    logger.info(f"\nOutput files:")
+    logger.info(f"  Training: {train_output_path}")
+    logger.info(f"  Validation: {val_output_path}")
 
 
 if __name__ == '__main__':
