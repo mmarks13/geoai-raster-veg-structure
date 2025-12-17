@@ -45,7 +45,7 @@ import dask.array as da
 from dask import delayed
 import time
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 import multiprocessing as mp
 import rasterio
 from rasterio.warp import reproject, Resampling
@@ -81,6 +81,53 @@ CLIENT = Client.open(
 
 # Configure environment
 os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # Helps with network filesystems
+
+
+def get_processed_tile_ids(output_dir: str) -> set:
+    """
+    Scan existing H5 chunk files in output_dir and return set of already-processed tile IDs.
+    
+    Used for resuming interrupted processing runs.
+    
+    Parameters
+    ----------
+    output_dir : str
+        Directory containing H5 chunk files
+        
+    Returns
+    -------
+    set
+        Set of tile IDs (as integers) that have already been processed
+    """
+    from pathlib import Path
+    
+    processed_ids = set()
+    h5_files = list(Path(output_dir).glob("*.h5"))
+    
+    if not h5_files:
+        return processed_ids
+    
+    print(f"Scanning {len(h5_files)} existing H5 files for processed tile IDs...")
+    
+    for h5_path in h5_files:
+        try:
+            with h5py.File(h5_path, 'r') as f:
+                # Extract tile IDs from group names (format: "tile_123")
+                for group_name in f.keys():
+                    if group_name.startswith('tile_'):
+                        try:
+                            tile_id = int(group_name.split('_')[1])
+                            processed_ids.add(tile_id)
+                        except (ValueError, IndexError):
+                            # Also try reading from attribute
+                            if 'tile_id' in f[group_name].attrs:
+                                processed_ids.add(int(f[group_name].attrs['tile_id']))
+        except Exception as e:
+            print(f"Warning: Could not read {h5_path}: {e}")
+            continue
+    
+    print(f"Found {len(processed_ids)} already-processed tiles")
+    return processed_ids
 
 def bboxes_intersect(bbox1, bbox2):
     """
@@ -1900,7 +1947,7 @@ def process_chunk(
     This version is updated to handle a flattened dictionary structure.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] Processing chunk {chunk_index}/{total_chunks}...")
+    print(f"[{timestamp}] Processing chunk {chunk_index}/{total_chunks} ({len(chunk)} tiles)...")
 
     # Prepare arguments for parallel processing, including voxel downsampling parameters
     args_list = [
@@ -1912,6 +1959,9 @@ def process_chunk(
     chunk_results = []
     future_to_tile = {}
     
+    # Per-tile timeout in seconds (10 minutes per tile should be plenty)
+    TILE_TIMEOUT = 600
+    
     try:
         with ProcessPoolExecutor(max_workers=max_threads, mp_context=mp.get_context('spawn')) as executor:
             future_to_tile = {
@@ -1921,21 +1971,51 @@ def process_chunk(
                 )
             }
             
-            for future in future_to_tile:
+            # Use as_completed for progress tracking
+            completed = 0
+            total_in_chunk = len(future_to_tile)
+            chunk_start_time = datetime.now()
+            
+            for future in as_completed(future_to_tile, timeout=TILE_TIMEOUT * total_in_chunk):
                 i, tile_id = future_to_tile[future]
+                completed += 1
+                elapsed = (datetime.now() - chunk_start_time).total_seconds()
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (total_in_chunk - completed) / rate if rate > 0 else 0
+                
                 try:
-                    result = future.result()
+                    result = future.result(timeout=TILE_TIMEOUT)
                     if result is not None:
                         chunk_results.append(result)
                         results_tracker['successful'].append((tile_id, "Successfully processed"))
+                        status = "✓"
                     else:
-                        # Failed to process tile
                         results_tracker['failed'].append((tile_id, "Failed to process - see logs for details"))
+                        status = "✗ (null result)"
+                except TimeoutError:
+                    results_tracker['failed'].append((tile_id, f"Timeout after {TILE_TIMEOUT}s"))
+                    status = "✗ (timeout)"
                 except Exception as e:
-                    results_tracker['failed'].append((tile_id, f"Error: {str(e)[:100]}..."))  # Truncate very long error messages
+                    results_tracker['failed'].append((tile_id, f"Error: {str(e)[:100]}..."))
+                    status = f"✗ ({type(e).__name__})"
+                
+                # Progress update every tile
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                print(f"  [{timestamp}] Chunk {chunk_index}: {completed}/{total_in_chunk} tiles "
+                      f"({rate:.1f}/s, ETA {eta:.0f}s) - tile {tile_id} {status}")
+                      
+    except TimeoutError:
+        print(f"⚠️ Chunk {chunk_index} timed out after {TILE_TIMEOUT * total_in_chunk}s - some tiles may not have completed")
+        # Mark remaining futures as failed
+        for future, (i, tile_id) in future_to_tile.items():
+            if not future.done():
+                future.cancel()
+                results_tracker['failed'].append((tile_id, "Cancelled due to chunk timeout"))
             
     except Exception as e:
-        print(f"Error during parallel processing of chunk {chunk_index}: {e}")
+        print(f"❌ Error during parallel processing of chunk {chunk_index}: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Write chunk results to disk using HDF5
     if chunk_results:
@@ -2154,7 +2234,8 @@ def process_tiles_from_geojson(
     min_uav_points=1000,
     skip_uav_lidar=False,
     dep_stac_source=None,
-    fuel_metrics_raster=None
+    fuel_metrics_raster=None,
+    resume=False
 ):
     """
     Process LiDAR and imagery data using pre-defined tiles from a GeoJSON file.
@@ -2197,6 +2278,9 @@ def process_tiles_from_geojson(
         Initial size of voxel (grid cell) in centimeters for point cloud downsampling. Default is 5.0 cm.
     max_points_list : list, optional
         List of maximum point thresholds for downsampling. Default is [20000, 30000, 40000].
+    resume : bool, optional
+        If True, scan existing H5 files in output_dir and skip already-processed tiles.
+        Default is False.
     """
     # Default list of maximum point thresholds if not provided
     if max_points_list is None:
@@ -2245,6 +2329,37 @@ def process_tiles_from_geojson(
         # Extract properties (convert to dict, exclude geometry)
         props = {k: v for k, v in row.items() if k != 'geometry'}
         tile_properties_list.append(props)
+
+    total_tiles_original = len(tile_bounding_boxes)
+    print(f"Found {total_tiles_original} tiles in {tiles_geojson}")
+
+    # Resume mode: filter out already-processed tiles
+    if resume:
+        processed_ids = get_processed_tile_ids(output_dir)
+        if processed_ids:
+            # Filter out already-processed tiles
+            filtered_data = [
+                (tid, bbox, props) 
+                for tid, bbox, props in zip(tile_ids, tile_bounding_boxes, tile_properties_list)
+                if tid not in processed_ids
+            ]
+            
+            if filtered_data:
+                tile_ids, tile_bounding_boxes, tile_properties_list = zip(*filtered_data)
+                tile_ids = list(tile_ids)
+                tile_bounding_boxes = list(tile_bounding_boxes)
+                tile_properties_list = list(tile_properties_list)
+            else:
+                tile_ids = []
+                tile_bounding_boxes = []
+                tile_properties_list = []
+            
+            skipped = total_tiles_original - len(tile_ids)
+            print(f"Resume mode: Skipping {skipped} already-processed tiles, {len(tile_ids)} remaining")
+            
+            if len(tile_ids) == 0:
+                print("All tiles already processed! Nothing to do.")
+                return
 
     total_tiles = len(tile_bounding_boxes)
     print(f"Processing {total_tiles} tiles from {tiles_geojson}")
@@ -2570,6 +2685,12 @@ if __name__ == "__main__":
         help="Path to fuel metrics GeoTIFF raster (173 bands: 23 summary + 150 bulk density)"
     )
 
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from a previous run by skipping tiles already in existing H5 chunk files in outdir"
+    )
+
     args = parser.parse_args()
 
     # Call processing function with the given tiles and other parameters
@@ -2594,5 +2715,6 @@ if __name__ == "__main__":
         min_uav_points=args.min_uav_points,
         skip_uav_lidar=args.skip_uav_lidar,
         dep_stac_source=args.dep_stac_source,
-        fuel_metrics_raster=args.fuel_metrics_raster
+        fuel_metrics_raster=args.fuel_metrics_raster,
+        resume=args.resume
     )

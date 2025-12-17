@@ -17,11 +17,12 @@ def create_tile_grid_from_polygon(
     polygon_gpkg: str,
     output_geojson: str,
     tile_size: float = 10.0,
+    stride: float = None,
     site_filter: str = None
 ) -> None:
     """
     Create a grid of square tiles covering convex hull polygons.
-    
+
     Parameters
     ----------
     polygon_gpkg : str
@@ -30,12 +31,30 @@ def create_tile_grid_from_polygon(
         Path to output GeoJSON file
     tile_size : float
         Side length of square tiles in meters (default: 10.0)
+    stride : float, optional
+        Distance between tile origins in meters. If None, defaults to tile_size
+        (no overlap). For 20% overlap on 10m tiles, use stride=8.0
     site_filter : str, optional
         If provided, only process this site
     """
+    # Use tile_size as default stride (no overlap)
+    if stride is None:
+        stride = tile_size
+
+    # Calculate overlap percentage for logging
+    overlap_pct = (1 - stride / tile_size) * 100 if stride < tile_size else 0
+    # Target CRS - must match training data
+    target_crs = "EPSG:32611"
+    
     # Read site polygons
     print(f"Reading site polygons from: {polygon_gpkg}")
     gdf_sites = gpd.read_file(polygon_gpkg)
+    
+    # Reproject to target CRS FIRST, before any coordinate operations
+    # This ensures we work in the same CRS as training data throughout
+    if str(gdf_sites.crs) != target_crs:
+        print(f"Reprojecting from {gdf_sites.crs} to {target_crs}...")
+        gdf_sites = gdf_sites.to_crs(target_crs)
     
     # Filter by site if requested
     if site_filter:
@@ -55,14 +74,27 @@ def create_tile_grid_from_polygon(
         
         print(f"\nGenerating tiles for {site_name}...")
         
-        # Get bounding box of the polygon
-        minx, miny, maxx, maxy = site_poly.bounds
+        # Get bounding box of the polygon (now in EPSG:32611)
+        raw_minx, raw_miny, raw_maxx, raw_maxy = site_poly.bounds
+        
+        # Snap bounding box to 0.5m grid to ensure exact tile dimensions
+        # This prevents floating-point precision issues that cause 41x40 pixel images
+        # Training data uses exact coordinates like 537540.5, 537550.5 (10m tiles)
+        # and NAIP bbox 537535.5, 537555.5 (20m, centered on tile)
+        grid_snap = 0.5  # 0.5m grid alignment
+        minx = np.floor(raw_minx / grid_snap) * grid_snap
+        miny = np.floor(raw_miny / grid_snap) * grid_snap
+        maxx = np.ceil(raw_maxx / grid_snap) * grid_snap
+        maxy = np.ceil(raw_maxy / grid_snap) * grid_snap
         
         # Calculate number of tiles needed in each direction
-        nx = int(np.ceil((maxx - minx) / tile_size))
-        ny = int(np.ceil((maxy - miny) / tile_size))
-        
+        # With overlap, we step by stride (not tile_size), but ensure last tile fits
+        nx = int(np.ceil((maxx - minx - tile_size) / stride)) + 1
+        ny = int(np.ceil((maxy - miny - tile_size) / stride)) + 1
+
         print(f"  Bounding box: ({minx:.1f}, {miny:.1f}) to ({maxx:.1f}, {maxy:.1f})")
+        print(f"  Grid origin snapped to 0.5m grid for NAIP alignment")
+        print(f"  Stride: {stride}m (overlap: {overlap_pct:.0f}%)")
         print(f"  Grid dimensions: {nx} × {ny} = {nx * ny:,} potential tiles")
         
         # Generate grid of tiles
@@ -71,11 +103,18 @@ def create_tile_grid_from_polygon(
         
         for i in range(nx):
             for j in range(ny):
-                # Calculate tile bounds
-                tile_minx = minx + (i * tile_size)
-                tile_miny = miny + (j * tile_size)
+                # Calculate tile bounds using stride for positioning
+                # Tiles are still tile_size × tile_size, but origins are stride apart
+                tile_minx = minx + (i * stride)
+                tile_miny = miny + (j * stride)
                 tile_maxx = tile_minx + tile_size
                 tile_maxy = tile_miny + tile_size
+                
+                # Verify exact dimensions (should be exactly tile_size)
+                assert abs((tile_maxx - tile_minx) - tile_size) < 1e-10, \
+                    f"Tile width {tile_maxx - tile_minx} != {tile_size}"
+                assert abs((tile_maxy - tile_miny) - tile_size) < 1e-10, \
+                    f"Tile height {tile_maxy - tile_miny} != {tile_size}"
                 
                 # Create tile geometry
                 tile_geom = box(tile_minx, tile_miny, tile_maxx, tile_maxy)
@@ -111,19 +150,12 @@ def create_tile_grid_from_polygon(
         print(f"  Tiles intersecting polygon: {tiles_inside:,}")
         all_tiles.extend(site_tiles)
     
-    # Create GeoDataFrame
+    # Create GeoDataFrame - already in target CRS since we reprojected at the start
     gdf = gpd.GeoDataFrame(
         [t['properties'] for t in all_tiles],
         geometry=[t['geometry'] for t in all_tiles],
-        crs=gdf_sites.crs
+        crs=target_crs  # Use target_crs directly since tiles were created in this CRS
     )
-
-    # Reproject to EPSG:32611 to match training tiles CRS
-    # This ensures consistency with data/processed/tiles.geojson
-    target_crs = "EPSG:32611"
-    if str(gdf.crs) != target_crs:
-        print(f"Reprojecting from {gdf.crs} to {target_crs}...")
-        gdf = gdf.to_crs(target_crs)
 
     # Save to GeoJSON
     output_path = Path(output_geojson)
@@ -144,6 +176,7 @@ def create_tile_grid_from_polygon(
     print(f"\n{'='*60}")
     print(f"Total tiles: {len(gdf):,}")
     print(f"Tile size: {tile_size}m × {tile_size}m")
+    print(f"Stride: {stride}m (overlap: {overlap_pct:.0f}%)")
     print(f"Total area covered: {(len(gdf) * 0.01):.2f} ha")
     print(f"CRS: {gdf.crs}")
 
@@ -171,6 +204,13 @@ def main():
         help='Side length of square tiles in meters (default: 10.0)'
     )
     parser.add_argument(
+        '--stride',
+        type=float,
+        default=None,
+        help='Distance between tile origins in meters (default: tile_size, no overlap). '
+             'For 20%% overlap on 10m tiles, use stride=8.0'
+    )
+    parser.add_argument(
         '--site',
         type=str,
         default=None,
@@ -183,6 +223,7 @@ def main():
         polygon_gpkg=args.input,
         output_geojson=args.output,
         tile_size=args.tile_size,
+        stride=args.stride,
         site_filter=args.site
     )
 

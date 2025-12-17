@@ -9,9 +9,15 @@ Key principle:
   - Intensity/noise augmentation: Applied to inputs ONLY
   - Ensures spatial correspondence between inputs and targets
 
+RASTER MODEL AUGMENTATION STRATEGY (Phase 1):
+  Addresses distribution gaps between training data (Volcan) and forest plots:
+  - Gap 2: Aggressive sparse point removal (simulates ultra-sparse 3DEP tiles)
+  - Gap 3: UAVSAR temporal augmentation (duplication/subsampling for sequence length variance)
+  - Gap 1: Modality dropout handled in training loop (not here)
+
 Usage:
-    python data_augmentation_raster.py \
-        --training_tiles precomputed_training_tiles_raster_32bit.pt \
+    python data_augmentation_raster.py \\
+        --training_tiles precomputed_training_tiles_raster_32bit.pt \\
         --output_path augmented_tiles_raster_32bit.pt
 """
 
@@ -20,6 +26,8 @@ import sys
 import argparse
 from pathlib import Path
 import logging
+import random
+import copy
 
 # Import base augmentation functions
 sys.path.insert(0, str(Path(__file__).parent))
@@ -44,6 +52,293 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# RASTER MODEL: Augmentation Configuration (Single Source of Truth)
+# ============================================================================
+
+DEFAULT_RASTER_AUGMENTATION_CONFIG = {
+    # Geometric transforms (applied to BOTH inputs and targets)
+    'rotate_probability': 0.9,
+    'reflect_probability': 0.5,
+    
+    # Point cloud augmentations (inputs only)
+    'jitter_probability': 0.2,
+    'jitter_xy_scale': 0.02,
+    'jitter_z_scale': 0.01,
+    
+    'add_points_probability': 0.1,
+    'add_points_ratio': 0.05,
+    'add_points_max_distance': 0.02,
+    
+    # Regular point removal (mild sparsification)
+    'remove_points_probability': 0.3,
+    'remove_points_ratio': 0.05,
+    
+    # RASTER MODEL: Aggressive sparse removal (Gap 2 - simulates ultra-sparse 3DEP tiles)
+    # 50% of tiles get heavy point removal (50-90% of points removed)
+    # Floor of 50 points ensures grid attention still works
+    'aggressive_sparse_probability': 0.5,
+    'aggressive_sparse_min_ratio': 0.5,  # Remove at least 50% of points
+    'aggressive_sparse_max_ratio': 0.9,  # Remove up to 90% of points
+    'aggressive_sparse_min_points': 20,  # Never go below 20 points
+
+    # Spatial masking
+    'mask_points_probability': 0.0,
+    'mask_min_radius': 0.05,
+    'mask_max_radius': 0.2,
+    'mask_count': 1,
+    'mask_min_removal_ratio': 0.5,
+    'mask_max_removal_ratio': 0.8,
+    
+    # Horizontal slice removal
+    'remove_horizontal_slice_probability': 0.0,
+    'horizontal_slice_min_height': 0.05,
+    'horizontal_slice_max_height': 0.2,
+    'horizontal_slice_max_position': 0.5,
+    'horizontal_slice_min_removal_ratio': 0.5,
+    'horizontal_slice_max_removal_ratio': 0.8,
+    
+    # Temporal augmentations (inputs only)
+    'temporal_shift_probability': 0.2,  # Disabled: shifts dates, not useful
+    'max_shift_days': 30,
+    
+    # RASTER MODEL: UAVSAR temporal sequence augmentation (Gap 3)
+    # Addresses sequence length mismatch: Training=15 frames, BluffMesa/NorthBigBear=4 frames
+    'uavsar_temporal_duplicate_probability': 0.0,  # Duplicate short sequences
+    'uavsar_temporal_duplicate_target_frames': 15,  # Target number of frames after duplication
+    'uavsar_temporal_subsample_probability': 0.05,  # Subsample long sequences
+    'uavsar_temporal_subsample_min_frames': 1,  # Can go down to 1 frame
+    
+    # Attribute augmentations (inputs only)
+    'attribute_augment_probability': 0.0,  # Disabled
+    'attribute_scale_range': (0.9, 1.1),
+    'attribute_shift_range': (-0.1, 0.1),
+    
+    # Spectral augmentations (imagery inputs only)
+    'spectral_band_probability': 0.2,
+    'band_scale_range': (0.9, 1.1),
+    
+    # Sensor effects (imagery inputs only)
+    'sensor_effects_probability': 0.2,
+    'sensor_effect_strength': 0.1,
+    'uavsar_noise_variance': 0.1,
+    
+    # Validation
+    'min_points_after_augmentation': 20,  # RASTER MODEL: Lowered from 100 for sparse tile handling
+
+    # RASTER MODEL: Modality dropout moved to training time (raster_training.py)
+    # Set training_modality_dropout_naip and training_modality_dropout_uavsar in model config
+    # Keeping these disabled here to avoid double dropout
+    'modality_dropout_enabled': False,  # DISABLED - use training-time dropout instead
+    'uavsar_dropout': 0.0,
+    'naip_dropout': 0.0
+
+}
+
+
+# ============================================================================
+# RASTER MODEL: Aggressive Sparse Point Removal (Gap 2)
+# ============================================================================
+
+def aggressive_sparse_removal(tile, min_ratio=0.5, max_ratio=0.9, min_points=50):
+    """
+    RASTER MODEL: Aggressive point removal to simulate ultra-sparse 3DEP tiles.
+    
+    This addresses Gap 2: Forest plot tiles may have much sparser point clouds
+    than training data (Volcan site). By aggressively removing points during
+    augmentation, the model learns to handle sparse inputs.
+    
+    Parameters:
+        tile (dict): Tile with 'dep_points_norm' and optionally 'dep_points_attr_norm'
+        min_ratio (float): Minimum ratio of points to remove (0.5 = remove 50%)
+        max_ratio (float): Maximum ratio of points to remove (0.9 = remove 90%)
+        min_points (int): Floor - never go below this many points (default 50)
+        
+    Returns:
+        dict: Tile with reduced point count (floor of min_points)
+    """
+    tile_copy = copy.deepcopy(tile)
+    
+    if 'dep_points_norm' not in tile_copy:
+        return tile_copy
+    
+    dep_points = tile_copy['dep_points_norm']
+    n_original = dep_points.shape[0]
+    
+    # Skip if already very sparse
+    if n_original <= min_points:
+        return tile_copy
+    
+    # Random removal ratio in [min_ratio, max_ratio]
+    removal_ratio = random.uniform(min_ratio, max_ratio)
+    n_keep = int(n_original * (1.0 - removal_ratio))
+    
+    # Enforce floor
+    n_keep = max(n_keep, min_points)
+    
+    if n_keep < n_original:
+        # Random selection of points to keep
+        keep_indices = torch.randperm(n_original)[:n_keep]
+        
+        tile_copy['dep_points_norm'] = dep_points[keep_indices]
+        
+        # Also update attributes if present
+        if 'dep_points_attr_norm' in tile_copy and tile_copy['dep_points_attr_norm'] is not None:
+            tile_copy['dep_points_attr_norm'] = tile_copy['dep_points_attr_norm'][keep_indices]
+    
+    return tile_copy
+
+
+# ============================================================================
+# RASTER MODEL: UAVSAR Temporal Sequence Augmentation (Gap 3)
+# ============================================================================
+
+def duplicate_uavsar_temporally(tile, target_frames=15):
+    """
+    RASTER MODEL: Duplicate UAVSAR temporal sequence to match training distribution.
+    
+    This addresses Gap 3: Training data has 15 UAVSAR acquisition events (T), but forest plots
+    (BluffMesa, NorthBigBear) have only 4. By duplicating acquisition events during
+    augmentation, the model learns to handle the GRU temporal encoder with
+    varying effective sequence lengths.
+    
+    UAVSAR format: [T, G_max, n_bands, h, w] where:
+      - T = number of acquisition events (temporal dimension)
+      - G_max = max images per acquisition event (typically 8)
+      - n_bands = 6 polarization bands
+      - h, w = spatial dimensions (4×4 pixels)
+    
+    Strategy: Repeat acquisition events cyclically until reaching target_frames.
+    Example: T=4 events → T=15 by repeating [0,1,2,3,0,1,2,3,0,1,2,3,0,1,2]
+    
+    Parameters:
+        tile (dict): Tile with 'uavsar' dict containing 'images' [T, G_max, n_bands, h, w]
+        target_frames (int): Target number of acquisition events (default 15)
+        
+    Returns:
+        dict: Tile with duplicated UAVSAR acquisition events
+    """
+    tile_copy = copy.deepcopy(tile)
+    
+    if 'uavsar' not in tile_copy or tile_copy['uavsar'] is None:
+        return tile_copy
+    
+    uavsar_data = tile_copy['uavsar']
+    
+    if 'images' not in uavsar_data or uavsar_data['images'] is None:
+        return tile_copy
+    
+    images = uavsar_data['images']  # [T, G_max, n_bands, h, w]
+    
+    # Verify 5D format
+    if images.ndim != 5:
+        logger.warning(f"UAVSAR images have {images.ndim}D, expected 5D. Skipping temporal duplication.")
+        return tile_copy
+    
+    T = images.shape[0]  # Number of acquisition events
+    
+    # Skip if already at or above target
+    if T >= target_frames:
+        return tile_copy
+    
+    # Calculate how many times to repeat
+    n_repeats = (target_frames + T - 1) // T  # Ceiling division
+    
+    # Repeat along temporal dimension (dim=0) and truncate to target
+    duplicated = images.repeat(n_repeats, 1, 1, 1, 1)[:target_frames]
+    
+    tile_copy['uavsar']['images'] = duplicated
+    
+    # Also duplicate attention_mask if present [T, G_max]
+    if 'attention_mask' in uavsar_data and uavsar_data['attention_mask'] is not None:
+        mask = uavsar_data['attention_mask']
+        if isinstance(mask, torch.Tensor) and mask.ndim == 2:
+            duplicated_mask = mask.repeat(n_repeats, 1)[:target_frames]
+            tile_copy['uavsar']['attention_mask'] = duplicated_mask
+    
+    # Also duplicate relative_dates if present [T, 1]
+    if 'relative_dates' in uavsar_data and uavsar_data['relative_dates'] is not None:
+        rel_dates = uavsar_data['relative_dates']
+        if isinstance(rel_dates, torch.Tensor):
+            if rel_dates.ndim == 2:  # [T, 1]
+                duplicated_dates = rel_dates.repeat(n_repeats, 1)[:target_frames]
+            else:  # [T]
+                duplicated_dates = rel_dates.repeat(n_repeats)[:target_frames]
+            tile_copy['uavsar']['relative_dates'] = duplicated_dates
+    
+    return tile_copy
+
+
+def subsample_uavsar_temporally(tile, min_frames=1):
+    """
+    RASTER MODEL: Subsample UAVSAR temporal sequence to vary sequence length.
+    
+    This provides data augmentation by randomly reducing the number of UAVSAR
+    acquisition events, helping the model be robust to varying temporal coverage.
+    
+    UAVSAR format: [T, G_max, n_bands, h, w]
+    
+    Strategy: Randomly select a subset of acquisition events (preserving temporal order).
+    
+    Parameters:
+        tile (dict): Tile with 'uavsar' dict containing 'images' [T, G_max, n_bands, h, w]
+        min_frames (int): Minimum number of acquisition events to keep (default 1)
+        
+    Returns:
+        dict: Tile with subsampled UAVSAR acquisition events
+    """
+    tile_copy = copy.deepcopy(tile)
+    
+    if 'uavsar' not in tile_copy or tile_copy['uavsar'] is None:
+        return tile_copy
+    
+    uavsar_data = tile_copy['uavsar']
+    
+    if 'images' not in uavsar_data or uavsar_data['images'] is None:
+        return tile_copy
+    
+    images = uavsar_data['images']  # [T, G_max, n_bands, h, w]
+    
+    # Verify 5D format
+    if images.ndim != 5:
+        logger.warning(f"UAVSAR images have {images.ndim}D, expected 5D. Skipping temporal subsampling.")
+        return tile_copy
+    
+    T = images.shape[0]  # Number of acquisition events
+    
+    # Skip if already at minimum
+    if T <= min_frames:
+        return tile_copy
+    
+    # Random number of events to keep (between min_frames and T-1)
+    n_keep = random.randint(min_frames, T - 1)
+    
+    # Sorted random indices to preserve temporal order
+    keep_indices = sorted(random.sample(range(T), n_keep))
+    keep_indices = torch.tensor(keep_indices)
+    
+    tile_copy['uavsar']['images'] = images[keep_indices]
+    
+    # Also subsample attention_mask if present [T, G_max]
+    if 'attention_mask' in uavsar_data and uavsar_data['attention_mask'] is not None:
+        mask = uavsar_data['attention_mask']
+        if isinstance(mask, torch.Tensor) and mask.ndim == 2:
+            tile_copy['uavsar']['attention_mask'] = mask[keep_indices]
+    
+    # Also subsample relative_dates if present [T, 1] or [T]
+    if 'relative_dates' in uavsar_data and uavsar_data['relative_dates'] is not None:
+        rel_dates = uavsar_data['relative_dates']
+        if isinstance(rel_dates, torch.Tensor):
+            tile_copy['uavsar']['relative_dates'] = rel_dates[keep_indices]
+    
+    return tile_copy
+
+
+# ============================================================================
+# Core Functions
+# ============================================================================
+
+
 def denormalize_to_physical_space(tile):
     """
     Convert z-score normalized points back to bbox-normalized (physical space).
@@ -61,8 +356,8 @@ def denormalize_to_physical_space(tile):
     norm_params = tile_copy['norm_params']
 
     # Extract denormalization parameters
-    coord_mean = torch.tensor(norm_params['coord_mean'], dtype=zscore_points.dtype, device=zscore_points.device)
-    coord_std = torch.tensor(norm_params['coord_std'], dtype=zscore_points.dtype, device=zscore_points.device)
+    coord_mean = norm_params['coord_mean'].clone().detach().to(dtype=zscore_points.dtype, device=zscore_points.device)
+    coord_std = norm_params['coord_std'].clone().detach().to(dtype=zscore_points.dtype, device=zscore_points.device)
 
     # Denormalize: x_physical = x_zscore * std + mean
     bbox_norm_points = zscore_points * coord_std + coord_mean
@@ -90,8 +385,8 @@ def renormalize_from_physical_space(tile):
     norm_params = tile_copy['norm_params']
 
     # Extract normalization parameters
-    coord_mean = torch.tensor(norm_params['coord_mean'], dtype=bbox_norm_points.dtype, device=bbox_norm_points.device)
-    coord_std = torch.tensor(norm_params['coord_std'], dtype=bbox_norm_points.dtype, device=bbox_norm_points.device)
+    coord_mean = norm_params['coord_mean'].clone().detach().to(dtype=bbox_norm_points.dtype, device=bbox_norm_points.device)
+    coord_std = norm_params['coord_std'].clone().detach().to(dtype=bbox_norm_points.dtype, device=bbox_norm_points.device)
 
     # Re-normalize: x_zscore = (x_physical - mean) / std
     zscore_points = (bbox_norm_points - coord_mean) / coord_std
@@ -185,52 +480,20 @@ def augment_tile_with_rasters(tile, config=None):
 
     Geometric transforms (rotate, reflect) are applied to BOTH inputs and targets.
     Intensity/noise augmentations are applied to inputs only.
+    
+    RASTER MODEL: Includes aggressive sparse removal and UAVSAR temporal augmentation
+    to address distribution gaps with forest plot inference data.
 
     Parameters:
         tile (dict): Tile to augment
-        config (dict): Augmentation configuration
+        config (dict): Augmentation configuration (uses DEFAULT_RASTER_AUGMENTATION_CONFIG if None)
 
     Returns:
         dict: Augmented tile
     """
-    import copy
-    import random
-
+    # Use global default config if not provided
     if config is None:
-        config = {
-            'rotate_probability': 1.0,
-            'reflect_probability': 0.5,
-            'jitter_probability': 0.3,
-            'add_points_probability': 0.2,
-            'remove_points_probability': 0.5,
-            'mask_points_probability': 0.5,
-            'remove_horizontal_slice_probability': 0.5,
-            'temporal_shift_probability': 0.4,
-            'attribute_augment_probability': 0.4,
-            'spectral_band_probability': 0.3,
-            'sensor_effects_probability': 0.3,
-            'max_shift_days': 30,
-            'jitter_xy_scale': 0.02,
-            'jitter_z_scale': 0.01,
-            'attribute_scale_range': (0.9, 1.1),
-            'attribute_shift_range': (-0.1, 0.1),
-            'band_scale_range': (0.9, 1.1),
-            'add_points_ratio': 0.1,
-            'add_points_max_distance': 0.02,
-            'remove_points_ratio': 0.1,
-            'mask_min_radius': 0.05,
-            'mask_max_radius': 0.2,
-            'mask_count': 1,
-            'mask_min_removal_ratio': 0.7,
-            'mask_max_removal_ratio': 1.0,
-            'sensor_effect_strength': 0.2,
-            'uavsar_noise_variance': 0.1,
-            'horizontal_slice_min_height': 0.05,
-            'horizontal_slice_max_height': 0.2,
-            'horizontal_slice_max_position': 0.5,
-            'horizontal_slice_min_removal_ratio': 0.7,
-            'horizontal_slice_max_removal_ratio': 1.0,
-        }
+        config = DEFAULT_RASTER_AUGMENTATION_CONFIG.copy()
 
     augmented_tile = copy.deepcopy(tile)
 
@@ -261,7 +524,11 @@ def augment_tile_with_rasters(tile, config=None):
                 # Also reflect fuel_metrics with same axis
                 augmented_tile = reflect_fuel_metrics(augmented_tile, axis=axis)
 
+        # ================================================================
         # Input-only augmentations (NOT applied to fuel_metrics)
+        # ================================================================
+        
+        # Point jitter
         if random.random() < config['jitter_probability']:
             augmented_tile = jitter_points(
                 augmented_tile,
@@ -269,6 +536,7 @@ def augment_tile_with_rasters(tile, config=None):
                 z_scale=config['jitter_z_scale']
             )
 
+        # Add nearby points
         if random.random() < config['add_points_probability']:
             augmented_tile = add_nearby_points(
                 augmented_tile,
@@ -276,12 +544,24 @@ def augment_tile_with_rasters(tile, config=None):
                 max_distance=config['add_points_max_distance']
             )
 
+        # Regular point removal (mild)
         if random.random() < config['remove_points_probability']:
             augmented_tile = randomly_remove_points(
                 augmented_tile,
                 ratio=config['remove_points_ratio']
             )
+        
+        # RASTER MODEL: Aggressive sparse point removal (Gap 2)
+        # Applied separately from regular removal - simulates ultra-sparse 3DEP tiles
+        if random.random() < config.get('aggressive_sparse_probability', 0.0):
+            augmented_tile = aggressive_sparse_removal(
+                augmented_tile,
+                min_ratio=config.get('aggressive_sparse_min_ratio', 0.5),
+                max_ratio=config.get('aggressive_sparse_max_ratio', 0.9),
+                min_points=config.get('aggressive_sparse_min_points', 50)
+            )
 
+        # Spatial masking
         if random.random() < config['mask_points_probability']:
             augmented_tile = mask_points(
                 augmented_tile,
@@ -292,6 +572,7 @@ def augment_tile_with_rasters(tile, config=None):
                 max_removal_ratio=config['mask_max_removal_ratio']
             )
 
+        # Horizontal slice removal
         if random.random() < config['remove_horizontal_slice_probability']:
             augmented_tile = remove_horizontal_slice(
                 augmented_tile,
@@ -302,12 +583,29 @@ def augment_tile_with_rasters(tile, config=None):
                 max_removal_ratio=config['horizontal_slice_max_removal_ratio']
             )
 
+        # Temporal shift (disabled by default)
         if random.random() < config['temporal_shift_probability']:
             augmented_tile = shift_temporal_sequence(
                 augmented_tile,
                 max_shift_days=config['max_shift_days']
             )
+        
+        # RASTER MODEL: UAVSAR temporal sequence augmentation (Gap 3)
+        # Duplicate short sequences to match training distribution (15 frames)
+        if random.random() < config.get('uavsar_temporal_duplicate_probability', 0.0):
+            augmented_tile = duplicate_uavsar_temporally(
+                augmented_tile,
+                target_frames=config.get('uavsar_temporal_duplicate_target_frames', 15)
+            )
+        
+        # Subsample long sequences to add variation
+        if random.random() < config.get('uavsar_temporal_subsample_probability', 0.0):
+            augmented_tile = subsample_uavsar_temporally(
+                augmented_tile,
+                min_frames=config.get('uavsar_temporal_subsample_min_frames', 1)
+            )
 
+        # Attribute augmentation (disabled by default)
         if random.random() < config['attribute_augment_probability']:
             augmented_tile = augment_attributes(
                 augmented_tile,
@@ -315,12 +613,14 @@ def augment_tile_with_rasters(tile, config=None):
                 shift_range=config['attribute_shift_range']
             )
 
+        # Spectral band augmentation
         if random.random() < config['spectral_band_probability']:
             augmented_tile = augment_spectral_bands(
                 augmented_tile,
                 band_scale_range=config['band_scale_range']
             )
 
+        # Sensor effects simulation
         if random.random() < config['sensor_effects_probability']:
             augmented_tile = simulate_sensor_effects(
                 augmented_tile,
@@ -341,6 +641,20 @@ def augment_tile_with_rasters(tile, config=None):
                 edge_index = to_undirected(edge_index, num_nodes=augmented_tile['dep_points_norm'].size(0))
                 augmented_tile['knn_edge_indices'][k] = edge_index
 
+        # === DEPRECATED: Modality dropout moved to training time ===
+        # Modality dropout is now applied in raster_training.py during training
+        # using config parameters: training_modality_dropout_naip, training_modality_dropout_uavsar
+        # This block is kept for backwards compatibility but disabled by default
+        if config.get('modality_dropout_enabled', False):
+            uavsar_drop_prob = config.get('uavsar_dropout', 0.0)
+            naip_drop_prob = config.get('naip_dropout', 0.0)
+
+            if uavsar_drop_prob > 0 and random.random() < uavsar_drop_prob:
+                augmented_tile['uavsar'] = None
+
+            if naip_drop_prob > 0 and random.random() < naip_drop_prob:
+                augmented_tile['naip'] = None
+
         return augmented_tile
 
     except Exception as e:
@@ -348,7 +662,8 @@ def augment_tile_with_rasters(tile, config=None):
         return copy.deepcopy(tile)
 
 
-def validate_augmented_tile_raster(original_tile, augmented_tile, max_allowed_value=500.0):
+def validate_augmented_tile_raster(original_tile, augmented_tile, max_allowed_value=500.0, 
+                                    min_points=None):
     """
     Validate augmented tile with raster targets.
 
@@ -356,10 +671,15 @@ def validate_augmented_tile_raster(original_tile, augmented_tile, max_allowed_va
         original_tile (dict): Original tile
         augmented_tile (dict): Augmented tile to validate
         max_allowed_value (float): Max allowed value for any tensor
+        min_points (int): Minimum points required (default from config: 50)
 
     Returns:
         dict: Validated augmented tile or raises ValueError
     """
+    # RASTER MODEL: Use config default if not specified
+    if min_points is None:
+        min_points = DEFAULT_RASTER_AUGMENTATION_CONFIG.get('min_points_after_augmentation', 50)
+    
     # Check basic keys
     essential_keys = ['dep_points_norm']
     for key in essential_keys:
@@ -369,8 +689,9 @@ def validate_augmented_tile_raster(original_tile, augmented_tile, max_allowed_va
     # Check DEP points
     if 'dep_points_norm' in augmented_tile:
         points = augmented_tile['dep_points_norm']
-        if points.shape[0] < 100:
-            raise ValueError(f"Too few DEP points after augmentation: {points.shape[0]}")
+        # RASTER MODEL: Lowered from 100 to support aggressive sparse removal
+        if points.shape[0] < min_points:
+            raise ValueError(f"Too few DEP points after augmentation: {points.shape[0]} (min: {min_points})")
         if torch.isnan(points).any():
             raise ValueError("NaN values in dep_points_norm")
         if torch.isinf(points).any():
@@ -415,6 +736,16 @@ def main():
         default=1,
         help='Number of augmentations per tile (default: 1)'
     )
+    parser.add_argument(
+        '--disable_aggressive_sparse',
+        action='store_true',
+        help='Disable aggressive sparse point removal (Gap 2)'
+    )
+    parser.add_argument(
+        '--disable_uavsar_temporal',
+        action='store_true', 
+        help='Disable UAVSAR temporal augmentation (Gap 3)'
+    )
 
     args = parser.parse_args()
 
@@ -427,45 +758,34 @@ def main():
     training_tiles = torch.load(args.training_tiles, weights_only=False)
     logger.info(f"Loaded {len(training_tiles)} tiles")
 
-    # Configure augmentation
-    config = {
-        'rotate_probability': 1.0,
-        'reflect_probability': 0.5,
-        'jitter_probability': 0.2,
-        'add_points_probability': 0.1,
-        'remove_points_probability': 0.3,
-        'mask_points_probability': 0.2,
-        'remove_horizontal_slice_probability': 0.2,
-        'temporal_shift_probability': 0.0,
-        'attribute_augment_probability': 0.0,
-        'spectral_band_probability': 0.2,
-        'sensor_effects_probability': 0.2,
-        'max_shift_days': 30,
-        'jitter_xy_scale': 0.02,
-        'jitter_z_scale': 0.01,
-        'attribute_scale_range': (0.9, 1.1),
-        'attribute_shift_range': (-0.1, 0.1),
-        'band_scale_range': (0.9, 1.1),
-        'add_points_ratio': 0.05,
-        'add_points_max_distance': 0.02,
-        'remove_points_ratio': 0.05,
-        'mask_min_radius': 0.05,
-        'mask_max_radius': 0.2,
-        'mask_count': 1,
-        'mask_min_removal_ratio': 0.5,
-        'mask_max_removal_ratio': 0.8,
-        'sensor_effect_strength': 0.1,
-        'uavsar_noise_variance': 0.1,
-        'horizontal_slice_min_height': 0.05,
-        'horizontal_slice_max_height': 0.2,
-        'horizontal_slice_max_position': 0.5,
-        'horizontal_slice_min_removal_ratio': 0.5,
-        'horizontal_slice_max_removal_ratio': 0.8,
-    }
+    # Use centralized config (single source of truth)
+    config = DEFAULT_RASTER_AUGMENTATION_CONFIG.copy()
+    
+    # Apply command-line overrides if specified
+    if args.disable_aggressive_sparse:
+        config['aggressive_sparse_probability'] = 0.0
+        logger.info("Aggressive sparse point removal DISABLED")
+    
+    if args.disable_uavsar_temporal:
+        config['uavsar_temporal_duplicate_probability'] = 0.0
+        config['uavsar_temporal_subsample_probability'] = 0.0
+        logger.info("UAVSAR temporal augmentation DISABLED")
+    
+    # Log key augmentation settings
+    logger.info("\nAugmentation Configuration:")
+    logger.info(f"  Geometric: rotate={config['rotate_probability']:.0%}, reflect={config['reflect_probability']:.0%}")
+    logger.info(f"  Point removal (mild): {config['remove_points_probability']:.0%} prob, {config['remove_points_ratio']:.0%} ratio")
+    logger.info(f"  Point removal (aggressive): {config['aggressive_sparse_probability']:.0%} prob, "
+                f"{config['aggressive_sparse_min_ratio']:.0%}-{config['aggressive_sparse_max_ratio']:.0%} ratio, "
+                f"floor={config['aggressive_sparse_min_points']} pts")
+    logger.info(f"  UAVSAR temporal: duplicate={config['uavsar_temporal_duplicate_probability']:.0%}, "
+                f"subsample={config['uavsar_temporal_subsample_probability']:.0%}")
+    logger.info(f"  Min points after augmentation: {config['min_points_after_augmentation']}")
 
     # Augment dataset
-    logger.info(f"Augmenting dataset ({args.n_augmentations} per tile)...")
+    logger.info(f"\nAugmenting dataset ({args.n_augmentations} per tile)...")
     augmented_tiles = []
+    failed_count = 0
 
     for tile_idx, tile in enumerate(training_tiles):
         for aug_idx in range(args.n_augmentations):
@@ -481,12 +801,16 @@ def main():
 
             except Exception as e:
                 logger.warning(f"Augmentation failed for tile {tile_idx}, aug {aug_idx}: {str(e)}")
+                failed_count += 1
                 continue
 
-        if (tile_idx + 1) % 100 == 0:
-            logger.info(f"  Augmented {tile_idx + 1}/{len(training_tiles)} tiles ({len(augmented_tiles)} total augmentations)")
+        if (tile_idx + 1) % 1000 == 0:
+            logger.info(f"  Augmented {tile_idx + 1}/{len(training_tiles)} tiles "
+                       f"({len(augmented_tiles)} successful, {failed_count} failed)")
 
     logger.info(f"\nAugmentation complete: {len(augmented_tiles)} augmented tiles created")
+    if failed_count > 0:
+        logger.warning(f"  {failed_count} augmentations failed")
 
     # Save augmented dataset
     logger.info(f"Saving augmented tiles to {args.output_path}...")

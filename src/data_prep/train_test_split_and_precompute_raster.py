@@ -815,6 +815,41 @@ def normalize_fuel_metrics(tile, stats):
     return tile
 
 
+def apply_log_transform_to_tfl(tiles: List[dict], tfl_band_index: int = 7) -> int:
+    """
+    Apply log(x + 1) transform to TFL band for all tiles.
+
+    This compresses the right-skewed TFL distribution (30% near-zero values)
+    and helps with variance collapse during training.
+
+    Must be called AFTER replace_na_with_defaults() since log(0 + 1) = 0.
+
+    Args:
+        tiles: List of tiles with 'fuel_metrics' [22, h, w]
+        tfl_band_index: Index of TFL band (0-indexed, default 7 = band 8)
+
+    Returns:
+        Number of tiles processed
+    """
+    processed = 0
+    for tile in tiles:
+        if 'fuel_metrics' not in tile or tile['fuel_metrics'] is None:
+            continue
+
+        fuel_metrics = tile['fuel_metrics']
+
+        # Apply log(x + 1) to TFL band
+        # NaN values stay NaN (log(NaN + 1) = NaN)
+        # Zero values become 0 (log(0 + 1) = 0)
+        tfl_band = fuel_metrics[tfl_band_index]
+        fuel_metrics[tfl_band_index] = torch.log(tfl_band + 1)
+
+        tile['fuel_metrics'] = fuel_metrics
+        processed += 1
+
+    return processed
+
+
 def replace_remaining_nans_with_sentinel(tile, sentinel_value=-999.0):
     """
     Replace any remaining NaN values in normalized fuel metrics with a sentinel value.
@@ -950,8 +985,23 @@ def main():
         default=0.5,
         help='Maximum allowed ratio of NaN pixels in Band 15 (0.0-1.0, default: 0.5 = 50%)'
     )
+    parser.add_argument(
+        '--use-log-tfl',
+        action='store_true',
+        default=True,
+        help='Apply log(x+1) transform to TFL band before normalization (default: True)'
+    )
+    parser.add_argument(
+        '--no-log-tfl',
+        action='store_true',
+        help='Disable log transform for TFL (use raw values)'
+    )
 
     args = parser.parse_args()
+
+    # Handle --no-log-tfl flag
+    if args.no_log_tfl:
+        args.use_log_tfl = False
 
     # Validate max_na_ratio
     if not (0.0 <= args.max_na_ratio <= 1.0):
@@ -1068,6 +1118,20 @@ def main():
         return
 
     # ============================================================================
+    # STEP 3b: APPLY LOG TRANSFORM TO TFL (if enabled)
+    # ============================================================================
+    if args.use_log_tfl:
+        logger.info("\n" + "="*80)
+        logger.info("STEP 3b: APPLY LOG TRANSFORM TO TFL BAND")
+        logger.info("="*80)
+        logger.info("Applying log(x+1) transform to TFL band (index 7 = band 8)")
+
+        n_transformed = apply_log_transform_to_tfl(filtered_tiles, tfl_band_index=7)
+        logger.info(f"Transformed {n_transformed} tiles")
+    else:
+        logger.info("\nSkipping TFL log transform (--no-log-tfl specified)")
+
+    # ============================================================================
     # STEP 4: RANDOM SHUFFLE AND TRAIN/VAL SPLIT
     # ============================================================================
     logger.info("\n" + "="*80)
@@ -1113,6 +1177,12 @@ def main():
     logger.info("="*80)
 
     fuel_stats_train = compute_normalization_stats(training_tiles)
+
+    # Add log transform flag to stats (so inference knows to apply exp(x) - 1)
+    fuel_stats_train['use_log_tfl'] = args.use_log_tfl
+    fuel_stats_train['tfl_band_index'] = 7  # TFL is band 8 (0-indexed: 7)
+    if args.use_log_tfl:
+        logger.info("  Note: TFL stats (band 8) computed on log(x+1) transformed values")
 
     # Save TRAINING fuel metrics normalization stats
     fuel_stats_path = output_dir / 'fuel_metrics_normalization_stats_train.json'
@@ -1352,16 +1422,21 @@ def main():
 
     logger.info(f"  Replaced NaN values in {nan_replacement_count} tiles")
 
-    # Preprocess NAIP and UAVSAR imagery (IDENTICAL to original train_test_split_and_precompute.py)
+    # Preprocess NAIP and UAVSAR imagery
     logger.info("\nPreprocessing NAIP imagery...")
     for tile_idx, tile in enumerate(training_tiles + validation_tiles):
-        # Use first NAIP image date as reference if available, otherwise use current date
-        if 'naip_dates' in tile and len(tile['naip_dates']) > 0:
+        # Use 3DEP acquisition date as reference for relative_dates computation
+        # This is the correct temporal anchor: imagery dates relative to when 3DEP was captured
+        # The model learns to predict current vegetation state from 3DEP + temporal changes in imagery
+        if 'dep_meta' in tile and tile['dep_meta'] and 'start_datetime' in tile['dep_meta']:
+            reference_date = parse_date(tile['dep_meta']['start_datetime'])
+        elif 'naip_dates' in tile and len(tile['naip_dates']) > 0:
+            # Fallback to NAIP if 3DEP date not available
             reference_date = parse_date(tile['naip_dates'][0])
-        elif 'uavsar_dates' in tile and len(tile['uavsar_dates']) > 0:
-            reference_date = parse_date(tile['uavsar_dates'][0])
+            logger.warning(f"Tile {tile.get('tile_id', 'unknown')}: No 3DEP date, using NAIP date as fallback")
         else:
-            reference_date = datetime.now()  # Fallback
+            reference_date = datetime.now()
+            logger.warning(f"Tile {tile.get('tile_id', 'unknown')}: No reference date available")
 
         # Preprocess NAIP imagery
         if 'naip_imgs' in tile and tile['naip_imgs'] is not None and tile['naip_imgs'].numel() > 0:

@@ -13,7 +13,7 @@ Scripts called by `scripts/get_data.sh` and `scripts/process_data.sh` to create 
 - `make_local_3dep_stac.py` - Download 3DEP LiDAR point clouds from Planetary Computer, create local STAC catalog
 - `make_local_uavlidar_stac.py` - Catalog UAV LiDAR ground truth point clouds from local files
 
-###Training Data Generation
+### Training Data Generation
 
 - `generate_training_data.py` - Generate 10m×10m training tiles by querying STAC catalogs for each tile geometry, combining UAV LiDAR, 3DEP LiDAR, UAVSAR, and NAIP data into HDF5 files
 - `train_test_split_and_precompute.py` - Split combined training data into train/val/test sets based on spatial polygons, apply quality filters (minimum points, coverage), precompute KNN graphs and normalized features, save as PyTorch files

@@ -339,13 +339,28 @@ class CrossAttentionFusion(nn.Module):
         # Combine outputs using concatenation and linear layers
         if len(to_concat) > 1:  # If we have at least one modality in addition to point features
             # Concatenate features
-            concatenated = torch.cat(to_concat, dim=1)  # [N, D_p + ...] 
-        else:
-            # If no modalities used, just use the point features
-            concatenated = point_features  # [N, D_p]
+            concatenated = torch.cat(to_concat, dim=1)  # [N, D_p + ...]
 
-        # Apply linear layers for feature extraction and projection 
-        concatenated = self.act(self.linear1(concatenated))  # [N, concat_dim or D_p]
+            # Handle missing modalities: pad with zeros to maintain consistent size
+            # This handles both natural missing data (e.g., Laguna with no UAVSAR)
+            # and modality dropout during training
+            actual_dim = concatenated.shape[1]
+            expected_dim = self.point_dim * (1 + int(self.use_naip) + int(self.use_uavsar))
+            if actual_dim < expected_dim:
+                # Pad with zeros for missing modality features
+                # The model learns through dropout that zero-features = unavailable modality
+                padding = torch.zeros(concatenated.shape[0], expected_dim - actual_dim,
+                                     device=concatenated.device, dtype=concatenated.dtype)
+                concatenated = torch.cat([concatenated, padding], dim=1)  # [N, expected_dim]
+        else:
+            # If no modalities used, pad point features to expected concat_dim
+            expected_dim = self.point_dim * (1 + int(self.use_naip) + int(self.use_uavsar))
+            padding = torch.zeros(point_features.shape[0], expected_dim - self.point_dim,
+                                 device=point_features.device, dtype=point_features.dtype)
+            concatenated = torch.cat([point_features, padding], dim=1)  # [N, expected_dim]
+
+        # Apply linear layers for feature extraction and projection
+        concatenated = self.act(self.linear1(concatenated))  # [N, concat_dim]
         fused_features = self.linear2(concatenated)  # [N, D_p]
 
         # Apply residual connection and normalization to the output features

@@ -49,6 +49,88 @@ from src.training.raster_dataset import ShardedRasterDataset, raster_variable_si
 # Import shared utilities
 from src.training.ddp_training import setup_logging
 from schedulefree import AdamWScheduleFree
+import socket
+
+
+def find_free_port(start_port: int = 12355, max_attempts: int = 100) -> int:
+    """
+    Find a free port for distributed training.
+
+    Args:
+        start_port: Starting port number to try
+        max_attempts: Maximum number of ports to try
+
+    Returns:
+        Available port number
+
+    Raises:
+        RuntimeError: If no free port found after max_attempts
+    """
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', port))
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"Could not find free port after {max_attempts} attempts starting from {start_port}")
+
+
+def compute_correlation_loss(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute correlation loss as (1 - Pearson correlation coefficient).
+
+    This loss penalizes predictions that fail to preserve the ranking/variance
+    of the targets, addressing variance collapse where models predict a narrow
+    range around the mean.
+
+    Args:
+        predictions: [batch_size, n_bands, H, W] predicted values
+        targets: [batch_size, n_bands, H, W] target values
+
+    Returns:
+        Scalar tensor: mean(1 - r) across all bands, where r is Pearson correlation.
+        Range: [0, 2] where 0 = perfect positive correlation, 1 = no correlation, 2 = perfect negative correlation.
+    """
+    # Flatten spatial dimensions: [batch_size, n_bands, H*W]
+    batch_size, n_bands = predictions.shape[:2]
+    pred_flat = predictions.view(batch_size, n_bands, -1)
+    targ_flat = targets.view(batch_size, n_bands, -1)
+
+    # Compute per-band correlation across all samples and spatial locations
+    # Reshape to [n_bands, batch_size * H * W]
+    pred_all = pred_flat.permute(1, 0, 2).reshape(n_bands, -1)  # [n_bands, N]
+    targ_all = targ_flat.permute(1, 0, 2).reshape(n_bands, -1)  # [n_bands, N]
+
+    # Compute Pearson correlation for each band
+    corr_losses = []
+    for band_idx in range(n_bands):
+        pred_band = pred_all[band_idx]  # [N]
+        targ_band = targ_all[band_idx]  # [N]
+
+        # Center the data
+        pred_centered = pred_band - pred_band.mean()
+        targ_centered = targ_band - targ_band.mean()
+
+        # Compute correlation coefficient
+        pred_std = pred_centered.std()
+        targ_std = targ_centered.std()
+
+        # Avoid division by zero (if all predictions are identical)
+        if pred_std < 1e-8 or targ_std < 1e-8:
+            # If variance collapsed completely, correlation is undefined
+            # Penalize with maximum loss (1.0)
+            corr_losses.append(torch.tensor(1.0, device=predictions.device))
+        else:
+            covariance = (pred_centered * targ_centered).mean()
+            correlation = covariance / (pred_std * targ_std)
+            # Clamp to [-1, 1] for numerical stability
+            correlation = torch.clamp(correlation, -1.0, 1.0)
+            corr_losses.append(1.0 - correlation)
+
+    # Average across bands
+    return torch.stack(corr_losses).mean()
 
 
 def log_system_metrics(writer: Optional[SummaryWriter], step: int, device: torch.device, rank: int = 0):
@@ -182,7 +264,11 @@ def process_raster_batch(
     use_uavsar: bool = False,
     is_training: bool = True,
     rank: int = 0,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    training_edge_dropout: float = 0.0,
+    training_modality_dropout_naip: float = 0.0,
+    training_modality_dropout_uavsar: float = 0.0,
+    correlation_loss_weight: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Process a single batch for raster prediction with per-tile NaN diagnostics.
@@ -196,13 +282,14 @@ def process_raster_batch(
         is_training: Whether in training mode
         rank: GPU rank for logging
         logger: Logger instance
+        correlation_loss_weight: Weight for correlation loss term (0 = disabled)
 
     Returns:
         Tuple of (predictions, targets, loss, per_band_losses, diagnostics)
         - predictions: [batch_size, n_bands, 5, 5] predicted rasters
         - targets: [batch_size, n_bands, 5, 5] ground truth rasters
-        - loss: scalar MSE loss (or NaN if batch is bad)
-        - per_band_losses: Dict with per-band MSE losses
+        - loss: scalar combined loss (MSE + correlation_loss_weight * corr_loss)
+        - per_band_losses: Dict with per-band MSE losses and correlation loss
         - diagnostics: Dict with batch status and bad tile info
     """
     # Unpack batch (12 elements)
@@ -218,9 +305,39 @@ def process_raster_batch(
     batch_indices = batch_indices.to(device)
     bboxes = bboxes.to(device) if bboxes is not None else None
 
+    # =========================================================================
+    # Training-time dropout (applied during training only, not validation)
+    # These are SEPARATE from augmentation-time dropout
+    # =========================================================================
+
+    # Edge dropout: randomly mask edges in KNN graph for sparse-robustness
+    # This only changes input data, not model structure - safe for DDP
+    if is_training and training_edge_dropout > 0:
+        n_edges = edge_index_batch.shape[1]
+        edge_keep_mask = torch.rand(n_edges, device=device) > training_edge_dropout
+        edge_index_batch = edge_index_batch[:, edge_keep_mask]
+
     # Handle imagery data (list of dicts)
     naip_data = naip_data_batch if use_naip else None
     uavsar_data = uavsar_data_batch if use_uavsar else None
+
+    # Modality dropout: randomly drop modalities per-tile for modality-robustness
+    # IMPORTANT: We NEVER set the entire modality to None during training
+    # because that would change the computation graph and break DDP.
+    # Instead, we keep per-tile None entries - the encoder handles this gracefully.
+    if is_training and naip_data is not None and training_modality_dropout_naip > 0:
+        import random
+        naip_data = [
+            None if random.random() < training_modality_dropout_naip else tile_naip
+            for tile_naip in naip_data
+        ]
+
+    if is_training and uavsar_data is not None and training_modality_dropout_uavsar > 0:
+        import random
+        uavsar_data = [
+            None if random.random() < training_modality_dropout_uavsar else tile_uavsar
+            for tile_uavsar in uavsar_data
+        ]
 
     # Forward pass
     predictions = model(
@@ -235,7 +352,7 @@ def process_raster_batch(
     )  # [batch_size, n_bands, 5, 5]
 
     # Compute MSE loss on normalized values
-    loss = nn.functional.mse_loss(predictions, fuel_metrics_batch)
+    mse_loss = nn.functional.mse_loss(predictions, fuel_metrics_batch)
 
     # Compute per-band losses
     per_band_losses = {}
@@ -243,6 +360,17 @@ def process_raster_batch(
     for band_idx in range(n_bands):
         band_loss = nn.functional.mse_loss(predictions[:, band_idx], fuel_metrics_batch[:, band_idx])
         per_band_losses[f'Band_{band_idx}'] = band_loss
+
+    # Compute correlation loss if enabled
+    if correlation_loss_weight > 0:
+        corr_loss = compute_correlation_loss(predictions, fuel_metrics_batch)
+        per_band_losses['correlation_loss'] = corr_loss
+        loss = mse_loss + correlation_loss_weight * corr_loss
+    else:
+        loss = mse_loss
+
+    # Store MSE separately for logging
+    per_band_losses['mse_loss'] = mse_loss
 
     # Initialize diagnostics
     diagnostics = {
@@ -349,7 +477,9 @@ def train_one_epoch_ddp(
     n_good_tiles = 0
     n_bad_tiles = 0
 
-    current_optimizer_step = 0
+    # Compute steps_per_epoch for global step tracking
+    steps_per_epoch = len(train_loader) // accumulation_steps
+    current_optimizer_step = epoch * steps_per_epoch  # Global step, not per-epoch
     current_batch_step = epoch * len(train_loader)
 
     # Zero gradients at start of epoch
@@ -361,6 +491,10 @@ def train_one_epoch_ddp(
     backward_time = 0.0
     optimizer_time = 0.0
     batch_start_time = time.time()
+
+    # Variance tracking for epoch-level metrics
+    all_train_predictions = []
+    all_train_targets = []
 
     for batch_idx, batch in enumerate(train_loader):
         # Track data loading time
@@ -376,7 +510,11 @@ def train_one_epoch_ddp(
                 use_uavsar=config.use_uavsar,
                 is_training=True,
                 rank=rank,
-                logger=logger
+                logger=logger,
+                training_edge_dropout=config.training_edge_dropout,
+                training_modality_dropout_naip=config.training_modality_dropout_naip,
+                training_modality_dropout_uavsar=config.training_modality_dropout_uavsar,
+                correlation_loss_weight=config.correlation_loss_weight
             )
         forward_time += (time.time() - forward_start)
 
@@ -398,6 +536,11 @@ def train_one_epoch_ddp(
         # Scale loss for gradient accumulation
         scaled_loss = loss / accumulation_steps
         n_good_tiles += batch[0].shape[0] - len(diagnostics['bad_tiles'])
+
+        # Accumulate predictions/targets for variance metrics (subsample to save memory)
+        if batch_idx % 10 == 0:  # Every 10th batch
+            all_train_predictions.append(predictions.detach().cpu())
+            all_train_targets.append(targets.detach().cpu())
 
         # Backward pass timing
         backward_start = time.time()
@@ -455,6 +598,103 @@ def train_one_epoch_ddp(
             if current_optimizer_step % 10 == 0:
                 log_system_metrics(writer, current_batch_step, device, rank)
 
+            # Run feature diversity diagnostics every 50 optimizer steps
+            # This helps identify if bottleneck is aggregation (low diversity) or decoder
+            if current_optimizer_step % 50 == 0 and rank == 0:
+                with torch.no_grad():
+                    # Get model (unwrap DDP)
+                    model_module = model.module if hasattr(model, 'module') else model
+
+                    # Run diagnostic forward pass on current batch
+                    with autocast(device_type='cuda', dtype=torch.bfloat16):
+                        # Unpack batch for diagnostic
+                        (dep_points_batch, fuel_metrics_batch, edge_index_batch, dep_points_attr_batch,
+                         naip_data_batch, uavsar_data_batch, centers, scales, bboxes, tile_ids,
+                         norm_params_list, batch_indices_diag) = batch
+
+                        # Move to device
+                        dep_points_batch = dep_points_batch.to(device)
+                        edge_index_batch = edge_index_batch.to(device)
+                        dep_points_attr_batch = dep_points_attr_batch.to(device)
+                        batch_indices_diag = batch_indices_diag.to(device)
+
+                        # Forward through full model to get point features
+                        # (Skip image encoding for speed - just use point features)
+                        dep_points_and_attr = torch.cat([dep_points_attr_batch, dep_points_batch], dim=1)
+                        x_feat, _ = model_module.feature_extractor(dep_points_and_attr, dep_points_batch, edge_index_batch)
+
+                        # Run raster head with diagnostics
+                        _, feature_diagnostics = model_module.raster_head.forward_with_diagnostics(
+                            point_features=x_feat,
+                            point_positions=dep_points_batch,
+                            batch_indices=batch_indices_diag,
+                            norm_params=norm_params_list
+                        )
+
+                        # Log diagnostics to TensorBoard
+                        if writer is not None:
+                            # Point feature diagnostics
+                            if 'point_feature_std' in feature_diagnostics:
+                                writer.add_scalar('Diagnostics/point_feature_std',
+                                                feature_diagnostics['point_feature_std'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/point_cosine_similarity',
+                                                feature_diagnostics['point_cosine_similarity'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/point_feature_cv',
+                                                feature_diagnostics['point_feature_cv'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/point_feature_norm',
+                                                feature_diagnostics['point_feature_norm'], current_optimizer_step)
+
+                            # Grid feature diagnostics
+                            writer.add_scalar('Diagnostics/grid_feature_std_spatial',
+                                            feature_diagnostics['grid_feature_std_spatial'], current_optimizer_step)
+                            writer.add_scalar('Diagnostics/grid_feature_range',
+                                            feature_diagnostics['grid_feature_range'], current_optimizer_step)
+                            writer.add_scalar('Diagnostics/grid_feature_cv',
+                                            feature_diagnostics['grid_feature_cv'], current_optimizer_step)
+                            writer.add_scalar('Diagnostics/grid_cosine_similarity',
+                                            feature_diagnostics['grid_cosine_similarity'], current_optimizer_step)
+                            writer.add_scalar('Diagnostics/grid_feature_norm',
+                                            feature_diagnostics['grid_feature_norm'], current_optimizer_step)
+
+                            # Coverage diagnostics
+                            if 'coverage_mean' in feature_diagnostics:
+                                writer.add_scalar('Diagnostics/coverage_mean',
+                                                feature_diagnostics['coverage_mean'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/coverage_min',
+                                                feature_diagnostics['coverage_min'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/coverage_max',
+                                                feature_diagnostics['coverage_max'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/coverage_corner',
+                                                feature_diagnostics['coverage_corner'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/coverage_edge',
+                                                feature_diagnostics['coverage_edge'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/coverage_interior',
+                                                feature_diagnostics['coverage_interior'], current_optimizer_step)
+
+                            # Query norm diagnostics (detect positional encoding washout)
+                            if 'query_embed_norm' in feature_diagnostics:
+                                writer.add_scalar('Diagnostics/query_embed_norm',
+                                                feature_diagnostics['query_embed_norm'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/pos_encoding_norm',
+                                                feature_diagnostics['pos_encoding_norm'], current_optimizer_step)
+                                writer.add_scalar('Diagnostics/query_pos_ratio',
+                                                feature_diagnostics['query_pos_ratio'], current_optimizer_step)
+
+                        # Print comprehensive diagnostic summary to console
+                        if logger:
+                            point_std = feature_diagnostics.get('point_feature_std', 0)
+                            point_sim = feature_diagnostics.get('point_cosine_similarity', 0)
+                            grid_std = feature_diagnostics['grid_feature_std_spatial']
+                            grid_sim = feature_diagnostics['grid_cosine_similarity']
+                            cov_mean = feature_diagnostics.get('coverage_mean', 0)
+                            cov_corner = feature_diagnostics.get('coverage_corner', 0)
+                            cov_interior = feature_diagnostics.get('coverage_interior', 0)
+
+                            logger.info(f"[Epoch {epoch}, Step {current_optimizer_step}] Diagnostics:")
+                            logger.info(f"  Point features:  std={point_std:.4f}, cosine_sim={point_sim:.4f}")
+                            logger.info(f"  Grid features:   std={grid_std:.4f}, cosine_sim={grid_sim:.4f}")
+                            logger.info(f"  Coverage:        mean={cov_mean:.0f}pts, corner={cov_corner:.0f}pts, interior={cov_interior:.0f}pts")
+
             current_optimizer_step += 1
             accumulated_batch_count = 0
 
@@ -501,6 +741,47 @@ def train_one_epoch_ddp(
 
         # Log one final system snapshot at end of epoch
         log_system_metrics(writer, epoch * len(train_loader), device, rank)
+
+        # Compute and log variance/correlation metrics
+        if len(all_train_predictions) > 0:
+            train_preds = torch.cat(all_train_predictions, dim=0)  # [N, n_bands, 5, 5]
+            train_targs = torch.cat(all_train_targets, dim=0)
+
+            # Per-band variance and correlation metrics
+            n_bands = train_preds.shape[1]
+            for band_idx in range(n_bands):
+                pred_band = train_preds[:, band_idx].flatten()
+                targ_band = train_targs[:, band_idx].flatten()
+
+                # Standard deviations (measures variance)
+                pred_std = pred_band.std().item()
+                targ_std = targ_band.std().item()
+                writer.add_scalar(f'Variance/train_band_{band_idx}_pred_std', pred_std, epoch)
+                writer.add_scalar(f'Variance/train_band_{band_idx}_target_std', targ_std, epoch)
+
+                # Variance ratio (pred_std / target_std) - closer to 1.0 is better
+                if targ_std > 1e-8:
+                    variance_ratio = pred_std / targ_std
+                    writer.add_scalar(f'Variance/train_band_{band_idx}_ratio', variance_ratio, epoch)
+
+                # Pearson correlation
+                pred_centered = pred_band - pred_band.mean()
+                targ_centered = targ_band - targ_band.mean()
+                if pred_std > 1e-8 and targ_std > 1e-8:
+                    covariance = (pred_centered * targ_centered).mean()
+                    correlation = covariance / (pred_std * targ_std)
+                    correlation = torch.clamp(correlation, -1.0, 1.0)
+                    writer.add_scalar(f'Correlation/train_band_{band_idx}_pearson_r', correlation.item(), epoch)
+
+                # Mean absolute error (in normalized space)
+                mae = (pred_band - targ_band).abs().mean().item()
+                writer.add_scalar(f'MAE/train_band_{band_idx}', mae, epoch)
+
+                # Prediction range (max - min)
+                pred_range = (pred_band.max() - pred_band.min()).item()
+                targ_range = (targ_band.max() - targ_band.min()).item()
+                writer.add_scalar(f'Range/train_band_{band_idx}_pred', pred_range, epoch)
+                writer.add_scalar(f'Range/train_band_{band_idx}_target', targ_range, epoch)
 
     return {
         'loss': train_loss_avg,
@@ -558,7 +839,8 @@ def validate_one_epoch_ddp(
                     use_uavsar=config.use_uavsar,
                     is_training=False,
                     rank=rank,
-                    logger=logger
+                    logger=logger,
+                    correlation_loss_weight=config.correlation_loss_weight
                 )
 
                 # Synchronize skip decision across all GPUs (critical for DDP)
@@ -639,6 +921,33 @@ def validate_one_epoch_ddp(
                 writer.add_scalar(f'Val_Metrics/band_{band_idx}_mae', band_mae, epoch)
                 writer.add_scalar(f'Val_Metrics/band_{band_idx}_p50', band_p50, epoch)
 
+                # Variance and correlation metrics
+                pred_std = pred_band.std().item()
+                targ_std = targ_band.std().item()
+                writer.add_scalar(f'Variance/val_band_{band_idx}_pred_std', pred_std, epoch)
+                writer.add_scalar(f'Variance/val_band_{band_idx}_target_std', targ_std, epoch)
+
+                # Variance ratio
+                if targ_std > 1e-8:
+                    variance_ratio = pred_std / targ_std
+                    writer.add_scalar(f'Variance/val_band_{band_idx}_ratio', variance_ratio, epoch)
+
+                # Pearson correlation
+                pred_centered = pred_band - pred_band.mean()
+                targ_centered = targ_band - targ_band.mean()
+                if pred_std > 1e-8 and targ_std > 1e-8:
+                    covariance = (pred_centered * targ_centered).mean()
+                    correlation = covariance / (pred_std * targ_std)
+                    correlation = torch.clamp(correlation, -1.0, 1.0)
+                    writer.add_scalar(f'Correlation/val_band_{band_idx}_pearson_r', correlation.item(), epoch)
+                    metrics[f'band_{band_idx}_correlation'] = correlation.item()
+
+                # Prediction range
+                pred_range = (pred_band.max() - pred_band.min()).item()
+                targ_range = (targ_band.max() - targ_band.min()).item()
+                writer.add_scalar(f'Range/val_band_{band_idx}_pred', pred_range, epoch)
+                writer.add_scalar(f'Range/val_band_{band_idx}_target', targ_range, epoch)
+
     # Log epoch-level metrics
     if rank == 0 and writer is not None:
         writer.add_scalar('Loss/val_epoch', val_loss_avg, epoch)
@@ -670,11 +979,13 @@ def train_raster_worker(
     save_every_n_epochs: int = 10,
     use_amp: bool = True,
     early_stopping_patience: int = 10,
+    early_stopping_metric: str = 'loss',
     seed: int = 42,
     beta1: float = 0.9,
     beta2: float = 0.999,
     max_grad_norm: float = 10.0,
-    warmup_steps_percentage: float = 0.05
+    warmup_steps_percentage: float = 0.05,
+    resume_checkpoint_path: Optional[str] = None
 ):
     """
     Training worker for distributed data parallel training.
@@ -697,13 +1008,11 @@ def train_raster_worker(
         save_every_n_epochs: Save checkpoint every N epochs
         use_amp: Use automatic mixed precision
         early_stopping_patience: Epochs without improvement before stopping
+        early_stopping_metric: Metric to use for early stopping ('loss' or 'mae')
         seed: Random seed
+        resume_checkpoint_path: Path to checkpoint to resume training from (optional)
     """
-    # Setup distributed training
-    os.environ['MASTER_ADDR'] = 'localhost'
-    # Use environment variable if set, otherwise use default port
-    if 'MASTER_PORT' not in os.environ:
-        os.environ['MASTER_PORT'] = '12355'
+    # Setup distributed training (MASTER_ADDR and MASTER_PORT already set by parent process)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
     device = torch.device(f'cuda:{rank}')
@@ -717,6 +1026,10 @@ def train_raster_worker(
         checkpoint_dir = Path(output_dir) / 'checkpoints'
         checkpoint_dir.mkdir(exist_ok=True)
 
+    # Validate early stopping metric
+    if early_stopping_metric not in ['loss', 'mae']:
+        raise ValueError(f"early_stopping_metric must be 'loss' or 'mae', got '{early_stopping_metric}'")
+
     # Setup logging (rank 0 only)
     logger = None
     if rank == 0:
@@ -727,7 +1040,8 @@ def train_raster_worker(
         logger.info(f"Configuration: use_naip={config.use_naip}, use_uavsar={config.use_uavsar}")
         logger.info(f"Hyperparameters: epochs={num_epochs}, batch_size={batch_size}, "
                    f"lr={learning_rate}, weight_decay={weight_decay}, "
-                   f"early_stopping_patience={early_stopping_patience}")
+                   f"early_stopping_patience={early_stopping_patience}, "
+                   f"early_stopping_metric={early_stopping_metric}")
 
     # Create TensorBoard writer (rank 0 only)
     writer = None
@@ -853,12 +1167,59 @@ def train_raster_worker(
     # AMP scaler for mixed precision
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
-    # Training loop
-    best_val_loss = float('inf')
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    best_early_stop_metric = float('inf')  # Tracks early_stopping_metric (loss or mae)
     epochs_without_improvement = 0
-    training_history = {'train_loss': [], 'val_loss': [], 'learning_rates': []}
 
-    for epoch in range(num_epochs):
+    if resume_checkpoint_path is not None:
+        if rank == 0:
+            print(f"\n{'='*80}")
+            print(f"RESUMING FROM CHECKPOINT: {resume_checkpoint_path}")
+            print(f"{'='*80}")
+
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+
+        # Load model state
+        model.module.load_state_dict(checkpoint['model_state_dict'])
+        if rank == 0:
+            print(f"  ✓ Loaded model weights")
+
+        # Load optimizer state
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if rank == 0:
+            print(f"  ✓ Loaded optimizer state")
+
+        # Get starting epoch (resume from next epoch)
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        if rank == 0:
+            print(f"  ✓ Resuming from epoch {start_epoch} (checkpoint was epoch {checkpoint.get('epoch', 0)})")
+
+        # Load best metric value if available (use the appropriate metric)
+        if early_stopping_metric == 'mae' and 'val_mae' in checkpoint and checkpoint['val_mae'] is not None:
+            best_early_stop_metric = checkpoint['val_mae']
+            if rank == 0:
+                print(f"  ✓ Best MAE so far: {best_early_stop_metric:.6f}")
+        elif early_stopping_metric == 'loss' and 'val_loss' in checkpoint:
+            best_early_stop_metric = checkpoint['val_loss']
+            if rank == 0:
+                print(f"  ✓ Best loss so far: {best_early_stop_metric:.6f}")
+        else:
+            # If metric not in checkpoint, start fresh tracking
+            if rank == 0:
+                print(f"  ⚠ Best {early_stopping_metric} not in checkpoint, starting fresh early stopping tracking")
+
+        if rank == 0:
+            remaining_epochs = num_epochs - start_epoch
+            print(f"  → Will train for {remaining_epochs} more epochs (epochs {start_epoch} to {num_epochs-1})")
+            print(f"{'='*80}\n")
+            if logger:
+                logger.info(f"Resumed from checkpoint: {resume_checkpoint_path}")
+                logger.info(f"Starting at epoch {start_epoch}, best {early_stopping_metric}: {best_early_stop_metric:.6f}")
+
+    training_history = {'train_loss': [], 'val_loss': [], 'val_mae': [], 'learning_rates': []}
+
+    for epoch in range(start_epoch, num_epochs):
         epoch_start_time = time.time()
 
         # Set epoch for distributed sampler
@@ -911,11 +1272,14 @@ def train_raster_worker(
 
             training_history['train_loss'].append(train_metrics['loss'])
             training_history['val_loss'].append(val_metrics['loss'])
+            if 'mae' in val_metrics:
+                training_history['val_mae'].append(val_metrics['mae'])
             training_history['learning_rates'].append(current_lr)
 
             # Early stopping logic
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
+            current_metric_value = val_metrics[early_stopping_metric]
+            if current_metric_value < best_early_stop_metric:
+                best_early_stop_metric = current_metric_value
                 epochs_without_improvement = 0
                 checkpoint_path = Path(output_dir) / 'checkpoints' / 'best_model.pth'
                 torch.save({
@@ -923,20 +1287,21 @@ def train_raster_worker(
                     'model_state_dict': model.module.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_loss': val_metrics['loss'],
+                    'val_mae': val_metrics.get('mae', None),
                     'config': config
                 }, checkpoint_path)
-                msg = f"✓ Saved best model (val_loss: {val_metrics['loss']:.6f})"
+                msg = f"✓ Saved best model ({early_stopping_metric}: {current_metric_value:.6f})"
                 print(f"  → {msg}")
                 if logger:
                     logger.info(msg)
             else:
                 epochs_without_improvement += 1
                 if logger:
-                    logger.info(f"No improvement for {epochs_without_improvement} epochs")
+                    logger.info(f"No improvement in {early_stopping_metric} for {epochs_without_improvement} epochs")
 
             # Check early stopping
             if epochs_without_improvement >= early_stopping_patience:
-                msg = f"Early stopping triggered at epoch {epoch+1} (no improvement for {early_stopping_patience} epochs)"
+                msg = f"Early stopping triggered at epoch {epoch+1} (no improvement in {early_stopping_metric} for {early_stopping_patience} epochs)"
                 print(f"  → {msg}")
                 if logger:
                     logger.info(msg)
@@ -973,10 +1338,11 @@ def train_raster_worker(
     if rank == 0:
         final_checkpoint_path = Path(output_dir) / 'checkpoints' / 'final_model.pth'
         torch.save({
-            'epoch': num_epochs - 1,
+            'epoch': epoch,  # Actual last completed epoch (not num_epochs - 1)
             'model_state_dict': model.module.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_metrics['loss'],
+            'val_mae': val_metrics.get('mae', None),
             'config': config
         }, final_checkpoint_path)
         if logger:
@@ -993,12 +1359,20 @@ def train_raster_worker(
             writer.close()
 
         completion_msg = (f"\n{'='*80}\nTraining complete!\n"
-                         f"Best validation loss: {best_val_loss:.6f}\n"
+                         f"Best {early_stopping_metric}: {best_early_stop_metric:.6f}\n"
                          f"Checkpoints saved to: {Path(output_dir) / 'checkpoints'}\n"
                          f"Logs saved to: {Path(output_dir) / 'logs'}\n{'='*80}")
         print(completion_msg)
         if logger:
-            logger.info(f"Training complete. Best validation loss: {best_val_loss:.6f}")
+            logger.info(f"Training complete. Best {early_stopping_metric}: {best_early_stop_metric:.6f}")
+
+        # Save best metric to file for retrieval by main process (rank 0 only)
+        best_metric_file = Path(output_dir) / 'best_metric.json'
+        with open(best_metric_file, 'w') as f:
+            json.dump({
+                'best_metric': float(best_early_stop_metric),
+                'metric_name': early_stopping_metric
+            }, f)
 
     # Synchronize all ranks before cleanup to prevent deadlock
     if dist.is_initialized():
@@ -1028,12 +1402,14 @@ def train_raster_model(
     save_every_n_epochs: int = 10,
     use_amp: bool = True,
     early_stopping_patience: int = 10,
+    early_stopping_metric: str = 'loss',
     seed: int = 42,
     num_gpus: Optional[int] = None,
     beta1: float = 0.9,
     beta2: float = 0.999,
     max_grad_norm: float = 10.0,
-    warmup_steps_percentage: float = 0.05
+    warmup_steps_percentage: float = 0.05,
+    resume_checkpoint_path: Optional[str] = None
 ):
     """
     Main entry point for training raster prediction model.
@@ -1052,12 +1428,14 @@ def train_raster_model(
         save_every_n_epochs: Save frequency
         use_amp: Use mixed precision
         early_stopping_patience: Epochs without improvement before stopping
+        early_stopping_metric: Metric to use for early stopping ('loss' or 'mae')
         seed: Random seed
         num_gpus: Number of GPUs (None = all available)
         beta1: AdamW beta1 parameter
         beta2: AdamW beta2 parameter
         max_grad_norm: Gradient clipping threshold
         warmup_steps_percentage: Percentage of total steps for warmup
+        resume_checkpoint_path: Path to checkpoint to resume training from (optional)
     """
     import hashlib
 
@@ -1120,6 +1498,14 @@ def train_raster_model(
                           for i in range(world_size)]
         aug_shard_paths = aug_shard_paths if all(os.path.exists(p) for p in aug_shard_paths) else [None] * world_size
 
+    # Setup distributed training environment
+    os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        # Find a free port to avoid conflicts with previous runs
+        free_port = find_free_port()
+        os.environ['MASTER_PORT'] = str(free_port)
+        print(f"Using port {free_port} for distributed training")
+
     # Spawn training workers
     torch.multiprocessing.spawn(
         train_raster_worker,
@@ -1128,8 +1514,17 @@ def train_raster_model(
               aug_shard_prefix if aug_shard_paths[0] is not None else None,
               output_dir, num_epochs, batch_size,
               learning_rate, weight_decay, gradient_accumulation_steps,
-              save_every_n_epochs, use_amp, early_stopping_patience, seed,
-              beta1, beta2, max_grad_norm, warmup_steps_percentage),
+              save_every_n_epochs, use_amp, early_stopping_patience, early_stopping_metric, seed,
+              beta1, beta2, max_grad_norm, warmup_steps_percentage, resume_checkpoint_path),
         nprocs=world_size,
         join=True
     )
+
+    # Read and return best metric from training
+    best_metric_file = Path(output_dir) / 'best_metric.json'
+    if best_metric_file.exists():
+        with open(best_metric_file, 'r') as f:
+            metric_data = json.load(f)
+        return metric_data['best_metric']
+    else:
+        raise RuntimeError(f"Training completed but best metric file not found: {best_metric_file}")

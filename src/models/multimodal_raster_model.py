@@ -20,8 +20,8 @@ Key differences from point cloud model:
 
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Union
 
 # Import shared encoder components
 from .encoders import NAIPEncoder, UAVSAREncoder
@@ -79,10 +79,18 @@ class MultimodalRasterConfig:
     grid_size: int = 5  # Grid size per side (5×5 grid)
     tile_extent: float = 10.0  # Tile extent in meters
     raster_num_heads: int = 8  # Number of attention heads in raster aggregator
-    raster_radius: float = 5.0  # Distance threshold in meters for grid query attention (matches cross_attention max_dist_ratio)
+    # RASTER MODEL: Soft Gaussian distance weighting (σ) for grid query attention.
+    # Replaces hard radius cutoff to handle sparse tiles without NaN.
+    # σ=2.0m matches grid cell size: weight at 0m=1.0, 2m=0.61, 3m=0.32, 5m=0.04
+    # Can be a single float (same for all heads) or list of floats (per-head multi-scale)
+    # Multi-scale example: [0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0] for 8 heads
+    raster_distance_sigma: Union[float, List[float]] = 2.0
     raster_hidden_dim: int = 128  # Hidden dimension in raster decoder
-    raster_decoder_layers: int = 3  # Number of MLP layers in raster decoder (tunable: 3/4/5)
-    raster_dropout: float = 0.1  # Dropout in raster decoder
+    raster_decoder_layers: int = 3  # Number of MLP layers in raster decoder (tunable: 2/3)
+    # Split dropout: separate values for attention (preserve sparse signal) and decoder MLP (regularize)
+    raster_attention_dropout: float = 0.1  # Dropout for grid aggregation attention (keep low)
+    raster_decoder_dropout: float = 0.1  # Dropout for decoder MLP (can be higher)
+    raster_use_wide_decoder: bool = False  # Use wide decoder with Pre-LN residuals (256→256→256→n_bands)
 
     # Pre-aggregation refinement parameters
     num_pre_agg_blocks: int = 2  # Number of pre-aggregation LG-PAB blocks (0-5 configurable)
@@ -95,6 +103,17 @@ class MultimodalRasterConfig:
     checkpoint_path: str = None
     layers_to_load: list = None
     layers_to_freeze: list = None
+
+    # Training-time dropout (applied during training only, not validation)
+    # These are SEPARATE from augmentation-time dropout in data_augmentation_raster.py
+    training_edge_dropout: float = 0.0  # Edge dropout rate for KNN graph (e.g., 0.03 = 3%)
+    training_modality_dropout_naip: float = 0.0  # NAIP modality dropout rate (e.g., 0.03 = 3%)
+    training_modality_dropout_uavsar: float = 0.0  # UAVSAR modality dropout rate (e.g., 0.15 = 15%)
+
+    # Correlation loss weight (addresses variance collapse)
+    # Total loss = MSE + correlation_loss_weight * (1 - pearson_r)
+    # Set to 0.0 to disable, typical values: 0.1-0.5
+    correlation_loss_weight: float = 0.0
 
     def __post_init__(self):
         """Set default target_band_indices if not provided."""
@@ -130,10 +149,12 @@ class MultimodalRasterConfig:
                 self.grid_size,
                 self.tile_extent,
                 self.raster_num_heads,
-                self.raster_radius,
+                self.raster_distance_sigma,
                 self.raster_hidden_dim,
                 self.raster_decoder_layers,
-                self.raster_dropout,
+                self.raster_attention_dropout,
+                self.raster_decoder_dropout,
+                self.raster_use_wide_decoder,
                 self.num_pre_agg_blocks,
                 self.pre_agg_lcl_heads,
                 self.pre_agg_glbl_heads,
@@ -142,6 +163,10 @@ class MultimodalRasterConfig:
                 self.checkpoint_path,
                 self.layers_to_load,
                 self.layers_to_freeze,
+                self.training_edge_dropout,
+                self.training_modality_dropout_naip,
+                self.training_modality_dropout_uavsar,
+                self.correlation_loss_weight,
             )
         )
 
@@ -230,12 +255,14 @@ class MultimodalRasterPredictor(nn.Module):
             feature_dim=config.feature_dim,
             n_bands=config.n_bands,
             num_heads=config.raster_num_heads,
-            radius=config.raster_radius,
+            distance_sigma=config.raster_distance_sigma,  # RASTER MODEL: Soft Gaussian weighting
             grid_size=config.grid_size,
             tile_extent=config.tile_extent,
             hidden_dim=config.raster_hidden_dim,
             num_decoder_layers=config.raster_decoder_layers,
-            dropout=config.raster_dropout,
+            attention_dropout=config.raster_attention_dropout,  # Split dropout: attention
+            decoder_dropout=config.raster_decoder_dropout,  # Split dropout: decoder MLP
+            use_wide_decoder=config.raster_use_wide_decoder,  # Wide decoder with Pre-LN residuals
             num_pre_agg_blocks=config.num_pre_agg_blocks,
             pre_agg_lcl_heads=config.pre_agg_lcl_heads,
             pre_agg_glbl_heads=config.pre_agg_glbl_heads,
@@ -253,7 +280,8 @@ class MultimodalRasterPredictor(nn.Module):
         dep_attr: Optional[torch.Tensor] = None,
         naip: Optional[List[Dict]] = None,
         uavsar: Optional[List[Dict]] = None,
-        bbox: Optional[torch.Tensor] = None
+        bbox: Optional[torch.Tensor] = None,
+        debug_logging: bool = False
     ) -> torch.Tensor:
         """
         Forward pass of the multimodal raster predictor.
@@ -293,6 +321,12 @@ class MultimodalRasterPredictor(nn.Module):
         x_feat, _ = self.feature_extractor(dep_points_and_attr, dep_points, edge_index)
         # x_feat: [N_total, feature_dim]
 
+        if debug_logging:
+            has_nan = torch.isnan(x_feat).any().item()
+            print(f"  [DEBUG] After feature_extractor: NaN={has_nan}")
+            if has_nan:
+                print(f"    NaN count: {torch.isnan(x_feat).sum().item()}/{x_feat.numel()}")
+
         # ====== 2) Imagery Feature Extraction ======
         # Process each tile separately since imagery data is list of dicts
         naip_embeddings_list = []
@@ -314,6 +348,13 @@ class MultimodalRasterPredictor(nn.Module):
                         naip_b.get('img_bbox', None),
                         rel_dates
                     )  # [num_patches, img_embed_dim]
+
+                    if debug_logging:
+                        has_nan = torch.isnan(naip_emb).any().item()
+                        print(f"  [DEBUG] After naip_encoder (tile {b}): NaN={has_nan}")
+                        if has_nan:
+                            print(f"    NaN count: {torch.isnan(naip_emb).sum().item()}/{naip_emb.numel()}")
+
                     naip_embeddings_list.append(naip_emb)
                 else:
                     naip_embeddings_list.append(None)
@@ -333,12 +374,59 @@ class MultimodalRasterPredictor(nn.Module):
                     if rel_dates is not None:
                         rel_dates = rel_dates.to(device)
 
+                    # Filter out UAVSAR acquisitions with NaN values
+                    # Check NaN per acquisition: uavsar_images shape is [n_images, 6, 4, 4]
+                    n_acquisitions = uavsar_images.shape[0]
+                    pixels_per_acquisition = uavsar_images.shape[1] * uavsar_images.shape[2] * uavsar_images.shape[3]  # 6*4*4 = 96
+
+                    # Count NaN pixels per acquisition
+                    nan_counts_per_image = torch.isnan(uavsar_images).view(n_acquisitions, -1).sum(dim=1)  # [n_images]
+                    has_nan_per_image = nan_counts_per_image > 0
+
+                    if debug_logging:
+                        print(f"  [DEBUG] UAVSAR (tile {b}): {n_acquisitions} acquisitions")
+                        for acq_idx in range(n_acquisitions):
+                            nan_count = nan_counts_per_image[acq_idx].item()
+                            status = "✗ REMOVE" if has_nan_per_image[acq_idx] else "✓ KEEP"
+                            print(f"    Acquisition {acq_idx}: {nan_count}/{pixels_per_acquisition} NaN pixels ({100*nan_count/pixels_per_acquisition:.1f}%) - {status}")
+
+                    if has_nan_per_image.any():
+                        # Some acquisitions have NaN - filter them out
+                        valid_mask = ~has_nan_per_image
+
+                        if valid_mask.any():
+                            # Keep only valid acquisitions
+                            n_removed = has_nan_per_image.sum().item()
+                            n_kept = valid_mask.sum().item()
+
+                            uavsar_images = uavsar_images[valid_mask]
+                            if mask is not None:
+                                mask = mask[valid_mask]
+                            if rel_dates is not None:
+                                rel_dates = rel_dates[valid_mask]
+
+                            if debug_logging:
+                                print(f"  [DEBUG] UAVSAR filtering: Removed {n_removed}, kept {n_kept}")
+                        else:
+                            # All acquisitions have NaN - skip UAVSAR for this tile
+                            if debug_logging:
+                                print(f"  [DEBUG] UAVSAR filtering: All {n_acquisitions} acquisitions have NaN, skipping UAVSAR")
+                            uavsar_embeddings_list.append(None)
+                            continue
+
                     uavsar_emb = self.uavsar_encoder(
                         uavsar_images,
                         attention_mask=mask,
                         img_bbox=uavsar_b.get('img_bbox', None),
                         relative_dates=rel_dates
                     )  # [num_patches, img_embed_dim]
+
+                    if debug_logging:
+                        has_nan = torch.isnan(uavsar_emb).any().item()
+                        print(f"  [DEBUG] After uavsar_encoder (tile {b}): NaN={has_nan}")
+                        if has_nan:
+                            print(f"    NaN count: {torch.isnan(uavsar_emb).sum().item()}/{uavsar_emb.numel()}")
+
                     uavsar_embeddings_list.append(uavsar_emb)
                 else:
                     uavsar_embeddings_list.append(None)
@@ -384,6 +472,12 @@ class MultimodalRasterPredictor(nn.Module):
                 norm_params=norm_params[b]  # Pass norm_params for denormalization
             )  # [N_b, feature_dim]
 
+            if debug_logging:
+                has_nan = torch.isnan(x_fused_b).any().item()
+                print(f"  [DEBUG] After fusion (tile {b}): NaN={has_nan}")
+                if has_nan:
+                    print(f"    NaN count: {torch.isnan(x_fused_b).sum().item()}/{x_fused_b.numel()}")
+
             fused_features.append(x_fused_b)
 
         # Concatenate fused features back to full batch
@@ -396,5 +490,11 @@ class MultimodalRasterPredictor(nn.Module):
             batch_indices=batch_indices,
             norm_params=norm_params
         )  # [batch_size, n_bands, 5, 5]
+
+        if debug_logging:
+            has_nan = torch.isnan(pred_raster).any().item()
+            print(f"  [DEBUG] After raster_head: NaN={has_nan}")
+            if has_nan:
+                print(f"    NaN count: {torch.isnan(pred_raster).sum().item()}/{pred_raster.numel()}")
 
         return pred_raster

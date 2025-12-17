@@ -65,7 +65,7 @@ python src/data_prep/generate_training_data_raster.py \
   --outdir data/processed/training_data_chunks_raster \
   --naip_stac_source data/stac/naip/catalog.json \
   --uavsar_stac_source data/stac/uavsar/catalog.json \
-  --start_date 2016-01-01 \
+  --start_date 2014-01-01 \
   --end_date 2025-12-31 \
   --chunk_size 100 \
   --threads 8 \
@@ -84,7 +84,7 @@ python src/data_prep/validate_raster_training_data.py \
   --fuel-metrics-raster data/processed/fuel_metrics/volcan_mtn/merged/volcan_mtn_fuel_metrics_2.0m.tif \
   --output-dir data/processed/model_data_raster/validation_report \
   --max-na-ratio 0.5 \
-  --min-dep-points 100 \
+  --min-dep-points 50 \
   --verbose
 
 # Normalize, split 90/10, and precompute
@@ -93,16 +93,19 @@ python src/data_prep/train_test_split_and_precompute_raster.py \
   --pt-file data/processed/model_data_raster/combined_training_data_raster.pt \
   --output-dir data/processed/model_data_raster \
   --train-val-ratio 0.9 \
-  --min-dep-points 100 \
+  --min-dep-points 50 \
   --max-na-ratio 0.5 \
   --random-seed 42 \
-  --precision 32
+  --precision 32 \
+  --no-log-tfl
 
 # Data augmentation
 echo "Step 5: Data augmentation..."
 python src/data_prep/data_augmentation_raster.py \
   --training_tiles data/processed/model_data_raster/precomputed_training_tiles_raster_32bit.pt \
-  --output_path data/processed/model_data_raster/augmented_tiles_raster_32bit.pt
+  --output_path data/processed/model_data_raster/augmented_tiles_raster_32bit.pt \
+  --n_augmentations 2
 
 echo ""
 echo "Pipeline complete! Training data ready in data/processed/model_data_raster/"
+
