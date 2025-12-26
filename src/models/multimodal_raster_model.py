@@ -115,6 +115,16 @@ class MultimodalRasterConfig:
     # Set to 0.0 to disable, typical values: 0.1-0.5
     correlation_loss_weight: float = 0.0
 
+    # Huber loss delta threshold (for robust loss)
+    # Errors > delta use linear penalty instead of quadratic
+    huber_delta: float = 1.0
+
+    # Stochastic depth (DropPath) - separate configs for different components
+    encoder_drop_path: float = 0.0  # Drop path for image encoder TransformerBlocks (NAIPEncoder/UAVSAREncoder)
+    decoder_drop_path: float = 0.0  # Drop path for WideRasterDecoder residual blocks
+    extractor_point_attn_drop_path: float = 0.0  # Drop path for feature extractor's PosAwareGlobalFlashAttention
+    pre_agg_point_attn_drop_path: float = 0.0  # Drop path for pre-aggregation blocks' PosAwareGlobalFlashAttention
+
     def __post_init__(self):
         """Set default target_band_indices if not provided."""
         if self.target_band_indices is None:
@@ -167,6 +177,11 @@ class MultimodalRasterConfig:
                 self.training_modality_dropout_naip,
                 self.training_modality_dropout_uavsar,
                 self.correlation_loss_weight,
+                self.huber_delta,
+                self.encoder_drop_path,
+                self.decoder_drop_path,
+                self.extractor_point_attn_drop_path,
+                self.pre_agg_point_attn_drop_path,
             )
         )
 
@@ -211,7 +226,8 @@ class MultimodalRasterPredictor(nn.Module):
             num_glbl_heads=config.extractor_glbl_heads,
             pos_encoding_dim=config.position_encoding_dim,
             dropout=extractor_dropout,
-            k_neighbors=config.k
+            k_neighbors=config.k,
+            global_drop_path=config.extractor_point_attn_drop_path
         )
 
         # ====== 2) Imagery Encoders (shared with point cloud model) ======
@@ -223,7 +239,8 @@ class MultimodalRasterPredictor(nn.Module):
                 embed_dim=config.img_embed_dim,
                 num_patches=config.img_num_patches,
                 dropout=config.naip_dropout,
-                temporal_encoder_type=config.temporal_encoder
+                temporal_encoder_type=config.temporal_encoder,
+                drop_path=config.encoder_drop_path
             )
 
         if self.use_uavsar:
@@ -234,7 +251,8 @@ class MultimodalRasterPredictor(nn.Module):
                 embed_dim=config.img_embed_dim,
                 num_patches=config.img_num_patches,
                 dropout=config.uavsar_dropout,
-                temporal_encoder_type=config.temporal_encoder
+                temporal_encoder_type=config.temporal_encoder,
+                drop_path=config.encoder_drop_path
             )
 
         # ====== 3) Fusion Module (shared, with norm_params support) ======
@@ -263,12 +281,14 @@ class MultimodalRasterPredictor(nn.Module):
             attention_dropout=config.raster_attention_dropout,  # Split dropout: attention
             decoder_dropout=config.raster_decoder_dropout,  # Split dropout: decoder MLP
             use_wide_decoder=config.raster_use_wide_decoder,  # Wide decoder with Pre-LN residuals
+            decoder_drop_path=config.decoder_drop_path,  # Stochastic depth for decoder
             num_pre_agg_blocks=config.num_pre_agg_blocks,
             pre_agg_lcl_heads=config.pre_agg_lcl_heads,
             pre_agg_glbl_heads=config.pre_agg_glbl_heads,
             pre_agg_dropout=config.pre_agg_dropout,
             pre_agg_k_neighbors=config.pre_agg_k_neighbors,
-            position_encoding_dim=config.position_encoding_dim
+            position_encoding_dim=config.position_encoding_dim,
+            point_attn_drop_path=config.pre_agg_point_attn_drop_path  # Stochastic depth for pre-agg blocks
         )
 
     def forward(

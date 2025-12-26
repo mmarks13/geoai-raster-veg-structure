@@ -474,6 +474,7 @@ class NAIPEncoder(nn.Module):
         num_patches=16,         # Number of output patch embeddings
         dropout=0.1,            # Dropout rate
         temporal_encoder_type='gru',  # Type of temporal encoder: 'gru' or 'transformer'
+        drop_path=0.0,          # Stochastic depth rate for TransformerEncoderBlock
         # Additional parameters for transformer encoder
         transformer_num_heads=4,
         transformer_num_layers=2,
@@ -513,11 +514,12 @@ class NAIPEncoder(nn.Module):
             max_h=n_patches_h,
             max_w=n_patches_w
         )
-        
-        # Transformer encoder block
+
+        # Transformer encoder block with stochastic depth
         self.transformer_block = TransformerEncoderBlock(
             dim=embed_dim,
-            dropout=dropout
+            dropout=dropout,
+            drop_path=drop_path
         )
         
         # Temporal encoder for aggregating across time
@@ -598,6 +600,7 @@ class UAVSAREncoder(nn.Module):
         num_patches=16,         # Number of output patch embeddings
         dropout=0.1,            # Dropout rate
         temporal_encoder_type='gru',  # Type of temporal encoder: 'gru' or 'transformer'
+        drop_path=0.0,          # Stochastic depth rate for TransformerEncoderBlock
         # Additional parameters for transformer encoder
         transformer_num_heads=4,
         transformer_num_layers=2,
@@ -637,13 +640,14 @@ class UAVSAREncoder(nn.Module):
         
         # Layer normalization
         self.norm = nn.LayerNorm(embed_dim)
-        
-        # Transformer encoder block
+
+        # Transformer encoder block with stochastic depth
         self.transformer_block = TransformerEncoderBlock(
             dim=embed_dim,
-            dropout=dropout
+            dropout=dropout,
+            drop_path=drop_path
         )
-        
+
         # Temporal encoder for aggregating across time
         if temporal_encoder_type == 'gru':
             self.temporal_encoder = TemporalGRUEncoder(embed_dim=embed_dim)

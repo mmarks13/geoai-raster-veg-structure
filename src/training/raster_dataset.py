@@ -56,7 +56,7 @@ class ShardedRasterDataset(Dataset):
         use_uavsar: bool = False,
         target_band_indices: List[int] = [2, 7, 14]
     ):
-        self.data = torch.load(shard_path, weights_only=True)
+        self.data = torch.load(shard_path, weights_only=False)
         self.k = k
         self.use_naip = use_naip
         self.use_uavsar = use_uavsar

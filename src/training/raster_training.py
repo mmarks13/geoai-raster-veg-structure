@@ -268,7 +268,8 @@ def process_raster_batch(
     training_edge_dropout: float = 0.0,
     training_modality_dropout_naip: float = 0.0,
     training_modality_dropout_uavsar: float = 0.0,
-    correlation_loss_weight: float = 0.0
+    correlation_loss_weight: float = 0.0,
+    huber_delta: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Process a single batch for raster prediction with per-tile NaN diagnostics.
@@ -283,13 +284,14 @@ def process_raster_batch(
         rank: GPU rank for logging
         logger: Logger instance
         correlation_loss_weight: Weight for correlation loss term (0 = disabled)
+        huber_delta: Delta threshold for Huber loss (errors > delta use linear penalty)
 
     Returns:
         Tuple of (predictions, targets, loss, per_band_losses, diagnostics)
         - predictions: [batch_size, n_bands, 5, 5] predicted rasters
         - targets: [batch_size, n_bands, 5, 5] ground truth rasters
-        - loss: scalar combined loss (MSE + correlation_loss_weight * corr_loss)
-        - per_band_losses: Dict with per-band MSE losses and correlation loss
+        - loss: scalar combined loss (Huber + correlation_loss_weight * corr_loss)
+        - per_band_losses: Dict with per-band MSE losses, huber_loss, and correlation loss
         - diagnostics: Dict with batch status and bad tile info
     """
     # Unpack batch (12 elements)
@@ -351,10 +353,11 @@ def process_raster_batch(
         bbox=bboxes
     )  # [batch_size, n_bands, 5, 5]
 
-    # Compute MSE loss on normalized values
+    # Compute both MSE (for logging/comparison) and Huber (for training)
     mse_loss = nn.functional.mse_loss(predictions, fuel_metrics_batch)
+    huber_loss = nn.functional.huber_loss(predictions, fuel_metrics_batch, delta=huber_delta)
 
-    # Compute per-band losses
+    # Compute per-band losses (still use MSE for comparability across runs)
     per_band_losses = {}
     n_bands = predictions.shape[1]
     for band_idx in range(n_bands):
@@ -365,12 +368,13 @@ def process_raster_batch(
     if correlation_loss_weight > 0:
         corr_loss = compute_correlation_loss(predictions, fuel_metrics_batch)
         per_band_losses['correlation_loss'] = corr_loss
-        loss = mse_loss + correlation_loss_weight * corr_loss
+        loss = huber_loss + correlation_loss_weight * corr_loss  # Use Huber as base
     else:
-        loss = mse_loss
+        loss = huber_loss  # Use Huber for actual training
 
-    # Store MSE separately for logging
-    per_band_losses['mse_loss'] = mse_loss
+    # Store both MSE and Huber for logging
+    per_band_losses['mse_loss'] = mse_loss      # For backward compatibility / comparison
+    per_band_losses['huber_loss'] = huber_loss  # New robust loss metric
 
     # Initialize diagnostics
     diagnostics = {
@@ -514,7 +518,8 @@ def train_one_epoch_ddp(
                 training_edge_dropout=config.training_edge_dropout,
                 training_modality_dropout_naip=config.training_modality_dropout_naip,
                 training_modality_dropout_uavsar=config.training_modality_dropout_uavsar,
-                correlation_loss_weight=config.correlation_loss_weight
+                correlation_loss_weight=config.correlation_loss_weight,
+                huber_delta=config.huber_delta
             )
         forward_time += (time.time() - forward_start)
 
@@ -840,7 +845,8 @@ def validate_one_epoch_ddp(
                     is_training=False,
                     rank=rank,
                     logger=logger,
-                    correlation_loss_weight=config.correlation_loss_weight
+                    correlation_loss_weight=config.correlation_loss_weight,
+                    huber_delta=config.huber_delta
                 )
 
                 # Synchronize skip decision across all GPUs (critical for DDP)
@@ -1154,14 +1160,36 @@ def train_raster_worker(
         print(f"[GPU {rank}] Total training steps: {total_training_steps} ({total_batches} batches × {num_epochs} epochs)")
         print(f"[GPU {rank}] Warmup steps: {warmup_steps} ({warmup_steps_percentage*100:.1f}% of total)")
 
-    # Create optimizer
+    # Separate parameters: exclude bias and norm layers from weight decay
+    # This is a best practice that prevents regularizing shift/scale params
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Exclude: bias terms, LayerNorm weight/bias, any param with 'norm' in name
+        if 'bias' in name or 'norm' in name.lower() or name.endswith('.gamma') or name.endswith('.beta'):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    param_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+
+    # Create optimizer with parameter groups
     optimizer = AdamWScheduleFree(
-        model.parameters(),
+        param_groups,
         lr=learning_rate,
-        weight_decay=weight_decay,
         betas=(beta1, beta2),
-        warmup_steps=warmup_steps
+        warmup_steps=warmup_steps,
+        eps=1e-5
     )
+
+    if rank == 0:
+        print(f"[GPU {rank}] Params with weight decay: {len(decay_params)}, without: {len(no_decay_params)}")
     print(f"[GPU {rank}] Using AdamWScheduleFree with lr={learning_rate}, weight decay={weight_decay}, betas=({beta1}, {beta2}), warmup_steps={warmup_steps}")
 
     # AMP scaler for mixed precision
@@ -1189,6 +1217,40 @@ def train_raster_worker(
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if rank == 0:
             print(f"  ✓ Loaded optimizer state")
+
+        # Override betas with current config values (allows changing mid-training)
+        # This preserves momentum buffers but updates the decay rates
+        checkpoint_betas = optimizer.param_groups[0]['betas']
+        for param_group in optimizer.param_groups:
+            param_group['betas'] = (beta1, beta2)
+        if rank == 0:
+            print(f"  ✓ Overriding betas to ({beta1}, {beta2})")
+            if logger:
+                logger.info(f"Overriding betas: {checkpoint_betas} -> ({beta1}, {beta2})")
+
+        # Override weight_decay for param groups that have it (not bias/norm layers)
+        # Get checkpoint's weight_decay from first group that has it
+        checkpoint_wd = None
+        for param_group in optimizer.param_groups:
+            if param_group['weight_decay'] > 0:
+                checkpoint_wd = param_group['weight_decay']
+                break
+
+        if checkpoint_wd is not None:
+            if weight_decay > checkpoint_wd and rank == 0:
+                print(f"  ⚠ WARNING: Increasing weight_decay from {checkpoint_wd} to {weight_decay}")
+                print(f"    This may destabilize training. Consider smaller increases.")
+                if logger:
+                    logger.warning(f"Increasing weight_decay from {checkpoint_wd} to {weight_decay} - may destabilize training")
+
+            for param_group in optimizer.param_groups:
+                if param_group['weight_decay'] > 0:
+                    param_group['weight_decay'] = weight_decay
+
+            if rank == 0:
+                print(f"  ✓ Overriding weight_decay to {weight_decay} (was {checkpoint_wd})")
+                if logger:
+                    logger.info(f"Overriding weight_decay: {checkpoint_wd} -> {weight_decay}")
 
         # Get starting epoch (resume from next epoch)
         start_epoch = checkpoint.get('epoch', 0) + 1

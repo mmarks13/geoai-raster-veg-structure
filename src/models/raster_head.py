@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.utils import to_dense_batch
+from torchvision.ops import StochasticDepth
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import math
@@ -609,23 +610,25 @@ class RasterDecoder(nn.Module):
 
 class WideRasterDecoder(nn.Module):
     """
-    Wide MLP decoder with Pre-LayerNorm residual blocks for fuel metrics prediction.
+    Wide MLP decoder with Pre-LayerNorm residual blocks and stochastic depth.
 
     Architecture:
         grid_features [B, 5, 5, feature_dim]
-        → Pre-LN Residual Block 1: x = x + MLP(LayerNorm(x))  [feature_dim → feature_dim]
-        → Pre-LN Residual Block 2: x = x + MLP(LayerNorm(x))  [feature_dim → feature_dim]
+        → Pre-LN Residual Block 1: x = x + DropPath(MLP(LayerNorm(x)))
+        → Pre-LN Residual Block 2: x = x + DropPath(MLP(LayerNorm(x)))
         → Final projection: Linear(feature_dim → n_bands)
         → Permute to [B, n_bands, 5, 5]
 
     Uses GELU activation (smoother than ReLU, better for regression).
     Pre-LN structure provides better gradient flow than Post-LN.
+    Stochastic depth rates increase linearly from 0 (first block) to drop_path (last block).
 
     Args:
         feature_dim: Input/hidden feature dimension (default 256)
         n_bands: Number of output fuel metrics bands (default 2)
         num_layers: Number of residual blocks (default 2)
         dropout: Dropout probability (default 0.35)
+        drop_path: Maximum stochastic depth probability (default 0.0, disabled)
     """
 
     def __init__(
@@ -633,21 +636,25 @@ class WideRasterDecoder(nn.Module):
         feature_dim: int = 256,
         n_bands: int = 2,
         num_layers: int = 2,
-        dropout: float = 0.35
+        dropout: float = 0.35,
+        drop_path: float = 0.0
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.n_bands = n_bands
         self.num_layers = num_layers
 
-        # Build Pre-LN residual blocks
+        # Linearly increasing drop_path rates (0 at first block, max at last)
+        drop_path_rates = [drop_path * i / max(num_layers - 1, 1) for i in range(num_layers)]
+
+        # Build Pre-LN residual blocks with stochastic depth
         self.blocks = nn.ModuleList()
-        for _ in range(num_layers):
+        for i in range(num_layers):
             self.blocks.append(
-                PreLNResidualBlock(feature_dim, dropout)
+                PreLNResidualBlock(feature_dim, dropout, drop_path=drop_path_rates[i])
             )
 
-        # Final projection to n_bands (no residual)
+        # Final projection to n_bands (no residual, no drop_path)
         self.final_proj = nn.Linear(feature_dim, n_bands)
 
     def forward(self, grid_features: torch.Tensor) -> torch.Tensor:
@@ -677,18 +684,19 @@ class WideRasterDecoder(nn.Module):
 
 class PreLNResidualBlock(nn.Module):
     """
-    Pre-LayerNorm residual block: x = x + MLP(LayerNorm(x))
+    Pre-LayerNorm residual block: x = x + DropPath(MLP(LayerNorm(x)))
 
     Architecture:
         LayerNorm → Linear → GELU → Dropout → Linear → Dropout
-        + residual connection
+        + stochastic depth on residual connection
 
     Args:
         feature_dim: Input/output dimension
         dropout: Dropout probability
+        drop_path: Stochastic depth probability (0.0 = disabled)
     """
 
-    def __init__(self, feature_dim: int, dropout: float = 0.35):
+    def __init__(self, feature_dim: int, dropout: float = 0.35, drop_path: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(feature_dim)
         self.mlp = nn.Sequential(
@@ -698,10 +706,12 @@ class PreLNResidualBlock(nn.Module):
             nn.Linear(feature_dim, feature_dim),
             nn.Dropout(dropout)
         )
+        # Stochastic depth - drops entire residual branch with probability drop_path
+        self.drop_path = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply Pre-LN residual: x = x + MLP(LayerNorm(x))"""
-        return x + self.mlp(self.norm(x))
+        """Apply Pre-LN residual with stochastic depth: x = x + DropPath(MLP(LN(x)))"""
+        return x + self.drop_path(self.mlp(self.norm(x)))
 
 
 class RasterPredictionHead(nn.Module):
@@ -724,12 +734,14 @@ class RasterPredictionHead(nn.Module):
         attention_dropout: Dropout for grid aggregation attention (default 0.1, keep low)
         decoder_dropout: Dropout for decoder MLP (default 0.1, can be higher)
         use_wide_decoder: Use wide decoder with Pre-LN residuals (default False)
+        decoder_drop_path: Stochastic depth for WideRasterDecoder (default 0.0, disabled)
         num_pre_agg_blocks: Number of pre-aggregation LG-PAB blocks (default 2)
         pre_agg_lcl_heads: Local attention heads for pre-aggregation (default 4)
         pre_agg_glbl_heads: Global attention heads for pre-aggregation (default 4)
         pre_agg_dropout: Dropout for pre-aggregation blocks (default 0.1)
         pre_agg_k_neighbors: KNN neighbors for pre-aggregation (default 15)
         position_encoding_dim: Position encoding dimension (default 24)
+        point_attn_drop_path: Stochastic depth for PosAwareGlobalFlashAttention in pre-agg blocks (default 0.0)
     """
 
     def __init__(
@@ -745,12 +757,14 @@ class RasterPredictionHead(nn.Module):
         attention_dropout: float = 0.1,
         decoder_dropout: float = 0.1,
         use_wide_decoder: bool = False,
+        decoder_drop_path: float = 0.0,
         num_pre_agg_blocks: int = 2,
         pre_agg_lcl_heads: int = 4,
         pre_agg_glbl_heads: int = 4,
         pre_agg_dropout: float = 0.1,
         pre_agg_k_neighbors: int = 15,
-        position_encoding_dim: int = 24
+        position_encoding_dim: int = 24,
+        point_attn_drop_path: float = 0.0
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -769,7 +783,8 @@ class RasterPredictionHead(nn.Module):
                     pos_encoding_dim=position_encoding_dim,
                     dropout=pre_agg_dropout,
                     up_ratio=None,  # No upsampling
-                    k_neighbors=pre_agg_k_neighbors
+                    k_neighbors=pre_agg_k_neighbors,
+                    global_drop_path=point_attn_drop_path
                 )
                 for _ in range(num_pre_agg_blocks)
             ])
@@ -789,12 +804,13 @@ class RasterPredictionHead(nn.Module):
 
         # Raster decoder (uses decoder_dropout, can be higher for regularization)
         if use_wide_decoder:
-            # Wide decoder with Pre-LN residuals: 256→256→256→n_bands
+            # Wide decoder with Pre-LN residuals + stochastic depth: 256→256→256→n_bands
             self.decoder = WideRasterDecoder(
                 feature_dim=feature_dim,
                 n_bands=n_bands,
                 num_layers=num_decoder_layers,  # Number of residual blocks
-                dropout=decoder_dropout
+                dropout=decoder_dropout,
+                drop_path=decoder_drop_path
             )
         else:
             # Original narrow decoder with dimension halving

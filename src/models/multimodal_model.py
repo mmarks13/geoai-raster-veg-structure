@@ -22,6 +22,7 @@ from src.utils.knn_graph_gpu import knn_edge_index
 from .encoders import NAIPEncoder, UAVSAREncoder
 from .fusion import SpatialFusion
 from .cross_attn_fusion import CrossAttentionFusion
+from torchvision.ops import StochasticDepth
 import math
 
 
@@ -161,56 +162,62 @@ class PosAwareGlobalFlashAttention(nn.Module):
     """
     Position-Aware Global Flash Attention module that incorporates
     3D point positions into a flash attention mechanism.
-   
+
     Features:
     - Processes 3D positions to create positional encodings
     - Integrates position information with feature vectors
     - Applies multi-head self-attention using scaled dot product attention
     - Global attention across all points
     - Includes feedforward network similar to standard transformer
+    - Optional stochastic depth (DropPath) for regularization
     """
-    def __init__(self, dim, pos_encoding_dim=32, num_heads=4, dropout=0, ffn_expansion_factor=2):
+    def __init__(self, dim, pos_encoding_dim=32, num_heads=4, dropout=0, ffn_expansion_factor=2, drop_path=0.0):
         """
         Initialize Position-Aware Global Flash Attention module.
-       
+
         Args:
             dim: Feature dimension
             pos_encoding_dim: Dimension for positional encoding (default: 32)
             num_heads: Number of attention heads
             dropout: Dropout probability for attention
             ffn_expansion_factor: Expansion factor for feedforward network (default: 4)
+            drop_path: Stochastic depth probability (default: 0.0, disabled)
         """
         super().__init__()
         self.dim = dim
         self.pos_encoding_dim = pos_encoding_dim
         self.num_heads = num_heads
         self.dropout = dropout
-       
+
         # Position encoding MLP
         self.pos_encoder = nn.Sequential(
             nn.Linear(3, pos_encoding_dim),
             nn.GELU(),
             nn.Linear(pos_encoding_dim, pos_encoding_dim)
         )
-       
+
         # Projection for combining position encoding with features
         self.pos_feature_combiner = nn.Linear(dim + pos_encoding_dim, dim)
-       
+
         # Ensure dimension is divisible by number of heads
         assert dim % num_heads == 0, f"Dimension {dim} must be divisible by number of heads {num_heads}"
         self.head_dim = dim // num_heads
-       
+
         # Linear projections for attention
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
-       
+
         # Layer normalization for stability
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)  # New normalization for feedforward network
-        
+
+        # Stochastic depth for residual connections
+        self.drop_path1 = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
+        self.drop_path2 = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
+
         # Feedforward Network with GELU activation
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * ffn_expansion_factor),
@@ -275,15 +282,14 @@ class PosAwareGlobalFlashAttention(nn.Module):
         if len(orig_shape) == 2:
             output = output.squeeze(0)
        
-        # Apply normalization and residual connection after attention
-        output = self.norm2(output + residual)
-        
-        # Apply feedforward network with residual connection
+        # Apply normalization and residual connection after attention (with stochastic depth)
+        output = self.norm2(self.drop_path1(output) + residual)
+
+        # Apply feedforward network with residual connection (with stochastic depth)
         residual = output
         output = self.norm3(output)
-        output = self.ffn(output)
-        output = output + residual
-           
+        output = self.drop_path2(self.ffn(output)) + residual
+
         return output
 
 
@@ -388,22 +394,23 @@ class LocalGlobalPointAttentionBlock(nn.Module):
     """
     Enhanced local-global attention block with dual MLP design:
     1. Local attention + FFN →  Upsampling (optional) → Global attention + FFN
-    
+
     Supports feature-guided position generation for upsampling.
     """
-    def __init__(self, 
-                 in_channels, 
-                 out_channels, 
+    def __init__(self,
+                 in_channels,
+                 out_channels,
                  num_lcl_heads=4,
                  num_glbl_heads=4,
-                 pos_encoding_dim=32, 
-                 dropout=0.0, 
+                 pos_encoding_dim=32,
+                 dropout=0.0,
                  up_ratio=None,
                  k_neighbors=15,
-                 pos_gen_hidden_dim=64):
+                 pos_gen_hidden_dim=64,
+                 global_drop_path=0.0):
         """
         Initialize the LocalGlobalPointAttentionBlock
-        
+
         Args:
             in_channels: Input feature dimensions
             out_channels: Output feature dimensions
@@ -414,6 +421,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
             up_ratio: If provided, performs point upsampling by this ratio
             k_neighbors: Number of neighbors for KNN graph construction when edge_index is None
             pos_gen_hidden_dim: Hidden dimension for position generator network
+            global_drop_path: Stochastic depth for global attention (default 0.0)
         """
         super().__init__()
         self.in_channels = in_channels
@@ -424,6 +432,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
         self.dropout = dropout
         self.up_ratio = up_ratio
         self.k_neighbors = k_neighbors
+        self.global_drop_path = global_drop_path
         
         # Flag to determine whether to use local/global attention
         self.use_local_attention = num_lcl_heads > 0
@@ -458,7 +467,8 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                 dim=self.flash_attn_dim,
                 pos_encoding_dim=pos_encoding_dim,
                 num_heads=num_glbl_heads,
-                dropout=dropout
+                dropout=dropout,
+                drop_path=global_drop_path
             )
         
         
