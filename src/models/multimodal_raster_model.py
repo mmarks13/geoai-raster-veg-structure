@@ -28,6 +28,7 @@ from .encoders import NAIPEncoder, UAVSAREncoder
 from .multimodal_model import LocalGlobalPointAttentionBlock
 from .cross_attn_fusion import CrossAttentionFusion
 from .raster_head import RasterPredictionHead
+from .training_augmentation import TrainingAugmentation
 
 
 @dataclass
@@ -125,6 +126,47 @@ class MultimodalRasterConfig:
     extractor_point_attn_drop_path: float = 0.0  # Drop path for feature extractor's PosAwareGlobalFlashAttention
     pre_agg_point_attn_drop_path: float = 0.0  # Drop path for pre-aggregation blocks' PosAwareGlobalFlashAttention
 
+    # ===== GPU Training Augmentation (raster model only) =====
+    # Master switch for GPU-native augmentation (Kornia + custom PyTorch ops)
+    # See docs/training_augmentation.md for full documentation
+    training_augmentation_enabled: bool = False
+
+    # Point cloud augmentation
+    aug_coord_jitter_sigma: float = 0.02   # Z-score units (~0.1m physical)
+    aug_coord_jitter_prob: float = 0.5
+    aug_intensity_noise_sigma: float = 0.05
+    aug_intensity_noise_prob: float = 0.3
+    aug_intensity_outlier_prob: float = 0.01
+    aug_bird_outlier_prob: float = 0.05  # Per-tile prob of bird simulation
+    aug_bird_z_offset_range: tuple = (5.0, 15.0)  # Z-score offset (≈25-75m physical)
+
+    # NAIP augmentation
+    aug_naip_noise_sigma: float = 0.03
+    aug_naip_noise_prob: float = 0.3
+    aug_naip_blur_kernel: int = 3
+    aug_naip_blur_sigma: tuple = (0.1, 2.0)
+    aug_naip_blur_prob: float = 0.2
+    aug_naip_motion_blur_kernel: int = 5
+    aug_naip_motion_blur_angle: tuple = (-45.0, 45.0)
+    aug_naip_motion_blur_prob: float = 0.1
+    aug_naip_erasing_scale: tuple = (0.02, 0.15)
+    aug_naip_erasing_prob: float = 0.1
+    aug_naip_sharpness_range: tuple = (0.5, 1.5)
+    aug_naip_sharpness_prob: float = 0.2
+    aug_naip_equalize_prob: float = 0.1
+
+    # UAVSAR augmentation
+    aug_uavsar_noise_sigma: float = 0.05
+    aug_uavsar_noise_prob: float = 0.3
+    aug_uavsar_blur_kernel: int = 3
+    aug_uavsar_blur_sigma: tuple = (0.1, 1.5)
+    aug_uavsar_blur_prob: float = 0.2
+    aug_uavsar_motion_blur_kernel: int = 3
+    aug_uavsar_motion_blur_angle: tuple = (-30.0, 30.0)
+    aug_uavsar_motion_blur_prob: float = 0.1
+    aug_uavsar_erasing_scale: tuple = (0.02, 0.10)
+    aug_uavsar_erasing_prob: float = 0.1
+
     def __post_init__(self):
         """Set default target_band_indices if not provided."""
         if self.target_band_indices is None:
@@ -182,6 +224,38 @@ class MultimodalRasterConfig:
                 self.decoder_drop_path,
                 self.extractor_point_attn_drop_path,
                 self.pre_agg_point_attn_drop_path,
+                # GPU augmentation parameters
+                self.training_augmentation_enabled,
+                self.aug_coord_jitter_sigma,
+                self.aug_coord_jitter_prob,
+                self.aug_intensity_noise_sigma,
+                self.aug_intensity_noise_prob,
+                self.aug_intensity_outlier_prob,
+                self.aug_bird_outlier_prob,
+                self.aug_bird_z_offset_range,
+                self.aug_naip_noise_sigma,
+                self.aug_naip_noise_prob,
+                self.aug_naip_blur_kernel,
+                self.aug_naip_blur_sigma,
+                self.aug_naip_blur_prob,
+                self.aug_naip_motion_blur_kernel,
+                self.aug_naip_motion_blur_angle,
+                self.aug_naip_motion_blur_prob,
+                self.aug_naip_erasing_scale,
+                self.aug_naip_erasing_prob,
+                self.aug_naip_sharpness_range,
+                self.aug_naip_sharpness_prob,
+                self.aug_naip_equalize_prob,
+                self.aug_uavsar_noise_sigma,
+                self.aug_uavsar_noise_prob,
+                self.aug_uavsar_blur_kernel,
+                self.aug_uavsar_blur_sigma,
+                self.aug_uavsar_blur_prob,
+                self.aug_uavsar_motion_blur_kernel,
+                self.aug_uavsar_motion_blur_angle,
+                self.aug_uavsar_motion_blur_prob,
+                self.aug_uavsar_erasing_scale,
+                self.aug_uavsar_erasing_prob,
             )
         )
 
@@ -291,6 +365,9 @@ class MultimodalRasterPredictor(nn.Module):
             point_attn_drop_path=config.pre_agg_point_attn_drop_path  # Stochastic depth for pre-agg blocks
         )
 
+        # ====== 5) GPU Training Augmentation (raster model only) ======
+        self.training_aug = TrainingAugmentation(config)
+
     def forward(
         self,
         dep_points: torch.Tensor,
@@ -334,6 +411,11 @@ class MultimodalRasterPredictor(nn.Module):
         # Clamp extreme Z values (bird returns)
         dep_points[:, 2] = torch.clamp(dep_points[:, 2], -10, 10)  # In z-score space, ±10 is ~70m from mean
 
+        # ====== GPU Training Augmentation (Point Cloud) ======
+        # Applied during training only, disabled during validation/inference
+        if self.training:
+            dep_points, dep_attr = self.training_aug.augment_points(dep_points, dep_attr)
+
         # Concatenate attributes and positions
         dep_points_and_attr = torch.cat([dep_attr, dep_points], dim=1)  # [N_total, 6]
 
@@ -359,6 +441,11 @@ class MultimodalRasterPredictor(nn.Module):
                 if 'images' in naip_b and naip_b['images'] is not None:
                     # Convert to float32 if needed (preprocessed data may be float16)
                     naip_images = naip_b['images'].to(device).float()
+
+                    # GPU Training Augmentation (NAIP)
+                    if self.training:
+                        naip_images = self.training_aug.augment_naip(naip_images)
+
                     rel_dates = naip_b.get('relative_dates', None)
                     if rel_dates is not None:
                         rel_dates = rel_dates.to(device)
@@ -387,6 +474,11 @@ class MultimodalRasterPredictor(nn.Module):
                 if 'images' in uavsar_b and uavsar_b['images'] is not None:
                     # Convert to float32 if needed (preprocessed data may be float16)
                     uavsar_images = uavsar_b['images'].to(device).float()
+
+                    # GPU Training Augmentation (UAVSAR)
+                    if self.training:
+                        uavsar_images = self.training_aug.augment_uavsar(uavsar_images)
+
                     mask = uavsar_b.get('attention_mask', None)
                     if mask is not None:
                         mask = mask.to(device)
