@@ -27,20 +27,7 @@ except ImportError:
     HAS_TENSORBOARD = False
     print("Warning: TensorBoard not available")
 
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
-    print("Warning: psutil not available for CPU monitoring")
-
-try:
-    import pynvml
-    pynvml.nvmlInit()
-    HAS_PYNVML = True
-except:
-    HAS_PYNVML = False
-    print("Warning: pynvml not available for detailed GPU monitoring")
+import subprocess
 
 # Import raster-specific components
 from src.models.multimodal_raster_model import MultimodalRasterPredictor, MultimodalRasterConfig
@@ -81,6 +68,7 @@ def compute_correlation_loss(predictions: torch.Tensor, targets: torch.Tensor) -
     """
     Compute correlation loss as (1 - Pearson correlation coefficient).
 
+    Fully vectorized implementation - no Python loops or GPU→CPU syncs.
     This loss penalizes predictions that fail to preserve the ranking/variance
     of the targets, addressing variance collapse where models predict a narrow
     range around the mean.
@@ -93,93 +81,59 @@ def compute_correlation_loss(predictions: torch.Tensor, targets: torch.Tensor) -
         Scalar tensor: mean(1 - r) across all bands, where r is Pearson correlation.
         Range: [0, 2] where 0 = perfect positive correlation, 1 = no correlation, 2 = perfect negative correlation.
     """
-    # Flatten spatial dimensions: [batch_size, n_bands, H*W]
     batch_size, n_bands = predictions.shape[:2]
-    pred_flat = predictions.view(batch_size, n_bands, -1)
-    targ_flat = targets.view(batch_size, n_bands, -1)
 
-    # Compute per-band correlation across all samples and spatial locations
-    # Reshape to [n_bands, batch_size * H * W]
-    pred_all = pred_flat.permute(1, 0, 2).reshape(n_bands, -1)  # [n_bands, N]
-    targ_all = targ_flat.permute(1, 0, 2).reshape(n_bands, -1)  # [n_bands, N]
+    # Reshape to [n_bands, N] where N = batch_size * H * W
+    pred_all = predictions.permute(1, 0, 2, 3).reshape(n_bands, -1)  # [n_bands, N]
+    targ_all = targets.permute(1, 0, 2, 3).reshape(n_bands, -1)      # [n_bands, N]
 
-    # Compute Pearson correlation for each band
-    corr_losses = []
-    for band_idx in range(n_bands):
-        pred_band = pred_all[band_idx]  # [N]
-        targ_band = targ_all[band_idx]  # [N]
+    # Vectorized mean centering: [n_bands, N]
+    pred_centered = pred_all - pred_all.mean(dim=1, keepdim=True)
+    targ_centered = targ_all - targ_all.mean(dim=1, keepdim=True)
 
-        # Center the data
-        pred_centered = pred_band - pred_band.mean()
-        targ_centered = targ_band - targ_band.mean()
+    # Vectorized std: [n_bands]
+    pred_std = pred_centered.std(dim=1)
+    targ_std = targ_centered.std(dim=1)
 
-        # Compute correlation coefficient
-        pred_std = pred_centered.std()
-        targ_std = targ_centered.std()
+    # Vectorized covariance: [n_bands]
+    covariance = (pred_centered * targ_centered).mean(dim=1)
 
-        # Avoid division by zero (if all predictions are identical)
-        if pred_std < 1e-8 or targ_std < 1e-8:
-            # If variance collapsed completely, correlation is undefined
-            # Penalize with maximum loss (1.0)
-            corr_losses.append(torch.tensor(1.0, device=predictions.device))
-        else:
-            covariance = (pred_centered * targ_centered).mean()
-            correlation = covariance / (pred_std * targ_std)
-            # Clamp to [-1, 1] for numerical stability
-            correlation = torch.clamp(correlation, -1.0, 1.0)
-            corr_losses.append(1.0 - correlation)
+    # Vectorized correlation: [n_bands]
+    correlation = covariance / (pred_std * targ_std + 1e-8)
+    correlation = torch.clamp(correlation, -1.0, 1.0)
 
-    # Average across bands
-    return torch.stack(corr_losses).mean()
+    # Handle collapsed variance with torch.where (no if statement, no GPU→CPU sync)
+    min_std = 1e-8
+    valid_mask = (pred_std > min_std) & (targ_std > min_std)
+    corr_loss = torch.where(valid_mask, 1.0 - correlation, torch.ones_like(correlation))
+
+    return corr_loss.mean()
 
 
-def log_system_metrics(writer: Optional[SummaryWriter], step: int, device: torch.device, rank: int = 0):
+def get_gpu_stats() -> Optional[dict]:
+    """Get GPU memory and utilization stats via nvidia-smi subprocess.
+
+    Returns dict with 'gpus' list containing per-GPU stats, or None on failure.
     """
-    Log GPU and CPU utilization metrics to TensorBoard.
-
-    Args:
-        writer: TensorBoard SummaryWriter
-        step: Global step number for logging
-        device: CUDA device
-        rank: GPU rank (only rank 0 logs)
-    """
-    if writer is None or rank != 0:
-        return
-
-    # GPU Memory metrics
-    if device.type == 'cuda':
-        gpu_mem_allocated = torch.cuda.memory_allocated(device) / 1e9  # GB
-        gpu_mem_reserved = torch.cuda.memory_reserved(device) / 1e9    # GB
-        gpu_mem_free = (torch.cuda.get_device_properties(device).total_memory -
-                        torch.cuda.memory_reserved(device)) / 1e9      # GB
-
-        writer.add_scalar('System/GPU_Memory_Allocated_GB', gpu_mem_allocated, step)
-        writer.add_scalar('System/GPU_Memory_Reserved_GB', gpu_mem_reserved, step)
-        writer.add_scalar('System/GPU_Memory_Free_GB', gpu_mem_free, step)
-
-        # GPU utilization (requires pynvml)
-        if HAS_PYNVML:
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(device.index)
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                writer.add_scalar('System/GPU_Compute_Utilization_%', util.gpu, step)
-                writer.add_scalar('System/GPU_Memory_Utilization_%', util.memory, step)
-            except:
-                pass  # Skip if pynvml fails
-
-    # CPU metrics
-    if HAS_PSUTIL:
-        cpu_percent = psutil.cpu_percent(interval=None)  # Non-blocking
-        cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
-        mem = psutil.virtual_memory()
-
-        writer.add_scalar('System/CPU_Utilization_%', cpu_percent, step)
-        writer.add_scalar('System/CPU_Memory_Used_GB', mem.used / 1e9, step)
-        writer.add_scalar('System/CPU_Memory_Available_GB', mem.available / 1e9, step)
-
-        # Log per-core utilization (first 8 cores to avoid clutter)
-        for i, core_util in enumerate(cpu_per_core[:8]):
-            writer.add_scalar(f'System/CPU_Core_{i}_Utilization_%', core_util, step)
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=memory.used,memory.total,utilization.gpu',
+             '--format=csv,nounits,noheader'],
+            capture_output=True, text=True, timeout=1.0
+        )
+        lines = result.stdout.strip().split('\n')
+        stats = {'gpus': []}
+        for line in lines:
+            parts = line.split(', ')
+            if len(parts) == 3:
+                stats['gpus'].append({
+                    'memory_used_mb': int(parts[0]),
+                    'memory_total_mb': int(parts[1]),
+                    'utilization_pct': int(parts[2])
+                })
+        return stats
+    except Exception:
+        return None
 
 
 def create_raster_shards(data_list: List, world_size: int, temp_dir: str, prefix: str) -> List[str]:
@@ -474,8 +428,6 @@ def train_one_epoch_ddp(
     optimizer.train()
     model.train()
 
-    train_loss_total = 0.0
-    train_loss_per_band = {}
     batch_count = 0
     accumulated_batch_count = 0
     n_good_tiles = 0
@@ -496,9 +448,32 @@ def train_one_epoch_ddp(
     optimizer_time = 0.0
     batch_start_time = time.time()
 
-    # Variance tracking for epoch-level metrics
-    all_train_predictions = []
-    all_train_targets = []
+    # =========================================================================
+    # GPU Running Statistics (no CPU copies during training)
+    # All metrics computed via running sums, single .item() call at epoch end
+    # =========================================================================
+    running_loss = torch.zeros(1, device=device)
+    running_huber_loss = torch.zeros(1, device=device)
+    running_mse_loss = torch.zeros(1, device=device)
+    running_corr_loss = torch.zeros(1, device=device)
+
+    # Per-band running statistics (if n_bands is known)
+    n_bands = config.n_bands
+    running_loss_per_band = torch.zeros(n_bands, device=device)
+
+    # Gradient norm tracking (epoch-level max and mean)
+    running_max_grad_norm = torch.zeros(1, device=device)
+    running_sum_grad_norm = torch.zeros(1, device=device)
+    n_optimizer_steps_local = 0
+
+    # Overall running statistics for variance/correlation metrics
+    running_sum_pred = torch.zeros(1, device=device)
+    running_sum_targ = torch.zeros(1, device=device)
+    running_sum_sq_pred = torch.zeros(1, device=device)
+    running_sum_sq_targ = torch.zeros(1, device=device)
+    running_sum_cross = torch.zeros(1, device=device)
+    running_mae = torch.zeros(1, device=device)
+    n_samples = 0
 
     for batch_idx, batch in enumerate(train_loader):
         # Track data loading time
@@ -542,35 +517,53 @@ def train_one_epoch_ddp(
         scaled_loss = loss / accumulation_steps
         n_good_tiles += batch[0].shape[0] - len(diagnostics['bad_tiles'])
 
-        # Accumulate predictions/targets for variance metrics (subsample to save memory)
-        if batch_idx % 10 == 0:  # Every 10th batch
-            all_train_predictions.append(predictions.detach().cpu())
-            all_train_targets.append(targets.detach().cpu())
+        # =====================================================================
+        # GPU Running Statistics Update (no CPU copies, no .item() calls)
+        # =====================================================================
+        with torch.no_grad():
+            # Accumulate loss on GPU
+            running_loss += loss.detach()
+            running_huber_loss += per_band_losses['huber_loss'].detach()
+            running_mse_loss += per_band_losses['mse_loss'].detach()
+            if 'correlation_loss' in per_band_losses:
+                running_corr_loss += per_band_losses['correlation_loss'].detach()
+
+            # Per-band MSE losses
+            for band_idx in range(n_bands):
+                band_key = f'Band_{band_idx}'
+                if band_key in per_band_losses:
+                    running_loss_per_band[band_idx] += per_band_losses[band_key].detach()
+
+            # Update running statistics for variance/correlation metrics
+            pred_flat = predictions.detach().flatten()
+            targ_flat = targets.detach().flatten()
+            running_sum_pred += pred_flat.sum()
+            running_sum_targ += targ_flat.sum()
+            running_sum_sq_pred += (pred_flat ** 2).sum()
+            running_sum_sq_targ += (targ_flat ** 2).sum()
+            running_sum_cross += (pred_flat * targ_flat).sum()
+            running_mae += (pred_flat - targ_flat).abs().sum()
+            n_samples += pred_flat.numel()
 
         # Backward pass timing
         backward_start = time.time()
         scaler.scale(scaled_loss).backward()
         backward_time += (time.time() - backward_start)
 
-        # Accumulate unscaled loss for logging
-        train_loss_total += loss.item()
-
-        # Accumulate per-band losses
-        for band_name, band_loss in per_band_losses.items():
-            if band_name not in train_loss_per_band:
-                train_loss_per_band[band_name] = 0.0
-            train_loss_per_band[band_name] += band_loss.item()
-
         batch_count += 1
         accumulated_batch_count += 1
         current_batch_step += 1
 
-        # Log per-batch metrics
-        if rank == 0 and writer is not None:
-            writer.add_scalar('Loss/train_batch', loss.item(), current_batch_step)
-            for band_name, band_loss in per_band_losses.items():
-                writer.add_scalar(f'Loss_PerBand/train_{band_name}_batch', band_loss.item(), current_batch_step)
-            writer.add_scalar('Metrics/learning_rate_batch', optimizer.param_groups[0]['lr'], current_batch_step)
+        # NOTE: Per-batch TensorBoard logging removed for GPU efficiency
+        # Epoch-level metrics are sufficient for monitoring
+
+        # GPU monitoring via subprocess (every 20 batches, minimal overhead)
+        if batch_idx % 20 == 0 and rank == 0 and writer is not None:
+            gpu_stats = get_gpu_stats()
+            if gpu_stats:
+                for gpu_idx, gpu in enumerate(gpu_stats['gpus']):
+                    writer.add_scalar(f'GPU/memory_used_mb_gpu{gpu_idx}', gpu['memory_used_mb'], current_batch_step)
+                    writer.add_scalar(f'GPU/utilization_pct_gpu{gpu_idx}', gpu['utilization_pct'], current_batch_step)
 
         # Optimizer step (every gradient_accumulation_steps)
         is_last_batch = (batch_idx == len(train_loader) - 1)
@@ -580,17 +573,18 @@ def train_one_epoch_ddp(
             # Unscale gradients before clipping
             scaler.unscale_(optimizer)
 
-            # Clip gradients
+            # Clip gradients and track on GPU (no .item() calls here)
             grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=max_grad_norm
             )
 
-            effective_grad_norm = min(grad_norm_before_clip.item(), max_grad_norm)
+            # Update gradient norm running statistics on GPU
+            running_max_grad_norm = torch.maximum(running_max_grad_norm, grad_norm_before_clip.unsqueeze(0))
+            running_sum_grad_norm += grad_norm_before_clip
+            n_optimizer_steps_local += 1
 
-            # Log gradient norms
-            if rank == 0 and writer is not None:
-                writer.add_scalar('Gradients/norm_pre_clip', grad_norm_before_clip.item(), current_optimizer_step)
-                writer.add_scalar('Gradients/norm_post_clip', effective_grad_norm, current_optimizer_step)
+            # NOTE: Per-batch gradient norm logging removed for GPU efficiency
+            # Epoch-level max and mean gradient norms logged at epoch end
 
             # Update weights
             scaler.step(optimizer)
@@ -599,135 +593,123 @@ def train_one_epoch_ddp(
 
             optimizer_time += (time.time() - optimizer_step_start)
 
-            # Log system metrics every 10 optimizer steps
-            if current_optimizer_step % 10 == 0:
-                log_system_metrics(writer, current_batch_step, device, rank)
-
-            # Run feature diversity diagnostics every 50 optimizer steps
-            # This helps identify if bottleneck is aggregation (low diversity) or decoder
-            if current_optimizer_step % 50 == 0 and rank == 0:
-                with torch.no_grad():
-                    # Get model (unwrap DDP)
-                    model_module = model.module if hasattr(model, 'module') else model
-
-                    # Run diagnostic forward pass on current batch
-                    with autocast(device_type='cuda', dtype=torch.bfloat16):
-                        # Unpack batch for diagnostic
-                        (dep_points_batch, fuel_metrics_batch, edge_index_batch, dep_points_attr_batch,
-                         naip_data_batch, uavsar_data_batch, centers, scales, bboxes, tile_ids,
-                         norm_params_list, batch_indices_diag) = batch
-
-                        # Move to device
-                        dep_points_batch = dep_points_batch.to(device)
-                        edge_index_batch = edge_index_batch.to(device)
-                        dep_points_attr_batch = dep_points_attr_batch.to(device)
-                        batch_indices_diag = batch_indices_diag.to(device)
-
-                        # Forward through full model to get point features
-                        # (Skip image encoding for speed - just use point features)
-                        dep_points_and_attr = torch.cat([dep_points_attr_batch, dep_points_batch], dim=1)
-                        x_feat, _ = model_module.feature_extractor(dep_points_and_attr, dep_points_batch, edge_index_batch)
-
-                        # Run raster head with diagnostics
-                        _, feature_diagnostics = model_module.raster_head.forward_with_diagnostics(
-                            point_features=x_feat,
-                            point_positions=dep_points_batch,
-                            batch_indices=batch_indices_diag,
-                            norm_params=norm_params_list
-                        )
-
-                        # Log diagnostics to TensorBoard
-                        if writer is not None:
-                            # Point feature diagnostics
-                            if 'point_feature_std' in feature_diagnostics:
-                                writer.add_scalar('Diagnostics/point_feature_std',
-                                                feature_diagnostics['point_feature_std'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/point_cosine_similarity',
-                                                feature_diagnostics['point_cosine_similarity'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/point_feature_cv',
-                                                feature_diagnostics['point_feature_cv'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/point_feature_norm',
-                                                feature_diagnostics['point_feature_norm'], current_optimizer_step)
-
-                            # Grid feature diagnostics
-                            writer.add_scalar('Diagnostics/grid_feature_std_spatial',
-                                            feature_diagnostics['grid_feature_std_spatial'], current_optimizer_step)
-                            writer.add_scalar('Diagnostics/grid_feature_range',
-                                            feature_diagnostics['grid_feature_range'], current_optimizer_step)
-                            writer.add_scalar('Diagnostics/grid_feature_cv',
-                                            feature_diagnostics['grid_feature_cv'], current_optimizer_step)
-                            writer.add_scalar('Diagnostics/grid_cosine_similarity',
-                                            feature_diagnostics['grid_cosine_similarity'], current_optimizer_step)
-                            writer.add_scalar('Diagnostics/grid_feature_norm',
-                                            feature_diagnostics['grid_feature_norm'], current_optimizer_step)
-
-                            # Coverage diagnostics
-                            if 'coverage_mean' in feature_diagnostics:
-                                writer.add_scalar('Diagnostics/coverage_mean',
-                                                feature_diagnostics['coverage_mean'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/coverage_min',
-                                                feature_diagnostics['coverage_min'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/coverage_max',
-                                                feature_diagnostics['coverage_max'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/coverage_corner',
-                                                feature_diagnostics['coverage_corner'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/coverage_edge',
-                                                feature_diagnostics['coverage_edge'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/coverage_interior',
-                                                feature_diagnostics['coverage_interior'], current_optimizer_step)
-
-                            # Query norm diagnostics (detect positional encoding washout)
-                            if 'query_embed_norm' in feature_diagnostics:
-                                writer.add_scalar('Diagnostics/query_embed_norm',
-                                                feature_diagnostics['query_embed_norm'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/pos_encoding_norm',
-                                                feature_diagnostics['pos_encoding_norm'], current_optimizer_step)
-                                writer.add_scalar('Diagnostics/query_pos_ratio',
-                                                feature_diagnostics['query_pos_ratio'], current_optimizer_step)
-
-                        # Print comprehensive diagnostic summary to console
-                        if logger:
-                            point_std = feature_diagnostics.get('point_feature_std', 0)
-                            point_sim = feature_diagnostics.get('point_cosine_similarity', 0)
-                            grid_std = feature_diagnostics['grid_feature_std_spatial']
-                            grid_sim = feature_diagnostics['grid_cosine_similarity']
-                            cov_mean = feature_diagnostics.get('coverage_mean', 0)
-                            cov_corner = feature_diagnostics.get('coverage_corner', 0)
-                            cov_interior = feature_diagnostics.get('coverage_interior', 0)
-
-                            logger.info(f"[Epoch {epoch}, Step {current_optimizer_step}] Diagnostics:")
-                            logger.info(f"  Point features:  std={point_std:.4f}, cosine_sim={point_sim:.4f}")
-                            logger.info(f"  Grid features:   std={grid_std:.4f}, cosine_sim={grid_sim:.4f}")
-                            logger.info(f"  Coverage:        mean={cov_mean:.0f}pts, corner={cov_corner:.0f}pts, interior={cov_interior:.0f}pts")
-
             current_optimizer_step += 1
             accumulated_batch_count = 0
 
         # Reset timer for next batch
         batch_start_time = time.time()
 
-    # Average training loss across GPUs (using SUM reduce, then divide)
-    if batch_count > 0:
-        train_loss_avg = train_loss_total / batch_count
+    # =========================================================================
+    # Epoch-End Metric Computation (single .item() calls here only)
+    # All running statistics synchronized across GPUs before CPU transfer
+    # =========================================================================
+    import math
+
+    # Gather loss from all GPUs (reduce running sums, then average)
+    world_size = dist.get_world_size()
+
+    # All-reduce running sums across GPUs (SUM operation)
+    dist.all_reduce(running_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_huber_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_mse_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_corr_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_loss_per_band, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_pred, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_targ, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_sq_pred, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_sq_targ, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_cross, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_mae, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_max_grad_norm, op=dist.ReduceOp.MAX)
+    dist.all_reduce(running_sum_grad_norm, op=dist.ReduceOp.SUM)
+
+    # Reduce batch_count and n_samples across GPUs
+    batch_count_tensor = torch.tensor([batch_count], device=device)
+    n_samples_tensor = torch.tensor([n_samples], device=device)
+    n_optimizer_steps_tensor = torch.tensor([n_optimizer_steps_local], device=device)
+    dist.all_reduce(batch_count_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(n_samples_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(n_optimizer_steps_tensor, op=dist.ReduceOp.SUM)
+
+    total_batch_count = batch_count_tensor.item()
+    total_n_samples = n_samples_tensor.item()
+    total_optimizer_steps = n_optimizer_steps_tensor.item()
+
+    # Compute averaged loss (single .item() calls here)
+    if total_batch_count > 0:
+        train_loss_avg = running_loss.item() / total_batch_count
+        train_huber_avg = running_huber_loss.item() / total_batch_count
+        train_mse_avg = running_mse_loss.item() / total_batch_count
+        train_corr_avg = running_corr_loss.item() / total_batch_count if config.correlation_loss_weight > 0 else 0.0
     else:
         train_loss_avg = float('nan')
+        train_huber_avg = float('nan')
+        train_mse_avg = float('nan')
+        train_corr_avg = float('nan')
 
-    # Gather loss from all GPUs
-    world_size = dist.get_world_size()
-    train_loss_tensor = torch.tensor([train_loss_avg], device=device)
-    dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.AVG)
-    train_loss_avg = train_loss_tensor.item()
+    # Compute per-band losses dict (for backward compatibility)
+    train_loss_per_band = {}
+    for band_idx in range(n_bands):
+        if total_batch_count > 0:
+            train_loss_per_band[f'Band_{band_idx}'] = running_loss_per_band[band_idx].item() / total_batch_count
+        else:
+            train_loss_per_band[f'Band_{band_idx}'] = float('nan')
+    train_loss_per_band['huber_loss'] = train_huber_avg
+    train_loss_per_band['mse_loss'] = train_mse_avg
+    if config.correlation_loss_weight > 0:
+        train_loss_per_band['correlation_loss'] = train_corr_avg
 
-    # Average per-band losses
-    for band_name in train_loss_per_band:
-        if batch_count > 0:
-            train_loss_per_band[band_name] /= batch_count
+    # Compute overall variance/correlation metrics from running sums
+    if total_n_samples > 0:
+        pred_mean = running_sum_pred.item() / total_n_samples
+        targ_mean = running_sum_targ.item() / total_n_samples
+        pred_var = (running_sum_sq_pred.item() / total_n_samples) - (pred_mean ** 2)
+        targ_var = (running_sum_sq_targ.item() / total_n_samples) - (targ_mean ** 2)
+        covariance = (running_sum_cross.item() / total_n_samples) - (pred_mean * targ_mean)
 
-    # Log epoch-level metrics and timing
+        overall_pred_std = math.sqrt(max(pred_var, 0))
+        overall_targ_std = math.sqrt(max(targ_var, 0))
+        overall_correlation = covariance / (overall_pred_std * overall_targ_std + 1e-8) if overall_pred_std > 1e-8 and overall_targ_std > 1e-8 else 0.0
+        overall_variance_ratio = overall_pred_std / (overall_targ_std + 1e-8)
+        overall_mae = running_mae.item() / total_n_samples
+    else:
+        overall_pred_std = 0.0
+        overall_targ_std = 0.0
+        overall_correlation = 0.0
+        overall_variance_ratio = 0.0
+        overall_mae = float('nan')
+
+    # Compute gradient norm statistics
+    if total_optimizer_steps > 0:
+        max_grad_norm_epoch = running_max_grad_norm.item()
+        mean_grad_norm_epoch = running_sum_grad_norm.item() / total_optimizer_steps
+    else:
+        max_grad_norm_epoch = 0.0
+        mean_grad_norm_epoch = 0.0
+
+    # Log epoch-level metrics and timing (rank 0 only)
     if rank == 0 and writer is not None:
+        # Loss metrics
         writer.add_scalar('Loss/train_epoch', train_loss_avg, epoch)
-        for band_name in train_loss_per_band:
-            writer.add_scalar(f'Loss_PerBand/train_{band_name}', train_loss_per_band[band_name], epoch)
+        writer.add_scalar('Loss/train_huber', train_huber_avg, epoch)
+        writer.add_scalar('Loss/train_mse', train_mse_avg, epoch)
+        if config.correlation_loss_weight > 0:
+            writer.add_scalar('Loss/train_correlation', train_corr_avg, epoch)
+
+        # Per-band losses
+        for band_idx in range(n_bands):
+            writer.add_scalar(f'Loss_PerBand/train_Band_{band_idx}', train_loss_per_band[f'Band_{band_idx}'], epoch)
+
+        # Gradient norms (epoch-level max and mean)
+        writer.add_scalar('Gradients/max_norm_epoch', max_grad_norm_epoch, epoch)
+        writer.add_scalar('Gradients/mean_norm_epoch', mean_grad_norm_epoch, epoch)
+
+        # Overall variance/correlation metrics (replacing per-band detailed metrics)
+        writer.add_scalar('Variance/train_overall_pred_std', overall_pred_std, epoch)
+        writer.add_scalar('Variance/train_overall_target_std', overall_targ_std, epoch)
+        writer.add_scalar('Variance/train_overall_ratio', overall_variance_ratio, epoch)
+        writer.add_scalar('Correlation/train_overall_pearson_r', overall_correlation, epoch)
+        writer.add_scalar('MAE/train_overall', overall_mae, epoch)
 
         # Log timing breakdown
         total_time = data_load_time + forward_time + backward_time + optimizer_time
@@ -743,50 +725,6 @@ def train_one_epoch_ddp(
             writer.add_scalar('Timing/forward_pct', 100 * forward_time / total_time, epoch)
             writer.add_scalar('Timing/backward_pct', 100 * backward_time / total_time, epoch)
             writer.add_scalar('Timing/optimizer_pct', 100 * optimizer_time / total_time, epoch)
-
-        # Log one final system snapshot at end of epoch
-        log_system_metrics(writer, epoch * len(train_loader), device, rank)
-
-        # Compute and log variance/correlation metrics
-        if len(all_train_predictions) > 0:
-            train_preds = torch.cat(all_train_predictions, dim=0)  # [N, n_bands, 5, 5]
-            train_targs = torch.cat(all_train_targets, dim=0)
-
-            # Per-band variance and correlation metrics
-            n_bands = train_preds.shape[1]
-            for band_idx in range(n_bands):
-                pred_band = train_preds[:, band_idx].flatten()
-                targ_band = train_targs[:, band_idx].flatten()
-
-                # Standard deviations (measures variance)
-                pred_std = pred_band.std().item()
-                targ_std = targ_band.std().item()
-                writer.add_scalar(f'Variance/train_band_{band_idx}_pred_std', pred_std, epoch)
-                writer.add_scalar(f'Variance/train_band_{band_idx}_target_std', targ_std, epoch)
-
-                # Variance ratio (pred_std / target_std) - closer to 1.0 is better
-                if targ_std > 1e-8:
-                    variance_ratio = pred_std / targ_std
-                    writer.add_scalar(f'Variance/train_band_{band_idx}_ratio', variance_ratio, epoch)
-
-                # Pearson correlation
-                pred_centered = pred_band - pred_band.mean()
-                targ_centered = targ_band - targ_band.mean()
-                if pred_std > 1e-8 and targ_std > 1e-8:
-                    covariance = (pred_centered * targ_centered).mean()
-                    correlation = covariance / (pred_std * targ_std)
-                    correlation = torch.clamp(correlation, -1.0, 1.0)
-                    writer.add_scalar(f'Correlation/train_band_{band_idx}_pearson_r', correlation.item(), epoch)
-
-                # Mean absolute error (in normalized space)
-                mae = (pred_band - targ_band).abs().mean().item()
-                writer.add_scalar(f'MAE/train_band_{band_idx}', mae, epoch)
-
-                # Prediction range (max - min)
-                pred_range = (pred_band.max() - pred_band.min()).item()
-                targ_range = (targ_band.max() - targ_band.min()).item()
-                writer.add_scalar(f'Range/train_band_{band_idx}_pred', pred_range, epoch)
-                writer.add_scalar(f'Range/train_band_{band_idx}_target', targ_range, epoch)
 
     return {
         'loss': train_loss_avg,
@@ -810,6 +748,9 @@ def validate_one_epoch_ddp(
     """
     Validate the model for one epoch using DDP with comprehensive metrics.
 
+    Uses GPU running statistics - no CPU copies during validation loop.
+    Per-band extended metrics computed every 5 epochs using GPU running stats.
+
     Args:
         model: The model to validate
         val_loader: DataLoader for validation data
@@ -821,19 +762,42 @@ def validate_one_epoch_ddp(
         logger: Logger instance
 
     Returns:
-        Dict with validation metrics (loss, MAE, R², per-band quantiles)
+        Dict with validation metrics (loss, MAE, R²)
     """
+    import math
     model.eval()
 
-    val_loss_total = 0.0
-    val_loss_per_band = {}
     batch_count = 0
+    n_bands = config.n_bands
 
-    # Storage for metrics computation
-    all_predictions = []
-    all_targets = []
-    all_errors = []
-    band_errors = [[] for _ in range(config.n_bands)]
+    # =========================================================================
+    # GPU Running Statistics (no CPU copies during validation)
+    # =========================================================================
+    running_loss = torch.zeros(1, device=device)
+    running_huber_loss = torch.zeros(1, device=device)
+    running_mse_loss = torch.zeros(1, device=device)
+    running_loss_per_band = torch.zeros(n_bands, device=device)
+
+    # Overall running statistics for variance/correlation/R² metrics
+    running_sum_pred = torch.zeros(1, device=device)
+    running_sum_targ = torch.zeros(1, device=device)
+    running_sum_sq_pred = torch.zeros(1, device=device)
+    running_sum_sq_targ = torch.zeros(1, device=device)
+    running_sum_cross = torch.zeros(1, device=device)
+    running_mae = torch.zeros(1, device=device)
+    running_ss_res = torch.zeros(1, device=device)  # For R²
+    n_samples = 0
+
+    # Per-band running statistics (for extended metrics every 5 epochs)
+    do_extended_metrics = (epoch % 5 == 0)
+    if do_extended_metrics:
+        running_mae_per_band = torch.zeros(n_bands, device=device)
+        running_sum_pred_per_band = torch.zeros(n_bands, device=device)
+        running_sum_targ_per_band = torch.zeros(n_bands, device=device)
+        running_sum_sq_pred_per_band = torch.zeros(n_bands, device=device)
+        running_sum_sq_targ_per_band = torch.zeros(n_bands, device=device)
+        running_sum_cross_per_band = torch.zeros(n_bands, device=device)
+        n_samples_per_band = 0
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
@@ -859,110 +823,187 @@ def validate_one_epoch_ddp(
                         logger.warning(f"Validation batch: Skipping due to NaN loss (synchronized)")
                     continue
 
-                val_loss_total += loss.item()
+                # =====================================================================
+                # GPU Running Statistics Update (no CPU copies)
+                # =====================================================================
+                # Accumulate loss on GPU
+                running_loss += loss.detach()
+                running_huber_loss += per_band_losses['huber_loss'].detach()
+                running_mse_loss += per_band_losses['mse_loss'].detach()
 
-                # Accumulate per-band losses
-                for band_name, band_loss in per_band_losses.items():
-                    if band_name not in val_loss_per_band:
-                        val_loss_per_band[band_name] = 0.0
-                    val_loss_per_band[band_name] += band_loss.item()
+                # Per-band MSE losses
+                for band_idx in range(n_bands):
+                    band_key = f'Band_{band_idx}'
+                    if band_key in per_band_losses:
+                        running_loss_per_band[band_idx] += per_band_losses[band_key].detach()
 
-                # Store predictions/targets for metrics
-                all_predictions.append(predictions.cpu())
-                all_targets.append(targets.cpu())
+                # Overall running statistics
+                pred_flat = predictions.detach().flatten()
+                targ_flat = targets.detach().flatten()
+                diff = pred_flat - targ_flat
+
+                running_sum_pred += pred_flat.sum()
+                running_sum_targ += targ_flat.sum()
+                running_sum_sq_pred += (pred_flat ** 2).sum()
+                running_sum_sq_targ += (targ_flat ** 2).sum()
+                running_sum_cross += (pred_flat * targ_flat).sum()
+                running_mae += diff.abs().sum()
+                running_ss_res += (diff ** 2).sum()
+                n_samples += pred_flat.numel()
+
+                # Per-band extended metrics (every 5 epochs)
+                if do_extended_metrics:
+                    # Sum over batch and spatial dims, keep band dim
+                    pred_banded = predictions.detach()  # [B, n_bands, 5, 5]
+                    targ_banded = targets.detach()
+
+                    running_mae_per_band += (pred_banded - targ_banded).abs().sum(dim=(0, 2, 3))
+                    running_sum_pred_per_band += pred_banded.sum(dim=(0, 2, 3))
+                    running_sum_targ_per_band += targ_banded.sum(dim=(0, 2, 3))
+                    running_sum_sq_pred_per_band += (pred_banded ** 2).sum(dim=(0, 2, 3))
+                    running_sum_sq_targ_per_band += (targ_banded ** 2).sum(dim=(0, 2, 3))
+                    running_sum_cross_per_band += (pred_banded * targ_banded).sum(dim=(0, 2, 3))
+                    n_samples_per_band += pred_banded.shape[0] * 25  # B * 5 * 5
 
                 batch_count += 1
 
-    # Average validation loss
-    if batch_count > 0:
-        val_loss_avg = val_loss_total / batch_count
+    # =========================================================================
+    # Epoch-End Metric Computation (single .item() calls here only)
+    # =========================================================================
+    world_size = dist.get_world_size()
+
+    # All-reduce running sums across GPUs
+    dist.all_reduce(running_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_huber_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_mse_loss, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_loss_per_band, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_pred, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_targ, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_sq_pred, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_sq_targ, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_sum_cross, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_mae, op=dist.ReduceOp.SUM)
+    dist.all_reduce(running_ss_res, op=dist.ReduceOp.SUM)
+
+    if do_extended_metrics:
+        dist.all_reduce(running_mae_per_band, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_sum_pred_per_band, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_sum_targ_per_band, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_sum_sq_pred_per_band, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_sum_sq_targ_per_band, op=dist.ReduceOp.SUM)
+        dist.all_reduce(running_sum_cross_per_band, op=dist.ReduceOp.SUM)
+
+    # Reduce counts across GPUs
+    batch_count_tensor = torch.tensor([batch_count], device=device)
+    n_samples_tensor = torch.tensor([n_samples], device=device)
+    dist.all_reduce(batch_count_tensor, op=dist.ReduceOp.SUM)
+    dist.all_reduce(n_samples_tensor, op=dist.ReduceOp.SUM)
+
+    total_batch_count = batch_count_tensor.item()
+    total_n_samples = n_samples_tensor.item()
+
+    # Compute averaged loss
+    if total_batch_count > 0:
+        val_loss_avg = running_loss.item() / total_batch_count
+        val_huber_avg = running_huber_loss.item() / total_batch_count
+        val_mse_avg = running_mse_loss.item() / total_batch_count
     else:
         val_loss_avg = float('nan')
+        val_huber_avg = float('nan')
+        val_mse_avg = float('nan')
 
-    # Gather loss from all GPUs
-    world_size = dist.get_world_size()
-    val_loss_tensor = torch.tensor([val_loss_avg], device=device)
-    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
-    val_loss_avg = val_loss_tensor.item()
+    # Per-band losses dict
+    val_loss_per_band = {}
+    for band_idx in range(n_bands):
+        if total_batch_count > 0:
+            val_loss_per_band[f'Band_{band_idx}'] = running_loss_per_band[band_idx].item() / total_batch_count
+        else:
+            val_loss_per_band[f'Band_{band_idx}'] = float('nan')
+    val_loss_per_band['huber_loss'] = val_huber_avg
+    val_loss_per_band['mse_loss'] = val_mse_avg
 
-    # Average per-band losses
-    for band_name in val_loss_per_band:
-        if batch_count > 0:
-            val_loss_per_band[band_name] /= batch_count
-
-    # Compute additional metrics (MAE, R², quantiles)
+    # Compute overall metrics from running sums
     metrics = {'loss': val_loss_avg, 'per_band': val_loss_per_band}
 
-    if len(all_predictions) > 0:
-        preds_tensor = torch.cat(all_predictions, dim=0)  # [total_samples, n_bands, 5, 5]
-        targs_tensor = torch.cat(all_targets, dim=0)
+    if total_n_samples > 0:
+        # MAE
+        overall_mae = running_mae.item() / total_n_samples
+        metrics['mae'] = overall_mae
 
-        # Overall metrics
-        mae = (preds_tensor - targs_tensor).abs().mean().item()
-        ss_res = ((preds_tensor - targs_tensor) ** 2).sum().item()
-        ss_tot = ((targs_tensor - targs_tensor.mean()) ** 2).sum().item()
-        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-        metrics['mae'] = mae
+        # R² using running variance approach (single pass)
+        targ_mean = running_sum_targ.item() / total_n_samples
+        targ_var = (running_sum_sq_targ.item() / total_n_samples) - (targ_mean ** 2)
+        ss_tot = total_n_samples * targ_var
+        ss_res = running_ss_res.item()
+        r2 = 1 - (ss_res / (ss_tot + 1e-8)) if ss_tot > 1e-8 else 0.0
         metrics['r2'] = r2
 
-        # Per-band metrics
-        for band_idx in range(config.n_bands):
-            pred_band = preds_tensor[:, band_idx].flatten()
-            targ_band = targs_tensor[:, band_idx].flatten()
-            errors = (pred_band - targ_band).abs()
+        # Overall variance/correlation
+        pred_mean = running_sum_pred.item() / total_n_samples
+        pred_var = (running_sum_sq_pred.item() / total_n_samples) - (pred_mean ** 2)
+        covariance = (running_sum_cross.item() / total_n_samples) - (pred_mean * targ_mean)
 
-            band_mae = errors.mean().item()
-            band_p10 = torch.quantile(errors, 0.1).item()
-            band_p50 = torch.quantile(errors, 0.5).item()
-            band_p90 = torch.quantile(errors, 0.9).item()
-
-            metrics[f'band_{band_idx}_mae'] = band_mae
-            metrics[f'band_{band_idx}_p10'] = band_p10
-            metrics[f'band_{band_idx}_p50'] = band_p50
-            metrics[f'band_{band_idx}_p90'] = band_p90
-
-            # Log to TensorBoard
-            if rank == 0 and writer is not None:
-                writer.add_scalar(f'Val_Metrics/band_{band_idx}_mae', band_mae, epoch)
-                writer.add_scalar(f'Val_Metrics/band_{band_idx}_p50', band_p50, epoch)
-
-                # Variance and correlation metrics
-                pred_std = pred_band.std().item()
-                targ_std = targ_band.std().item()
-                writer.add_scalar(f'Variance/val_band_{band_idx}_pred_std', pred_std, epoch)
-                writer.add_scalar(f'Variance/val_band_{band_idx}_target_std', targ_std, epoch)
-
-                # Variance ratio
-                if targ_std > 1e-8:
-                    variance_ratio = pred_std / targ_std
-                    writer.add_scalar(f'Variance/val_band_{band_idx}_ratio', variance_ratio, epoch)
-
-                # Pearson correlation
-                pred_centered = pred_band - pred_band.mean()
-                targ_centered = targ_band - targ_band.mean()
-                if pred_std > 1e-8 and targ_std > 1e-8:
-                    covariance = (pred_centered * targ_centered).mean()
-                    correlation = covariance / (pred_std * targ_std)
-                    correlation = torch.clamp(correlation, -1.0, 1.0)
-                    writer.add_scalar(f'Correlation/val_band_{band_idx}_pearson_r', correlation.item(), epoch)
-                    metrics[f'band_{band_idx}_correlation'] = correlation.item()
-
-                # Prediction range
-                pred_range = (pred_band.max() - pred_band.min()).item()
-                targ_range = (targ_band.max() - targ_band.min()).item()
-                writer.add_scalar(f'Range/val_band_{band_idx}_pred', pred_range, epoch)
-                writer.add_scalar(f'Range/val_band_{band_idx}_target', targ_range, epoch)
+        overall_pred_std = math.sqrt(max(pred_var, 0))
+        overall_targ_std = math.sqrt(max(targ_var, 0))
+        overall_correlation = covariance / (overall_pred_std * overall_targ_std + 1e-8) if overall_pred_std > 1e-8 and overall_targ_std > 1e-8 else 0.0
+        overall_variance_ratio = overall_pred_std / (overall_targ_std + 1e-8)
+    else:
+        overall_mae = float('nan')
+        r2 = float('nan')
+        overall_pred_std = 0.0
+        overall_targ_std = 0.0
+        overall_correlation = 0.0
+        overall_variance_ratio = 0.0
+        metrics['mae'] = overall_mae
+        metrics['r2'] = r2
 
     # Log epoch-level metrics
     if rank == 0 and writer is not None:
         writer.add_scalar('Loss/val_epoch', val_loss_avg, epoch)
-        for band_name in val_loss_per_band:
-            writer.add_scalar(f'Loss_PerBand/val_{band_name}', val_loss_per_band[band_name], epoch)
-        if 'mae' in metrics:
-            writer.add_scalar('Val_Metrics/overall_mae', metrics['mae'], epoch)
-        if 'r2' in metrics:
-            writer.add_scalar('Val_Metrics/overall_r2', metrics['r2'], epoch)
+        writer.add_scalar('Loss/val_huber', val_huber_avg, epoch)
+        writer.add_scalar('Loss/val_mse', val_mse_avg, epoch)
+
+        # Per-band losses
+        for band_idx in range(n_bands):
+            writer.add_scalar(f'Loss_PerBand/val_Band_{band_idx}', val_loss_per_band[f'Band_{band_idx}'], epoch)
+
+        # Overall metrics
+        writer.add_scalar('Val_Metrics/overall_mae', overall_mae, epoch)
+        writer.add_scalar('Val_Metrics/overall_r2', r2, epoch)
+        writer.add_scalar('Variance/val_overall_pred_std', overall_pred_std, epoch)
+        writer.add_scalar('Variance/val_overall_target_std', overall_targ_std, epoch)
+        writer.add_scalar('Variance/val_overall_ratio', overall_variance_ratio, epoch)
+        writer.add_scalar('Correlation/val_overall_pearson_r', overall_correlation, epoch)
+
+        # Per-band extended metrics (every 5 epochs)
+        if do_extended_metrics and total_n_samples > 0:
+            n_samples_band_tensor = torch.tensor([n_samples_per_band], device=device)
+            dist.all_reduce(n_samples_band_tensor, op=dist.ReduceOp.SUM)
+            total_n_samples_band = n_samples_band_tensor.item()
+
+            if total_n_samples_band > 0:
+                for band_idx in range(n_bands):
+                    # Per-band MAE
+                    band_mae = running_mae_per_band[band_idx].item() / (total_n_samples_band / n_bands)
+                    writer.add_scalar(f'Val_Metrics/band_{band_idx}_mae', band_mae, epoch)
+                    metrics[f'band_{band_idx}_mae'] = band_mae
+
+                    # Per-band variance/correlation
+                    n_per_band = total_n_samples_band / n_bands
+                    pred_mean_band = running_sum_pred_per_band[band_idx].item() / n_per_band
+                    targ_mean_band = running_sum_targ_per_band[band_idx].item() / n_per_band
+                    pred_var_band = (running_sum_sq_pred_per_band[band_idx].item() / n_per_band) - (pred_mean_band ** 2)
+                    targ_var_band = (running_sum_sq_targ_per_band[band_idx].item() / n_per_band) - (targ_mean_band ** 2)
+                    cov_band = (running_sum_cross_per_band[band_idx].item() / n_per_band) - (pred_mean_band * targ_mean_band)
+
+                    pred_std_band = math.sqrt(max(pred_var_band, 0))
+                    targ_std_band = math.sqrt(max(targ_var_band, 0))
+                    corr_band = cov_band / (pred_std_band * targ_std_band + 1e-8) if pred_std_band > 1e-8 and targ_std_band > 1e-8 else 0.0
+
+                    writer.add_scalar(f'Variance/val_band_{band_idx}_pred_std', pred_std_band, epoch)
+                    writer.add_scalar(f'Variance/val_band_{band_idx}_target_std', targ_std_band, epoch)
+                    writer.add_scalar(f'Correlation/val_band_{band_idx}_pearson_r', corr_band, epoch)
+                    metrics[f'band_{band_idx}_correlation'] = corr_band
 
     return metrics
 
