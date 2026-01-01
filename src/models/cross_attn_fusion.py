@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import List, Dict, Optional
 from torch_geometric.nn import PointTransformerConv
+from torch_geometric.utils import to_dense_batch
 
 class CrossAttentionFusion(nn.Module):
     """
@@ -201,7 +203,63 @@ class CrossAttentionFusion(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size * n_queries, -1)  # [N, dim]
         
         return attn_output
-    
+
+    def cross_attention_batched(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        query_mask: torch.Tensor,
+        attn_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Batched multi-head cross-attention mechanism with padding mask support.
+
+        Args:
+            queries: Query tensor [B, max_N, dim] - padded point queries
+            keys: Key tensor [B, P, dim] - patch keys (fixed size per modality)
+            values: Value tensor [B, P, dim] - patch values
+            query_mask: Boolean mask [B, max_N] - True for VALID points, False for padding
+            attn_mask: Optional distance-based attention mask [B, max_N, P] - True where to MASK
+
+        Returns:
+            output: Attention output [B, max_N, dim]
+        """
+        batch_size, max_n, dim = queries.shape
+        n_keys = keys.size(1)
+        head_dim = dim // self.num_heads
+
+        # Reshape for multi-head attention: [B, N, H, D/H] -> [B, H, N, D/H]
+        q = queries.view(batch_size, max_n, self.num_heads, head_dim).transpose(1, 2)
+        k = keys.view(batch_size, n_keys, self.num_heads, head_dim).transpose(1, 2)
+        v = values.view(batch_size, n_keys, self.num_heads, head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention: [B, H, N, P]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+
+        # Apply distance-based attention mask if provided
+        if attn_mask is not None:
+            # attn_mask: [B, max_N, P] -> [B, 1, max_N, P] for broadcasting
+            scores = scores.masked_fill(attn_mask.unsqueeze(1), -1000.0)
+
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1)  # [B, H, N, P]
+
+        # Apply attention dropout during training
+        attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+        # Apply attention weights to values: [B, H, N, D/H]
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Reshape back: [B, H, N, D/H] -> [B, N, H, D/H] -> [B, N, D]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, max_n, dim)
+
+        # Zero out padded positions (optional but cleaner for downstream)
+        # query_mask: [B, max_N] True=valid -> expand to [B, max_N, 1]
+        attn_output = attn_output * query_mask.unsqueeze(-1).float()
+
+        return attn_output
+
     def forward(self, point_features, edge_index, point_positions, naip_embeddings=None, uavsar_embeddings=None,
                 main_bbox=None, naip_bbox=None, uavsar_bbox=None, center=None, scale=None, norm_params=None):
         """
@@ -367,5 +425,222 @@ class CrossAttentionFusion(nn.Module):
         fused_features = point_features + fused_features  # Residual connection [N, D_p]
         fused_features = self.norm2(fused_features)  # [N, D_p]
 
-        
+
+        return fused_features
+
+    def forward_batched(
+        self,
+        point_features: torch.Tensor,
+        point_positions: torch.Tensor,
+        batch_indices: torch.Tensor,
+        norm_params: List[Dict],
+        naip_embeddings: Optional[torch.Tensor] = None,
+        uavsar_embeddings: Optional[torch.Tensor] = None,
+        modality_mask: Optional[Dict[str, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        """
+        Batched fusion of point features with patch embeddings.
+
+        This method processes all tiles in a single batched operation, eliminating
+        the per-tile Python loop. Uses to_dense_batch for variable-length point clouds.
+
+        Args:
+            point_features: Point features [N_total, D_p] - concatenated across batch
+            point_positions: Point positions [N_total, 3] - z-score normalized
+            batch_indices: Batch assignment [N_total] - values 0 to B-1
+            norm_params: List of dicts [B], each with 'coord_mean' and 'coord_std' tensors
+            naip_embeddings: NAIP patch embeddings [B, P, D_patch] or None
+                            Zeros for tiles without NAIP (indicated by modality_mask)
+            uavsar_embeddings: UAVSAR patch embeddings [B, P, D_patch] or None
+                              Zeros for tiles without UAVSAR (indicated by modality_mask)
+            modality_mask: Dict with 'naip' and 'uavsar' boolean tensors [B]
+                          True = modality available, False = missing
+
+        Returns:
+            fused_features: [N_total, D_p] - fused features in original order
+        """
+        # Identity case - no imagery modalities used
+        if self.identity:
+            return point_features
+
+        device = point_features.device
+        batch_size = len(norm_params)
+
+        # ====== 1) Vectorized denormalization ======
+        # Stack norm_params into batched tensors
+        coord_means = torch.stack([np['coord_mean'] for np in norm_params]).to(
+            device=device, dtype=point_positions.dtype
+        )  # [B, 3]
+        coord_stds = torch.stack([np['coord_std'] for np in norm_params]).to(
+            device=device, dtype=point_positions.dtype
+        )  # [B, 3]
+
+        # Index by batch_indices for per-point values
+        point_means = coord_means[batch_indices]  # [N_total, 3]
+        point_stds = coord_stds[batch_indices]    # [N_total, 3]
+
+        # Denormalize: z-score → bbox-normalized (meters)
+        point_pos_phys = point_positions * point_stds + point_means  # [N_total, 3]
+
+        # ====== 2) Convert to dense batches ======
+        # Normalize point features first
+        point_features_norm = self.norm1(point_features)  # [N_total, D_p]
+
+        # Create dense batches with padding
+        feat_dense, valid_mask = to_dense_batch(
+            point_features_norm, batch_indices, batch_size=batch_size
+        )  # feat_dense: [B, max_N, D_p], valid_mask: [B, max_N]
+
+        pos_dense, _ = to_dense_batch(
+            point_positions, batch_indices, batch_size=batch_size
+        )  # [B, max_N, 3] - z-score normalized for encoding
+
+        pos_phys_dense, _ = to_dense_batch(
+            point_pos_phys, batch_indices, batch_size=batch_size
+        )  # [B, max_N, 3] - meters for distance computation
+
+        max_n = feat_dense.size(1)
+
+        # ====== 3) Encode point positions ======
+        # Flatten for positional encoding, then reshape
+        pos_flat = pos_dense.view(-1, 3)  # [B*max_N, 3]
+        pos_encoded_flat = self.positional_encoding(pos_flat, self.position_encoding_dim)  # [B*max_N, pos_dim]
+        # pos_encoded = pos_encoded_flat.view(batch_size, max_n, -1)  # [B, max_N, pos_dim] - not used currently
+
+        # ====== 4) Create queries ======
+        queries = self.point_query_proj(feat_dense)  # [B, max_N, D_p]
+
+        # ====== 5) Process modalities ======
+        to_concat = [feat_dense]  # Start with normalized point features [B, max_N, D_p]
+
+        # Patch positions are the same for all tiles (centered at origin)
+        patches_per_side = int(math.sqrt(self.num_patches))
+        # Create centered patch grid (20m x 20m imagery bbox → patches at ±5m, ±2.5m, etc.)
+        default_bbox = torch.tensor([-10.0, -10.0, 10.0, 10.0], device=device)
+        patch_positions = self.get_patch_positions(default_bbox, patches_per_side)  # [P, 2]
+
+        # Encode patch positions once (same for all tiles)
+        patch_pos_encoded = self.positional_encoding(patch_positions, self.position_encoding_dim)  # [P, pos_dim]
+
+        # Process NAIP
+        if self.use_naip and naip_embeddings is not None:
+            # naip_embeddings: [B, P, D_patch]
+            # Combine with positional encoding: [B, P, D_patch + pos_dim]
+            naip_with_pos = torch.cat([
+                naip_embeddings,
+                patch_pos_encoded.unsqueeze(0).expand(batch_size, -1, -1)
+            ], dim=2)  # [B, P, D_patch + pos_dim]
+
+            # Project to keys and values
+            naip_keys = self.naip_key_proj(naip_with_pos)    # [B, P, D_p]
+            naip_values = self.naip_value_proj(naip_with_pos)  # [B, P, D_p]
+
+            # Distance mask (optional)
+            distance_mask = None
+            if self.use_distance_mask:
+                # Compute batched distances: [B, max_N, P]
+                distances = torch.cdist(
+                    pos_phys_dense[:, :, :2],  # [B, max_N, 2] XY only
+                    patch_positions.unsqueeze(0).expand(batch_size, -1, -1),  # [B, P, 2]
+                    p=2
+                )  # [B, max_N, P]
+                distance_mask = distances > self.max_dist_ratio  # True = mask out
+
+            # Batched cross-attention
+            naip_attn = self.cross_attention_batched(
+                queries, naip_keys, naip_values, valid_mask, distance_mask
+            )  # [B, max_N, D_p]
+
+            # Zero out tiles without NAIP
+            if modality_mask is not None and 'naip' in modality_mask:
+                naip_mask = modality_mask['naip']  # [B]
+                naip_attn = naip_attn * naip_mask.view(-1, 1, 1).float()
+
+            to_concat.append(naip_attn)
+
+        # Process UAVSAR
+        if self.use_uavsar and uavsar_embeddings is not None:
+            # uavsar_embeddings: [B, P, D_patch]
+            uavsar_with_pos = torch.cat([
+                uavsar_embeddings,
+                patch_pos_encoded.unsqueeze(0).expand(batch_size, -1, -1)
+            ], dim=2)  # [B, P, D_patch + pos_dim]
+
+            uavsar_keys = self.uavsar_key_proj(uavsar_with_pos)    # [B, P, D_p]
+            uavsar_values = self.uavsar_value_proj(uavsar_with_pos)  # [B, P, D_p]
+
+            # Distance mask
+            distance_mask = None
+            if self.use_distance_mask:
+                distances = torch.cdist(
+                    pos_phys_dense[:, :, :2],
+                    patch_positions.unsqueeze(0).expand(batch_size, -1, -1),
+                    p=2
+                )
+                distance_mask = distances > self.max_dist_ratio
+
+            uavsar_attn = self.cross_attention_batched(
+                queries, uavsar_keys, uavsar_values, valid_mask, distance_mask
+            )  # [B, max_N, D_p]
+
+            # Zero out tiles without UAVSAR
+            if modality_mask is not None and 'uavsar' in modality_mask:
+                uavsar_mask = modality_mask['uavsar']  # [B]
+                uavsar_attn = uavsar_attn * uavsar_mask.view(-1, 1, 1).float()
+
+            to_concat.append(uavsar_attn)
+
+        # ====== 6) Combine and project ======
+        # NOTE: Behavior difference from forward() for consistent modality positions
+        #
+        # The original forward() uses "shift left, pad right" when modalities are missing:
+        #   - UAVSAR only: [point, uavsar, zeros] (UAVSAR in NAIP position)
+        #
+        # This batched version uses CONSISTENT positions:
+        #   - UAVSAR only: [point, zeros, uavsar] (each modality in its fixed slot)
+        #
+        # The consistent behavior is preferred because:
+        #   1. Matches embedding dropout behavior (zeros in correct slot, not shifted)
+        #   2. More intuitive for the model to learn fixed feature positions
+        #   3. All training sites have NAIP, so "NAIP missing" is rare in practice
+        #
+        # Models should be trained with this batched version for consistent behavior.
+
+        expected_dim = self.point_dim * (1 + int(self.use_naip) + int(self.use_uavsar))
+
+        if len(to_concat) > 1:
+            concatenated = torch.cat(to_concat, dim=2)  # [B, max_N, D_p * (1 + n_modalities)]
+
+            # Handle missing modalities: pad to expected dimension
+            actual_dim = concatenated.shape[2]
+            if actual_dim < expected_dim:
+                padding = torch.zeros(
+                    batch_size, max_n, expected_dim - actual_dim,
+                    device=device, dtype=concatenated.dtype
+                )
+                concatenated = torch.cat([concatenated, padding], dim=2)
+        else:
+            # No modalities available - pad point features
+            padding = torch.zeros(
+                batch_size, max_n, expected_dim - self.point_dim,
+                device=device, dtype=feat_dense.dtype
+            )
+            concatenated = torch.cat([feat_dense, padding], dim=2)
+
+        # Apply FFN
+        concatenated = self.act(self.linear1(concatenated))  # [B, max_N, concat_dim]
+        fused_dense = self.linear2(concatenated)  # [B, max_N, D_p]
+
+        # Residual connection
+        fused_dense = feat_dense + fused_dense  # [B, max_N, D_p]
+        fused_dense = self.norm2(fused_dense)
+
+        # ====== 7) Convert back to sparse format ======
+        # Extract valid points using valid_mask (no CPU sync needed)
+        # Since batch_indices are ordered [0,0,...,1,1,...,2,2,...] from collate,
+        # flattening and masking preserves the original point order
+        fused_flat = fused_dense.view(-1, self.point_dim)  # [B*max_N, D_p]
+        valid_flat = valid_mask.view(-1)  # [B*max_N]
+        fused_features = fused_flat[valid_flat]  # [N_total, D_p]
+
         return fused_features

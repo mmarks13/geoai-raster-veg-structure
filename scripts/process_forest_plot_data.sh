@@ -107,10 +107,6 @@ Output: data/processed/forest_plot_data/inference_ready/precomputed_forest_plot_
 2025-12-05 22:27:44,956 - INFO - Forest plot stats: data/processed/forest_plot_data/inference_ready/forest_plot_coordinate_stats.json
 ✓ Preprocessing complete 
 
-I would like to change the augmentation strategy though and remove the modality dropout in my augmentation script (
-@src/data_prep/data_augmentation_raster.py ) and instead do it during training (as long as we can do it without affecting performance <- that is
-critical because previous implementations have affected performance). If we can do some random 3dep point dropout (maybe 3%) during training too, that would be good (again as long as we can do it wihout affecting
-performance). The amount of dropout for these should be model configs. Please conduct an investigation into the feasibility of these changes. If you think they can be done simply and without affecting performance, go ahead and implement. Be sure to ask clarifying questions (using your ask user question tool) if anything is unclear 
 # -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------

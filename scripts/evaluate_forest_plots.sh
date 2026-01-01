@@ -93,7 +93,14 @@ fi
 # Check required input files
 TILES_FILE="data/processed/forest_plot_data/inference_ready/precomputed_forest_plot_tiles_32bit.pt"
 FIELD_DATA="data/processed/forest_plot_data/forest_plots_processed.gpkg"
-FUEL_STATS="data/processed/model_data_raster/fuel_metrics_normalization_stats_train.json"
+
+# Read stats file path from band config
+FUEL_STATS=$(python -c "import json; print(json.load(open('$BAND_CONFIG'))['stats_file'])")
+if [ -z "$FUEL_STATS" ]; then
+    echo "Error: Could not read 'stats_file' from band config: $BAND_CONFIG"
+    exit 1
+fi
+echo "Using stats file from band config: $FUEL_STATS"
 
 # Note: Using ls for file existence check due to -f test issues with large files
 if ! ls "$TILES_FILE" &>/dev/null; then

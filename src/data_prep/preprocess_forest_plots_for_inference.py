@@ -418,6 +418,15 @@ def preprocess_naip_imagery(
 
     images = images.clone()
 
+    # Center-crop to square if dimensions don't match
+    # This maintains centroid alignment and produces expected 40x40 for encoder
+    h, w = images.shape[-2:]
+    if h != w:
+        min_dim = min(h, w)
+        start_h = (h - min_dim) // 2
+        start_w = (w - min_dim) // 2
+        images = images[..., start_h:start_h + min_dim, start_w:start_w + min_dim]
+
     # Identify invalid values before normalization
     invalid_mask = torch.isnan(images) | torch.isinf(images)
 
@@ -444,6 +453,83 @@ def preprocess_naip_imagery(
     }
 
 
+def compute_image_coverage(image: torch.Tensor) -> float:
+    """
+    Compute fraction of valid (non-black) pixels in a single NAIP image.
+
+    Args:
+        image: [4, h, w] tensor (RGBN), values in [0, 1] or [0, 255]
+
+    Returns:
+        float: Fraction of pixels with non-zero RGB values (0.0 to 1.0)
+    """
+    # Normalize to [0, 1] if needed
+    img = image.float()
+    if img.max() > 1:
+        img = img / 255.0
+
+    # Sum RGB bands - black pixels have sum ≈ 0
+    rgb_sum = img[:3, :, :].sum(dim=0)  # [h, w]
+
+    # Valid if RGB sum > small threshold (handles slight noise)
+    valid_mask = rgb_sum > 0.01
+
+    return valid_mask.float().mean().item()
+
+
+def filter_naip_by_coverage(
+    naip_dict: Optional[Dict[str, Any]],
+    min_coverage: float = 0.8
+) -> Optional[Dict[str, Any]]:
+    """
+    Filter NAIP acquisitions, keeping only those with sufficient coverage.
+
+    Args:
+        naip_dict: Dict with 'images' [n_images, 4, h, w], 'ids', 'dates', etc.
+        min_coverage: Minimum fraction of valid pixels (default: 0.8)
+
+    Returns:
+        Filtered naip_dict with bad acquisitions removed, or None if all removed
+    """
+    if naip_dict is None:
+        return None
+
+    images = naip_dict['images']  # [n_images, 4, h, w]
+    n_images = images.shape[0]
+
+    # Compute coverage for each acquisition
+    keep_indices = []
+    for i in range(n_images):
+        coverage = compute_image_coverage(images[i])
+        if coverage >= min_coverage:
+            keep_indices.append(i)
+
+    if len(keep_indices) == 0:
+        # All acquisitions have low coverage
+        return None
+
+    if len(keep_indices) == n_images:
+        # All acquisitions are good, return unchanged
+        return naip_dict
+
+    # Filter to keep only good acquisitions
+    filtered = {
+        'images': images[keep_indices],
+        'ids': [naip_dict['ids'][i] for i in keep_indices],
+        'dates': [naip_dict['dates'][i] for i in keep_indices],
+    }
+
+    # Copy other fields if present
+    if 'relative_dates' in naip_dict:
+        filtered['relative_dates'] = naip_dict['relative_dates'][keep_indices]
+    if 'img_bbox' in naip_dict:
+        filtered['img_bbox'] = naip_dict['img_bbox']
+    if 'bands' in naip_dict:
+        filtered['bands'] = naip_dict['bands']
+
+    return filtered
+
+
 def preprocess_uavsar_imagery(
     tile: Dict[str, Any],
     reference_date: datetime,
@@ -453,7 +539,7 @@ def preprocess_uavsar_imagery(
     """
     Preprocess UAVSAR imagery, handling variable numbers of images
     associated with distinct acquisition events.
-    Only keeps acquisition events with two or more images.
+    Keeps all acquisition events (including single-image groups).
     """
     if 'uavsar_imgs' not in tile or tile['uavsar_imgs'] is None:
         return None
@@ -465,6 +551,15 @@ def preprocess_uavsar_imagery(
     images = images.clone()
     dates_str = tile['uavsar_dates']
     ids = tile['uavsar_ids']
+
+    # Center-crop to square if dimensions don't match
+    # This maintains centroid alignment and produces expected 4x4 for encoder
+    h, w = images.shape[-2:]
+    if h != w:
+        min_dim = min(h, w)
+        start_h = (h - min_dim) // 2
+        start_w = (w - min_dim) // 2
+        images = images[..., start_h:start_h + min_dim, start_w:start_w + min_dim]
 
     # Step 1: Filter out images with all invalid pixels
     n_images = images.shape[0]
@@ -525,11 +620,14 @@ def preprocess_uavsar_imagery(
     if current_group['images']:
         groups.append(current_group)
 
-    # Step 4: Filter groups to keep only those with two or more images
-    groups = [group for group in groups if len(group['images']) >= 2]
+    # Step 4: Filter groups to keep only those with one or more images
+    # Note: Training data uses >= 2 filter, but inference allows G=1 since
+    # the model is trained with G-dimension augmentation to handle single-image groups
+    # We need to explore further if this contraint should be relaxed in the training as well.
+    groups = [group for group in groups if len(group['images']) >= 1]
 
     if len(groups) == 0:
-        logger.warning("No valid UAVSAR acquisition events with 2+ images found!")
+        logger.warning("No valid UAVSAR acquisition events found!")
         return None
 
     # Get tensor dimensions
@@ -869,6 +967,14 @@ def main():
             if naip_preprocessed is not None:
                 tile['naip'] = naip_preprocessed
                 naip_count += 1
+
+                # Filter out acquisitions with partial coverage (< 80% valid pixels)
+                original_count = tile['naip']['images'].shape[0]
+                tile['naip'] = filter_naip_by_coverage(tile['naip'], min_coverage=0.8)
+                if tile['naip'] is None:
+                    logger.info(f"  Tile {tile.get('tile_id', 'unknown')}: All {original_count} NAIP acquisitions filtered (low coverage)")
+                elif tile['naip']['images'].shape[0] < original_count:
+                    logger.info(f"  Tile {tile.get('tile_id', 'unknown')}: NAIP filtered {original_count} → {tile['naip']['images'].shape[0]} acquisitions")
             else:
                 tile['naip'] = None
         else:

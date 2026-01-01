@@ -3,17 +3,20 @@
 Train/Validation Split and Precomputation for Raster-Based Model
 
 Loads combined training data, applies quality filtering, splits into train/val,
-normalizes fuel metrics bands globally, preprocesses NAIP/UAVSAR imagery, and
+normalizes target raster bands globally, preprocesses NAIP/UAVSAR imagery, and
 precomputes KNN indices.
 
-**IDENTICAL PREPROCESSING to: src/data_prep/train_test_split_and_precompute.py**
-(Same model architecture, different prediction head: point cloud → raster)
+**GENERIC:** Works with any target raster (vegetation structure, fuel metrics, etc.)
+- Auto-detects number of bands from data
+- Rejects tiles with ANY NaN in target (NA handling must be done upstream)
+- Applies z-score normalization to all bands
 
-Input: Combined .pt file with tiles containing fuel_metrics [22, h, w] (Band 22 removed)
+Input: Combined .pt file with tiles containing target_raster/fuel_metrics [n_bands, h, w]
 Output:
   - precomputed_training_tiles_raster_32bit.pt (normalized, preprocessed)
   - precomputed_validation_tiles_raster_32bit.pt (normalized, preprocessed)
-  - fuel_metrics_normalization_stats.json (statistics)
+  - target_raster_normalization_stats_train.json (statistics)
+  - rejected_tiles.log (tiles filtered out with reasons)
 """
 
 import torch
@@ -24,96 +27,119 @@ import numpy as np
 from pathlib import Path
 import logging
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+import geopandas as gpd
+from shapely.geometry import box
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def validate_fuel_metrics_quality(tile, band_index=14, max_na_ratio=0.5):  # Band 15 (index 14)
+def validate_tile_no_nan(tile, tile_id='unknown'):
     """
-    Check if fuel metrics have acceptable coverage in specified band.
+    Validate that target raster has NO NaN values (upstream should have handled all NA).
 
     Parameters:
-        tile (dict): Tile with 'fuel_metrics' key
-        band_index (int): Band to check (0-indexed, 14 = Band 15)
-        max_na_ratio (float): Maximum allowed ratio of NaN pixels (0.0-1.0, default: 0.5 = 50%)
+        tile (dict): Tile with 'fuel_metrics' (or 'target_raster') key
+        tile_id (str): Tile identifier for logging
 
     Returns:
-        bool: True if NaN pixels <= max_na_ratio, False otherwise
+        tuple: (is_valid: bool, nan_bands: list of band indices with NaN)
     """
-    if 'fuel_metrics' not in tile:
-        return False
+    # Check for target raster under either key name
+    target_key = 'fuel_metrics' if 'fuel_metrics' in tile else 'target_raster'
 
-    fuel_metrics = tile['fuel_metrics']
-    if fuel_metrics is None:
-        return False
+    if target_key not in tile:
+        return False, [-1]  # -1 indicates missing target
 
-    # Check band 15 (index 14) for NA ratio
-    band_data = fuel_metrics[band_index]
-    nan_count = torch.isnan(band_data).sum().item()
-    total_pixels = band_data.numel()
-    na_ratio = nan_count / total_pixels if total_pixels > 0 else 0.0
+    target_raster = tile[target_key]
+    if target_raster is None:
+        return False, [-1]
 
-    return na_ratio <= max_na_ratio
+    # Check each band for NaN
+    nan_bands = []
+    n_bands = target_raster.shape[0]
+
+    for band_idx in range(n_bands):
+        band_data = target_raster[band_idx]
+        if torch.isnan(band_data).any():
+            nan_bands.append(band_idx)
+
+    is_valid = len(nan_bands) == 0
+    return is_valid, nan_bands
 
 
 def compute_normalization_stats(tiles):
     """
-    Compute per-band global mean and std for fuel metrics (23 bands).
+    Compute per-band global mean and std for target raster.
+
+    Auto-detects number of bands from the data.
 
     Parameters:
-        tiles (list): List of tiles with 'fuel_metrics' [23, h, w]
+        tiles (list): List of tiles with 'fuel_metrics' [n_bands, h, w]
 
     Returns:
-        dict: Statistics {'band_1_mean': ..., 'band_1_std': ..., ...}
+        dict: Statistics {'n_bands': n, 'band_0_mean': ..., 'band_0_std': ..., ...}
+
+    Raises:
+        ValueError: If no valid tiles found or if any band has no valid data
     """
-    logger.info("Computing normalization statistics for 22 fuel metrics bands...")
+    # Auto-detect number of bands from first valid tile
+    n_bands = None
+    for tile in tiles:
+        if 'fuel_metrics' in tile and tile['fuel_metrics'] is not None:
+            n_bands = tile['fuel_metrics'].shape[0]
+            break
+
+    if n_bands is None:
+        raise ValueError("No valid tiles found to determine band count")
+
+    logger.info(f"Computing normalization statistics for {n_bands} bands...")
 
     # Initialize accumulators for each band
-    band_sums = [0.0] * 22
-    band_sq_sums = [0.0] * 22
-    band_counts = [0] * 22
+    band_sums = [0.0] * n_bands
+    band_sq_sums = [0.0] * n_bands
+    band_counts = [0] * n_bands
 
     # Collect statistics from all tiles
     for tile_idx, tile in enumerate(tiles):
         if 'fuel_metrics' not in tile or tile['fuel_metrics'] is None:
             continue
 
-        fuel_metrics = tile['fuel_metrics']  # [22, h, w]
+        target_raster = tile['fuel_metrics']  # [n_bands, h, w]
 
-        for band_idx in range(22):
-            band_data = fuel_metrics[band_idx]
+        for band_idx in range(n_bands):
+            band_data = target_raster[band_idx]
+            # All data should be valid (NaN tiles filtered upstream)
+            band_sums[band_idx] += band_data.sum().item()
+            band_sq_sums[band_idx] += (band_data ** 2).sum().item()
+            band_counts[band_idx] += band_data.numel()
 
-            # Ignore NaN values
-            valid_mask = ~torch.isnan(band_data)
-            valid_data = band_data[valid_mask]
-
-            if len(valid_data) > 0:
-                band_sums[band_idx] += valid_data.sum().item()
-                band_sq_sums[band_idx] += (valid_data ** 2).sum().item()
-                band_counts[band_idx] += valid_data.numel()
-
-        if (tile_idx + 1) % 100 == 0:
+        if (tile_idx + 1) % 500 == 0:
             logger.info(f"  Processed {tile_idx + 1}/{len(tiles)} tiles...")
 
     # Compute mean and std for each band
-    stats = {}
-    for band_idx in range(22):
-        if band_counts[band_idx] > 0:
-            mean = band_sums[band_idx] / band_counts[band_idx]
-            sq_mean = band_sq_sums[band_idx] / band_counts[band_idx]
-            variance = sq_mean - (mean ** 2)
-            std = np.sqrt(max(variance, 1e-8))  # Avoid sqrt of negative
+    stats = {'n_bands': n_bands}
+    for band_idx in range(n_bands):
+        if band_counts[band_idx] == 0:
+            raise ValueError(f"Band {band_idx} has no valid data across all tiles!")
 
-            stats[f'band_{band_idx + 1}_mean'] = float(mean)
-            stats[f'band_{band_idx + 1}_std'] = float(std)
-        else:
-            # Default for empty bands
-            stats[f'band_{band_idx + 1}_mean'] = 0.0
-            stats[f'band_{band_idx + 1}_std'] = 1.0
+        mean = band_sums[band_idx] / band_counts[band_idx]
+        sq_mean = band_sq_sums[band_idx] / band_counts[band_idx]
+        variance = sq_mean - (mean ** 2)
 
-    logger.info(f"Computed statistics for all 22 bands")
+        if variance < 0:
+            raise ValueError(
+                f"Band {band_idx} has negative variance ({variance:.6f}). "
+                f"This indicates numerical issues in the data."
+            )
+
+        std = np.sqrt(max(variance, 1e-8))  # Small epsilon for numerical stability
+
+        stats[f'band_{band_idx}_mean'] = float(mean)
+        stats[f'band_{band_idx}_std'] = float(std)
+
+    logger.info(f"Computed statistics for all {n_bands} bands")
     return stats
 
 
@@ -513,6 +539,15 @@ def preprocess_naip_imagery(tile: Dict[str, Any], reference_date: datetime,
     # Get NAIP imagery tensor
     images = tile['naip_imgs'].clone()  # Tensor: [n_images, 4, h, w]
 
+    # Center-crop to square if dimensions don't match
+    # This maintains centroid alignment and produces expected 40x40 for encoder
+    h, w = images.shape[-2:]
+    if h != w:
+        min_dim = min(h, w)
+        start_h = (h - min_dim) // 2
+        start_w = (w - min_dim) // 2
+        images = images[..., start_h:start_h + min_dim, start_w:start_w + min_dim]
+
     # Identify invalid values before normalization
     invalid_mask = torch.isnan(images) | torch.isinf(images)
 
@@ -576,6 +611,15 @@ def preprocess_uavsar_imagery(tile: Dict[str, Any], reference_date: datetime,
     images = tile['uavsar_imgs'].clone()  # Tensor: [n_images, n_bands, h, w]
     dates_str = tile['uavsar_dates']
     ids = tile['uavsar_ids']
+
+    # Center-crop to square if dimensions don't match
+    # This maintains centroid alignment and produces expected 4x4 for encoder
+    h, w = images.shape[-2:]
+    if h != w:
+        min_dim = min(h, w)
+        start_h = (h - min_dim) // 2
+        start_w = (w - min_dim) // 2
+        images = images[..., start_h:start_h + min_dim, start_w:start_w + min_dim]
 
     # Step 1: Filter out images with all invalid pixels
     n_images = images.shape[0]
@@ -737,144 +781,48 @@ def preprocess_uavsar_imagery(tile: Dict[str, Any], reference_date: datetime,
     }
 
 
-def replace_na_with_defaults(tile):
+def normalize_target_raster(tile, stats):
     """
-    Replace NA with 0 for fuel/cover/height bands, keep NA for structural metrics.
-
-    NA → 0 replacement (absence of vegetation = zero value):
-      - Band 3: Height (Canopy height, m)
-      - Bands 8-16: Fuel loads, cover percentages
-      - Bands 19-21, 23: PAI values, max_CBD (Band 22 skipped in source)
-
-    Keep NA (value undefined without vegetation):
-      - Bands 1-2: Profile types (categorical)
-      - Bands 4-7: CBH, FSG, VCI indices
-      - Bands 17-18: Entropy indices
-
-    Parameters:
-        tile (dict): Tile with 'fuel_metrics' key
-
-    Returns:
-        dict: Modified tile with NAs replaced for appropriate bands
-    """
-    if 'fuel_metrics' not in tile or tile['fuel_metrics'] is None:
-        return tile
-
-    fuel_metrics = tile['fuel_metrics'].clone()  # [22, h, w]
-
-    # Band indices to replace NA → 0 (0-indexed)
-    # Band 3 (index 2): Height
-    # Bands 8-16 (indices 7-15): Fuel loads + cover
-    # Bands 19-21, 23 (indices 18-21): PAI + max_CBD (Band 22 removed)
-    replace_bands = [2] + list(range(7, 16)) + list(range(18, 22))
-
-    na_count_per_band = {}
-    for band_idx in replace_bands:
-        band_data = fuel_metrics[band_idx]
-        nan_mask = torch.isnan(band_data)
-        na_count = nan_mask.sum().item()
-        if na_count > 0:
-            fuel_metrics[band_idx, nan_mask] = 0.0
-            na_count_per_band[band_idx + 1] = na_count
-
-    tile['fuel_metrics'] = fuel_metrics
-    return tile, na_count_per_band
-
-
-def normalize_fuel_metrics(tile, stats):
-    """
-    Apply z-score normalization to fuel metrics using pre-computed statistics.
+    Apply z-score normalization to target raster using pre-computed statistics.
 
     Parameters:
         tile (dict): Tile to normalize (modified in-place)
-        stats (dict): Normalization statistics
+        stats (dict): Normalization statistics with 'n_bands', 'band_0_mean', 'band_0_std', etc.
 
     Returns:
         dict: Modified tile with normalized fuel_metrics
+
+    Raises:
+        ValueError: If stats are missing for any band
     """
     if 'fuel_metrics' not in tile or tile['fuel_metrics'] is None:
         return tile
 
-    fuel_metrics = tile['fuel_metrics'].clone()  # [22, h, w]
+    target_raster = tile['fuel_metrics'].clone()
+    n_bands = target_raster.shape[0]
 
-    for band_idx in range(22):
-        mean_key = f'band_{band_idx + 1}_mean'
-        std_key = f'band_{band_idx + 1}_std'
+    # Validate stats has all required keys
+    if 'n_bands' not in stats:
+        raise ValueError("Stats dict missing 'n_bands' key")
+    if stats['n_bands'] != n_bands:
+        raise ValueError(
+            f"Band count mismatch: tile has {n_bands} bands, stats computed for {stats['n_bands']}"
+        )
 
-        if mean_key in stats and std_key in stats:
-            mean = stats[mean_key]
-            std = stats[std_key]
+    for band_idx in range(n_bands):
+        mean_key = f'band_{band_idx}_mean'
+        std_key = f'band_{band_idx}_std'
 
-            # Apply z-score normalization, preserving NaN values
-            band_data = fuel_metrics[band_idx]
-            valid_mask = ~torch.isnan(band_data)
+        if mean_key not in stats or std_key not in stats:
+            raise ValueError(f"Stats missing for band {band_idx}: need '{mean_key}' and '{std_key}'")
 
-            fuel_metrics[band_idx, valid_mask] = (band_data[valid_mask] - mean) / (std + 1e-8)
+        mean = stats[mean_key]
+        std = stats[std_key]
 
-    tile['fuel_metrics'] = fuel_metrics
-    return tile
+        # Apply z-score normalization (no NaN handling - should be filtered upstream)
+        target_raster[band_idx] = (target_raster[band_idx] - mean) / std
 
-
-def apply_log_transform_to_tfl(tiles: List[dict], tfl_band_index: int = 7) -> int:
-    """
-    Apply log(x + 1) transform to TFL band for all tiles.
-
-    This compresses the right-skewed TFL distribution (30% near-zero values)
-    and helps with variance collapse during training.
-
-    Must be called AFTER replace_na_with_defaults() since log(0 + 1) = 0.
-
-    Args:
-        tiles: List of tiles with 'fuel_metrics' [22, h, w]
-        tfl_band_index: Index of TFL band (0-indexed, default 7 = band 8)
-
-    Returns:
-        Number of tiles processed
-    """
-    processed = 0
-    for tile in tiles:
-        if 'fuel_metrics' not in tile or tile['fuel_metrics'] is None:
-            continue
-
-        fuel_metrics = tile['fuel_metrics']
-
-        # Apply log(x + 1) to TFL band
-        # NaN values stay NaN (log(NaN + 1) = NaN)
-        # Zero values become 0 (log(0 + 1) = 0)
-        tfl_band = fuel_metrics[tfl_band_index]
-        fuel_metrics[tfl_band_index] = torch.log(tfl_band + 1)
-
-        tile['fuel_metrics'] = fuel_metrics
-        processed += 1
-
-    return processed
-
-
-def replace_remaining_nans_with_sentinel(tile, sentinel_value=-999.0):
-    """
-    Replace any remaining NaN values in normalized fuel metrics with a sentinel value.
-
-    This is called AFTER normalization to handle bands where NaN has meaning
-    (e.g., canopy height, understory height) and shouldn't be set to 0.
-
-    Parameters:
-        tile (dict): Tile with normalized fuel_metrics
-        sentinel_value (float): Sentinel value to use for NaN (-999.0 by default)
-
-    Returns:
-        dict: Modified tile with NaN replaced by sentinel
-    """
-    if 'fuel_metrics' not in tile or tile['fuel_metrics'] is None:
-        return tile
-
-    fuel_metrics = tile['fuel_metrics']
-    nan_mask = torch.isnan(fuel_metrics)
-
-    if nan_mask.any():
-        fuel_metrics = fuel_metrics.clone()
-        fuel_metrics[nan_mask] = sentinel_value
-        tile['fuel_metrics'] = fuel_metrics
-
+    tile['fuel_metrics'] = target_raster
     return tile
 
 
@@ -940,6 +888,100 @@ def report_distribution_shift(train_stats, val_stats, dataset_name="Validation")
     }
 
 
+def split_tiles_by_spatial_intersection(
+    tiles: List[dict],
+    geojson_file_path: str,
+    crs: str = 'EPSG:32611'
+) -> Tuple[List[dict], List[dict]]:
+    """
+    Split tiles into training and validation sets based on spatial intersection
+    with validation polygons from a GeoJSON file.
+
+    Tiles that intersect with validation polygons → validation set
+    Tiles that don't intersect → training set
+
+    Parameters:
+        tiles: List of tile dicts with 'bbox' key [xmin, ymin, xmax, ymax]
+        geojson_file_path: Path to GeoJSON file containing validation polygons
+        crs: Coordinate reference system (default: EPSG:32611 UTM 11N)
+
+    Returns:
+        Tuple of (training_tiles, validation_tiles)
+    """
+    logger.info(f"Loading validation polygons from {geojson_file_path}...")
+    val_polygons = gpd.read_file(geojson_file_path)
+    logger.info(f"Loaded {len(val_polygons)} validation polygons")
+
+    # Check/set CRS
+    if val_polygons.crs is None:
+        logger.warning(f"GeoJSON CRS is not defined. Assuming {crs}.")
+        val_polygons.crs = crs
+    elif str(val_polygons.crs) != crs:
+        logger.info(f"Reprojecting validation polygons from {val_polygons.crs} to {crs}")
+        val_polygons = val_polygons.to_crs(crs)
+
+    # Create GeoDataFrame from tile bounding boxes
+    logger.info("Creating GeoDataFrame from tile bounding boxes...")
+    tile_geoms = []
+    tile_indices = []
+
+    for idx, tile in enumerate(tiles):
+        bbox = tile.get('bbox', None)
+        if bbox is None:
+            logger.warning(f"Tile {tile.get('tile_id', idx)} has no bbox, skipping spatial check")
+            continue
+
+        # Handle both tensor and list/array bbox formats
+        if hasattr(bbox, 'tolist'):
+            bbox = bbox.tolist()
+        elif hasattr(bbox, 'numpy'):
+            bbox = bbox.numpy().tolist()
+
+        minx, miny, maxx, maxy = bbox
+        tile_geoms.append(box(minx, miny, maxx, maxy))
+        tile_indices.append(idx)
+
+    tile_gdf = gpd.GeoDataFrame(geometry=tile_geoms, crs=crs)
+    tile_gdf['tile_idx'] = tile_indices
+
+    # Perform spatial join to find tiles that intersect with validation polygons
+    logger.info("Performing spatial join...")
+    joined = gpd.sjoin(tile_gdf, val_polygons, predicate='intersects', how='left')
+
+    # Get indices of tiles that intersect with validation polygons
+    val_indices = set(joined.loc[~joined['index_right'].isna(), 'tile_idx'])
+    logger.info(f"Found {len(val_indices)} tiles that intersect with validation polygons")
+
+    # Split tiles
+    training_tiles = []
+    validation_tiles = []
+
+    for idx, tile in enumerate(tiles):
+        if idx in val_indices:
+            validation_tiles.append(tile)
+        else:
+            training_tiles.append(tile)
+
+    # Log site breakdown
+    train_sites = {}
+    val_sites = {}
+    for tile in training_tiles:
+        site = tile.get('site', 'unknown')
+        train_sites[site] = train_sites.get(site, 0) + 1
+    for tile in validation_tiles:
+        site = tile.get('site', 'unknown')
+        val_sites[site] = val_sites.get(site, 0) + 1
+
+    logger.info("Training tiles by site:")
+    for site, count in sorted(train_sites.items()):
+        logger.info(f"  {site}: {count}")
+    logger.info("Validation tiles by site:")
+    for site, count in sorted(val_sites.items()):
+        logger.info(f"  {site}: {count}")
+
+    return training_tiles, validation_tiles
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train/validation split and precomputation for raster model"
@@ -948,6 +990,14 @@ def main():
         '--pt-file',
         required=True,
         help='Path to combined .pt file with all tiles'
+    )
+    parser.add_argument(
+        '--geojson-file',
+        type=str,
+        default=None,
+        help='Path to GeoJSON file containing validation polygons for spatial split. '
+             'If provided, uses spatial intersection for train/val split. '
+             'If not provided, uses random split based on --train-val-ratio.'
     )
     parser.add_argument(
         '--output-dir',
@@ -963,7 +1013,7 @@ def main():
     parser.add_argument(
         '--min-dep-points',
         type=int,
-        default=100,
+        default=20,
         help='Minimum 3DEP points required per tile (default: 100)'
     )
     parser.add_argument(
@@ -979,34 +1029,8 @@ def main():
         default=32,
         help='Float precision for output (default: 32)'
     )
-    parser.add_argument(
-        '--max-na-ratio',
-        type=float,
-        default=0.5,
-        help='Maximum allowed ratio of NaN pixels in Band 15 (0.0-1.0, default: 0.5 = 50%)'
-    )
-    parser.add_argument(
-        '--use-log-tfl',
-        action='store_true',
-        default=True,
-        help='Apply log(x+1) transform to TFL band before normalization (default: True)'
-    )
-    parser.add_argument(
-        '--no-log-tfl',
-        action='store_true',
-        help='Disable log transform for TFL (use raw values)'
-    )
 
     args = parser.parse_args()
-
-    # Handle --no-log-tfl flag
-    if args.no_log_tfl:
-        args.use_log_tfl = False
-
-    # Validate max_na_ratio
-    if not (0.0 <= args.max_na_ratio <= 1.0):
-        logger.error(f"--max-na-ratio must be between 0.0 and 1.0, got {args.max_na_ratio}")
-        return
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -1048,8 +1072,12 @@ def main():
     ]
 
     for tile in all_tiles:
+        # Handle different key naming conventions for fuel metrics
         if 'fuel_metrics_fuel_metrics' in tile and 'fuel_metrics' not in tile:
             tile['fuel_metrics'] = tile.pop('fuel_metrics_fuel_metrics')
+        elif 'target_raster' in tile and 'fuel_metrics' not in tile:
+            # New pipeline uses 'target_raster' instead of 'fuel_metrics'
+            tile['fuel_metrics'] = tile.pop('target_raster')
 
         # Convert numpy arrays to tensors
         if 'dep_points' in tile and isinstance(tile['dep_points'], np.ndarray):
@@ -1078,70 +1106,82 @@ def main():
     logger.info("\n" + "="*80)
     logger.info("STEP 3: PRE-FILTER TILES BY QUALITY")
     logger.info("="*80)
-    logger.info(f"Filtering criteria: min_dep_points={args.min_dep_points}, max_na_ratio={args.max_na_ratio}")
+    logger.info(f"Filtering criteria: min_dep_points={args.min_dep_points}, no NaN in target raster")
 
     filtered_tiles = []
-    filtered_out_count = 0
-    total_na_replaced = 0
-    na_per_band = {i: 0 for i in range(1, 24)}
+    rejected_tiles = []  # Track rejected tiles for logging
+    missing_dep_count = 0
+    low_dep_count = 0
+    nan_count = 0
+    nan_bands_summary = {}  # band_idx -> count of tiles with NaN in that band
 
     for tile_idx, tile in enumerate(all_tiles):
-        # Check DEP points (use raw dep_points, not normalized)
+        tile_id = tile.get('tile_id', f'tile_{tile_idx}')
+
+        # Check DEP points
         if 'dep_points' not in tile or tile['dep_points'] is None:
-            filtered_out_count += 1
+            missing_dep_count += 1
+            rejected_tiles.append((tile_id, 'missing_dep_points', []))
             continue
 
         dep_count = tile['dep_points'].shape[0]
         if dep_count < args.min_dep_points:
-            filtered_out_count += 1
+            low_dep_count += 1
+            rejected_tiles.append((tile_id, f'low_dep_points ({dep_count})', []))
             continue
 
-        # Check fuel metrics quality (Band 15) with configurable NA ratio
-        if not validate_fuel_metrics_quality(tile, band_index=14, max_na_ratio=args.max_na_ratio):
-            filtered_out_count += 1
+        # Check for NaN in target raster (should be handled upstream)
+        is_valid, nan_bands = validate_tile_no_nan(tile, tile_id)
+        if not is_valid:
+            nan_count += 1
+            rejected_tiles.append((tile_id, 'nan_in_target', nan_bands))
+            for band_idx in nan_bands:
+                nan_bands_summary[band_idx] = nan_bands_summary.get(band_idx, 0) + 1
             continue
-
-        # Replace NA with 0 for appropriate bands
-        tile, tile_na_counts = replace_na_with_defaults(tile)
-        total_na_replaced += sum(tile_na_counts.values())
-        for band_idx, count in tile_na_counts.items():
-            na_per_band[band_idx] += count
 
         filtered_tiles.append(tile)
 
-    logger.info(f"Filtered to {len(filtered_tiles)} valid tiles (removed {filtered_out_count})")
-    if total_na_replaced > 0:
-        logger.info(f"Replaced {total_na_replaced} total NaN pixels with 0 across {len([b for b in na_per_band.values() if b > 0])} bands")
+    # Log filtering summary
+    total_rejected = missing_dep_count + low_dep_count + nan_count
+    logger.info(f"Filtered to {len(filtered_tiles)} valid tiles (removed {total_rejected})")
+    if total_rejected > 0:
+        logger.info(f"  - Missing dep_points: {missing_dep_count}")
+        logger.info(f"  - Low dep_points (<{args.min_dep_points}): {low_dep_count}")
+        logger.info(f"  - NaN in target raster: {nan_count}")
+
+    # Write rejected tiles log (detailed info for debugging)
+    rejected_log_path = output_dir / 'rejected_tiles.log'
+    with open(rejected_log_path, 'w') as f:
+        f.write("tile_id,reason,nan_bands\n")
+        for tile_id, reason, nan_bands in rejected_tiles:
+            nan_bands_str = ';'.join(map(str, nan_bands)) if nan_bands else ''
+            f.write(f"{tile_id},{reason},{nan_bands_str}\n")
+    logger.info(f"Rejected tiles log: {rejected_log_path}")
 
     if len(filtered_tiles) == 0:
-        logger.error("No valid tiles found after filtering!")
-        return
+        raise ValueError("No valid tiles found after filtering!")
 
     # ============================================================================
-    # STEP 3b: APPLY LOG TRANSFORM TO TFL (if enabled)
-    # ============================================================================
-    if args.use_log_tfl:
-        logger.info("\n" + "="*80)
-        logger.info("STEP 3b: APPLY LOG TRANSFORM TO TFL BAND")
-        logger.info("="*80)
-        logger.info("Applying log(x+1) transform to TFL band (index 7 = band 8)")
-
-        n_transformed = apply_log_transform_to_tfl(filtered_tiles, tfl_band_index=7)
-        logger.info(f"Transformed {n_transformed} tiles")
-    else:
-        logger.info("\nSkipping TFL log transform (--no-log-tfl specified)")
-
-    # ============================================================================
-    # STEP 4: RANDOM SHUFFLE AND TRAIN/VAL SPLIT
+    # STEP 4: TRAIN/VAL SPLIT (spatial or random)
     # ============================================================================
     logger.info("\n" + "="*80)
-    logger.info(f"STEP 4: RANDOM TRAIN/VAL SPLIT ({args.train_val_ratio*100:.0f}/{(1-args.train_val_ratio)*100:.0f})")
-    logger.info("="*80)
+    if args.geojson_file:
+        logger.info("STEP 4: SPATIAL TRAIN/VAL SPLIT (using validation polygons)")
+        logger.info("="*80)
 
-    random.shuffle(filtered_tiles)
-    split_idx = int(len(filtered_tiles) * args.train_val_ratio)
-    training_tiles = filtered_tiles[:split_idx]
-    validation_tiles = filtered_tiles[split_idx:]
+        training_tiles, validation_tiles = split_tiles_by_spatial_intersection(
+            filtered_tiles,
+            args.geojson_file,
+            crs='EPSG:32611'
+        )
+    else:
+        logger.info(f"STEP 4: RANDOM TRAIN/VAL SPLIT ({args.train_val_ratio*100:.0f}/{(1-args.train_val_ratio)*100:.0f})")
+        logger.info("="*80)
+
+        random.shuffle(filtered_tiles)
+        split_idx = int(len(filtered_tiles) * args.train_val_ratio)
+        training_tiles = filtered_tiles[:split_idx]
+        validation_tiles = filtered_tiles[split_idx:]
 
     logger.info(f"Training tiles: {len(training_tiles)}")
     logger.info(f"Validation tiles: {len(validation_tiles)}")
@@ -1170,25 +1210,19 @@ def main():
     logger.info(f"Saved TRAINING coordinate normalization stats to {coord_stats_path}")
 
     # ============================================================================
-    # STEP 6: COMPUTE FUEL METRICS STATISTICS (on TRAINING tiles only)
+    # STEP 6: COMPUTE TARGET RASTER STATISTICS (on TRAINING tiles only)
     # ============================================================================
     logger.info("\n" + "="*80)
-    logger.info("STEP 6: COMPUTE FUEL METRICS STATISTICS (TRAINING ONLY)")
+    logger.info("STEP 6: COMPUTE TARGET RASTER STATISTICS (TRAINING ONLY)")
     logger.info("="*80)
 
     fuel_stats_train = compute_normalization_stats(training_tiles)
 
-    # Add log transform flag to stats (so inference knows to apply exp(x) - 1)
-    fuel_stats_train['use_log_tfl'] = args.use_log_tfl
-    fuel_stats_train['tfl_band_index'] = 7  # TFL is band 8 (0-indexed: 7)
-    if args.use_log_tfl:
-        logger.info("  Note: TFL stats (band 8) computed on log(x+1) transformed values")
-
-    # Save TRAINING fuel metrics normalization stats
-    fuel_stats_path = output_dir / 'fuel_metrics_normalization_stats_train.json'
+    # Save TRAINING target raster normalization stats
+    fuel_stats_path = output_dir / 'target_raster_normalization_stats_train.json'
     with open(fuel_stats_path, 'w') as f:
         json.dump(fuel_stats_train, f, indent=2)
-    logger.info(f"Saved TRAINING fuel metrics normalization stats to {fuel_stats_path}")
+    logger.info(f"Saved TRAINING target raster normalization stats to {fuel_stats_path}")
 
     # ============================================================================
     # STEP 7: COMPUTE VALIDATION STATISTICS (for distribution shift analysis)
@@ -1215,10 +1249,10 @@ def main():
         json.dump(norm_stats_val_json, f, indent=2)
     logger.info(f"Saved validation coordinate stats (diagnostic) to {coord_stats_val_path}")
 
-    fuel_stats_val_path = output_dir / 'fuel_metrics_normalization_stats_val.json'
+    fuel_stats_val_path = output_dir / 'target_raster_normalization_stats_val.json'
     with open(fuel_stats_val_path, 'w') as f:
         json.dump(fuel_stats_val, f, indent=2)
-    logger.info(f"Saved validation fuel metrics stats (diagnostic) to {fuel_stats_val_path}")
+    logger.info(f"Saved validation target raster stats (diagnostic) to {fuel_stats_val_path}")
 
     # Report distribution shift
     report_distribution_shift(norm_stats_train, norm_stats_val, dataset_name="Validation")
@@ -1384,43 +1418,30 @@ def main():
     logger.info("Validation coordinate normalization complete")
 
     # ============================================================================
-    # STEP 10: APPLY FUEL METRICS NORMALIZATION TO TRAINING TILES
+    # STEP 10: APPLY TARGET RASTER NORMALIZATION TO TRAINING TILES
     # ============================================================================
     logger.info("\n" + "="*80)
-    logger.info("STEP 10: APPLY FUEL METRICS NORMALIZATION TO TRAINING TILES")
+    logger.info("STEP 10: APPLY TARGET RASTER NORMALIZATION TO TRAINING TILES")
     logger.info("="*80)
 
     for tile_idx, tile in enumerate(training_tiles):
-        normalize_fuel_metrics(tile, fuel_stats_train)
+        normalize_target_raster(tile, fuel_stats_train)
         if (tile_idx + 1) % 100 == 0:
             logger.info(f"  Normalized {tile_idx + 1}/{len(training_tiles)} training tiles...")
 
-    logger.info("Training fuel metrics normalization complete")
+    logger.info("Training target raster normalization complete")
 
     # ============================================================================
-    # STEP 11: APPLY FUEL METRICS NORMALIZATION TO VALIDATION TILES (using TRAINING stats)
+    # STEP 11: APPLY TARGET RASTER NORMALIZATION TO VALIDATION TILES (using TRAINING stats)
     # ============================================================================
     logger.info("\n" + "="*80)
-    logger.info("STEP 11: APPLY FUEL METRICS NORMALIZATION TO VALIDATION TILES (using TRAINING stats)")
+    logger.info("STEP 11: APPLY TARGET RASTER NORMALIZATION TO VALIDATION TILES (using TRAINING stats)")
     logger.info("="*80)
 
     for tile_idx, tile in enumerate(validation_tiles):
-        normalize_fuel_metrics(tile, fuel_stats_train)  # Use TRAINING stats!
+        normalize_target_raster(tile, fuel_stats_train)  # Use TRAINING stats!
         if (tile_idx + 1) % 50 == 0:
             logger.info(f"  Normalized {tile_idx + 1}/{len(validation_tiles)} validation tiles...")
-
-    # Replace remaining NaN values with sentinel (-999)
-    logger.info("\nReplacing remaining NaN values with sentinel (-999)...")
-    nan_replacement_count = 0
-
-    for tile in training_tiles + validation_tiles:
-        if 'fuel_metrics' in tile and tile['fuel_metrics'] is not None:
-            had_nans = torch.isnan(tile['fuel_metrics']).any()
-            replace_remaining_nans_with_sentinel(tile, sentinel_value=-999.0)
-            if had_nans:
-                nan_replacement_count += 1
-
-    logger.info(f"  Replaced NaN values in {nan_replacement_count} tiles")
 
     # Preprocess NAIP and UAVSAR imagery
     logger.info("\nPreprocessing NAIP imagery...")
@@ -1507,10 +1528,10 @@ def main():
     logger.info(f"Total: {len(training_tiles) + len(validation_tiles)}")
     logger.info(f"\nNormalization statistics (TRAINING - used for both train/val):")
     logger.info(f"  Coordinate stats: {coord_stats_path}")
-    logger.info(f"  Fuel metrics stats: {fuel_stats_path}")
+    logger.info(f"  Target raster stats: {fuel_stats_path}")
     logger.info(f"\nValidation statistics (diagnostic only):")
     logger.info(f"  Coordinate stats: {coord_stats_val_path}")
-    logger.info(f"  Fuel metrics stats: {fuel_stats_val_path}")
+    logger.info(f"  Target raster stats: {fuel_stats_val_path}")
     logger.info(f"\nOutput files:")
     logger.info(f"  Training: {train_output_path}")
     logger.info(f"  Validation: {val_output_path}")

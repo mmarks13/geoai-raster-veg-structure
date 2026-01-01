@@ -554,24 +554,17 @@ class NAIPEncoder(nn.Module):
             return torch.zeros(self.num_patches, self.embed_dim, device=device)  # [num_patches, embed_dim]
             
         T, C, H, W = x.shape  # [T, C, H, W]
-        
-        # Process each temporal acquisition
-        patch_embeds = []
-        for t in range(T):
-            # Get patch embeddings for this acquisition
-            patches = self.patch_embed(x[t].unsqueeze(0))  # [1, n_patches, embed_dim]
-            patches = patches.squeeze(0)  # [n_patches, embed_dim]
-            
-            # Add positional encoding
-            patches = self.pos_encoding(patches)  # [n_patches, embed_dim]
-            
-            # Apply transformer
-            patches = self.transformer_block(patches)  # [n_patches, embed_dim]
-            
-            patch_embeds.append(patches)
-        
-        # Stack along temporal dimension
-        patch_embeds = torch.stack(patch_embeds)  # [T, n_patches, embed_dim]
+
+        # Batched processing: process all T images at once instead of per-timestep loop
+        # patch_embed expects [B, C, H, W] and returns [B, n_patches, embed_dim]
+        patch_embeds = self.patch_embed(x)  # [T, n_patches, embed_dim]
+
+        # Add positional encoding (broadcast over T dimension)
+        # pos_encoding expects [n_patches, embed_dim] but handles [B, n_patches, embed_dim]
+        patch_embeds = patch_embeds + self.pos_encoding(None, n_patches=self.n_patches).unsqueeze(0)
+
+        # Apply transformer (already supports batched input with batch_first=True)
+        patch_embeds = self.transformer_block(patch_embeds)  # [T, n_patches, embed_dim]
         
         
         # Aggregate across temporal dimension, using dates if available

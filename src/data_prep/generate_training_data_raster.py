@@ -86,46 +86,42 @@ os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'  # Helps with network filesystems
 def get_processed_tile_ids(output_dir: str) -> set:
     """
     Scan existing H5 chunk files in output_dir and return set of already-processed tile IDs.
-    
+
     Used for resuming interrupted processing runs.
-    
+
     Parameters
     ----------
     output_dir : str
         Directory containing H5 chunk files
-        
+
     Returns
     -------
     set
-        Set of tile IDs (as integers) that have already been processed
+        Set of tile IDs (strings like 't01_t09_217793_3847397') that have already been processed
     """
     from pathlib import Path
-    
+
     processed_ids = set()
     h5_files = list(Path(output_dir).glob("*.h5"))
-    
+
     if not h5_files:
         return processed_ids
-    
+
     print(f"Scanning {len(h5_files)} existing H5 files for processed tile IDs...")
-    
+
     for h5_path in h5_files:
         try:
             with h5py.File(h5_path, 'r') as f:
-                # Extract tile IDs from group names (format: "tile_123")
+                # Extract tile IDs from group names (format: "tile_{tile_id}")
                 for group_name in f.keys():
                     if group_name.startswith('tile_'):
-                        try:
-                            tile_id = int(group_name.split('_')[1])
-                            processed_ids.add(tile_id)
-                        except (ValueError, IndexError):
-                            # Also try reading from attribute
-                            if 'tile_id' in f[group_name].attrs:
-                                processed_ids.add(int(f[group_name].attrs['tile_id']))
+                        # Extract everything after "tile_" prefix as the tile_id
+                        tile_id = group_name[5:]  # len("tile_") == 5
+                        processed_ids.add(tile_id)
         except Exception as e:
             print(f"Warning: Could not read {h5_path}: {e}")
             continue
-    
+
     print(f"Found {len(processed_ids)} already-processed tiles")
     return processed_ids
 
@@ -499,8 +495,10 @@ def _process_multiband_stack(items, item_metadata, reproj_bounds, target_crs, as
     
     try:
         minx_t, miny_t, maxx_t, maxy_t = reproj_bounds
-        width = math.ceil((maxx_t - minx_t) / out_resolution)
-        height = math.ceil((maxy_t - miny_t) / out_resolution)
+        # Use round() instead of ceil() - we define the output grid at known dimensions
+        # (e.g., 20m bbox / 0.5m res = exactly 40 pixels). Any deviation is float error.
+        width = round((maxx_t - minx_t) / out_resolution)
+        height = round((maxy_t - miny_t) / out_resolution)
         # Use rasterio's from_origin; note that the "origin" is the top-left corner.
         transform = from_origin(minx_t, maxy_t, out_resolution, out_resolution)
         if verbose:
@@ -677,9 +675,52 @@ def process_imagery_data(bbox, start_date, end_date, stac_source, assets=None, o
     return convert_stack_to_tensors(data_stack, metadata_list, bbox, out_resolution)
 
 
-def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:32611"):
+def parse_target_raster_map(map_string):
     """
-    Extract fuel metrics raster patch for a given tile bbox.
+    Parse a target raster map string into a dictionary.
+
+    Accepts either:
+    - Comma-separated site:path pairs: "site1:path1,site2:path2"
+    - Path to JSON file containing the mapping
+
+    Parameters
+    ----------
+    map_string : str
+        Either "site1:path1,site2:path2" format or path to JSON file
+
+    Returns
+    -------
+    dict
+        Mapping from site name to raster path
+    """
+    if map_string is None:
+        return None
+
+    # Check if it's a JSON file
+    if map_string.endswith('.json'):
+        with open(map_string, 'r') as f:
+            return json.load(f)
+
+    # Parse site:path,site:path format
+    raster_map = {}
+    for pair in map_string.split(','):
+        pair = pair.strip()
+        if ':' in pair:
+            site, path = pair.split(':', 1)
+            raster_map[site.strip()] = path.strip()
+        else:
+            # Single path without site - use as default
+            raster_map['_default_'] = pair
+
+    return raster_map
+
+
+def process_target_raster_data(bbox, raster_path, bbox_crs="EPSG:32611"):
+    """
+    Extract raster patch for a given tile bbox.
+
+    Generic function that extracts ALL bands from a raster, suitable for
+    any target raster (fuel metrics, vegetation structure metrics, etc.).
 
     Uses rasterio's one-step window + out_shape approach:
     - Creates window from bbox (restricts source pixels to bbox)
@@ -690,8 +731,8 @@ def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:326
     ----------
     bbox : tuple or list
         Bounding box (minx, miny, maxx, maxy) in bbox_crs coordinates
-    fuel_metrics_raster_path : str
-        Path to fuel metrics GeoTIFF (173 bands: 23 summary + 150 bulk density)
+    raster_path : str
+        Path to target GeoTIFF raster
     bbox_crs : str, optional
         CRS of the bounding box (default: EPSG:32611)
 
@@ -699,28 +740,29 @@ def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:326
     -------
     dict or None
         Dictionary containing:
-        - 'fuel_metrics': numpy array of shape [23, h, w] (summary bands only)
+        - 'target_raster': numpy array of shape [n_bands, h, w]
         - 'resolution': float (raster resolution in meters)
         - 'patch_shape': tuple (h, w)
-        - 'nodata_stats': dict with NA counts per band
+        - 'n_bands': int (number of bands extracted)
+        - 'nodata_stats': dict with summary statistics
         Returns None if tile is outside raster bounds or has no valid data
 
     Notes
     -----
-    - Only extracts bands 1-23 (summary metrics), ignoring bands 24-173 (bulk density profile)
+    - Extracts ALL bands from the raster (no hardcoded band selection)
     - Patch dimensions h=w=tile_size/resolution (e.g., 10m tile at 2m res → 5×5 pixels)
     - Uses src.read(window=..., out_shape=...) for one-step crop + resample
     - Window restricts source pixels to bbox, preventing neighbor contamination
     """
-    import rasterio
     from rasterio.windows import from_bounds
     from rasterio.enums import Resampling
     from pyproj import CRS
 
     try:
-        with rasterio.open(fuel_metrics_raster_path) as src:
+        with rasterio.open(raster_path) as src:
             # Get raster resolution (assuming square pixels)
             resolution = src.res[0]
+            n_bands = src.count
 
             # Validate CRS match (use same logic as create_tile_grid.py)
             expected_crs = CRS.from_epsg(32611)
@@ -736,57 +778,74 @@ def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:326
 
             if not is_valid_crs:
                 raise ValueError(
-                    f"Fuel metrics raster CRS mismatch. "
+                    f"Target raster CRS mismatch. "
                     f"Expected EPSG:32611, got {actual_crs.name}"
                 )
 
             # Calculate target dimensions
+            # Use round() instead of ceil() to avoid floating-point errors
+            # e.g., 10.0000001 / 2.0 = 5.00000005, ceil() = 6, round() = 5
             minx, miny, maxx, maxy = bbox
-            width = math.ceil((maxx - minx) / resolution)
-            height = math.ceil((maxy - miny) / resolution)
+            width = round((maxx - minx) / resolution)
+            height = round((maxy - miny) / resolution)
 
             # Create window from bbox (restricts source pixels)
             window = from_bounds(minx, miny, maxx, maxy, transform=src.transform)
 
+            # Read ALL bands
+            band_indices = list(range(1, n_bands + 1))
+
             # One-step read with window + out_shape + resampling
             # This crops to bbox AND resamples to exact dimensions
             data = src.read(
-                indexes=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23],  # Skip Band 22 (corrupted PAI_understory)
-                window=window,               # Restricts to bbox pixels
-                out_shape=(22, height, width),  # 22 bands (Band 22 removed)
-                resampling=Resampling.bilinear,  # Bilinear interpolation
-                boundless=False,             # Don't read outside raster bounds
-                fill_value=np.nan            # Use NaN for nodata
+                indexes=band_indices,
+                window=window,
+                out_shape=(n_bands, height, width),
+                resampling=Resampling.bilinear,
+                boundless=False,
+                fill_value=np.nan
             )
 
             # Check if patch has any valid data
             if np.all(np.isnan(data)):
                 return None
 
-            # Calculate NA statistics per band for monitoring
-            nodata_stats = {}
-            for i, band_idx in enumerate([3, 8, 12]):  # Height, TFL, Canopy_cover
-                band_data = data[band_idx - 1, :, :]
-                n_total = band_data.size
-                n_na = np.isnan(band_data).sum()
-                nodata_stats[f'band_{band_idx}'] = {
-                    'n_total': n_total,
-                    'n_na': n_na,
-                    'pct_na': 100 * n_na / n_total if n_total > 0 else 0
-                }
+            # Calculate generic NA statistics
+            nodata_stats = {
+                'total_pixels': data[0].size,
+                'bands_with_any_nan': int(np.any(np.isnan(data), axis=(1, 2)).sum()),
+                'all_nan': bool(np.all(np.isnan(data)))
+            }
 
             return {
-                'fuel_metrics': data,
+                'target_raster': data,
                 'resolution': resolution,
                 'patch_shape': (height, width),
+                'n_bands': n_bands,
                 'nodata_stats': nodata_stats
             }
 
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
-        logger.error(f"Error processing fuel metrics for bbox {bbox}: {e}")
+        logger.error(f"Error processing target raster for bbox {bbox}: {e}")
         return None
+
+
+def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:32611"):
+    """
+    Extract fuel metrics raster patch for a given tile bbox.
+
+    DEPRECATED: Use process_target_raster_data() for new code.
+    This function is kept for backward compatibility.
+
+    Calls process_target_raster_data() and renames the output key for compatibility.
+    """
+    result = process_target_raster_data(bbox, fuel_metrics_raster_path, bbox_crs)
+    if result is not None:
+        # Rename key for backward compatibility
+        result['fuel_metrics'] = result.pop('target_raster')
+    return result
 
 
 def bounding_box_to_geojson(bbox):
@@ -1592,6 +1651,18 @@ def process_bbox(args):
     dep_stac_source = args[18] if len(args) > 18 else None
     tile_properties = args[19] if len(args) > 19 else None
     fuel_metrics_raster = args[20] if len(args) > 20 else None
+    target_raster_map = args[21] if len(args) > 21 else None
+
+    # Resolve target raster path from map if provided
+    target_raster_path = None
+    if target_raster_map:
+        site = tile_properties.get('site') if tile_properties else None
+        if site and site in target_raster_map:
+            target_raster_path = target_raster_map[site]
+        elif '_default_' in target_raster_map:
+            target_raster_path = target_raster_map['_default_']
+        elif site:
+            print(f"Warning: No raster mapping found for site '{site}' in tile {tile_id}")
 
     # Calculate the overall tile number for progress reporting
     overall_tile_index = current_tile_index + i
@@ -1606,6 +1677,7 @@ def process_bbox(args):
     dep_pnt_attr = None
     bbox_wgs84 = None
     uavsar_data = None
+    target_raster_data = None
     naip_data = None
     
     try:
@@ -1843,6 +1915,30 @@ def process_bbox(args):
             else:
                 result['has_fuel_metrics'] = False
 
+        # Process target raster if path is provided (generic multi-site support)
+        if target_raster_path:
+            if verbose:
+                print(f"Processing target raster for tile {tile_id} from {target_raster_path}")
+
+            target_raster_data = process_target_raster_data(
+                bbox=bbox,
+                raster_path=target_raster_path,
+                bbox_crs=bbox_crs
+            )
+
+            # Add target raster data to the result dict
+            if target_raster_data:
+                result['has_target_raster'] = True
+
+                # Add each key from target_raster_data with 'target_raster_' prefix
+                for key, value in target_raster_data.items():
+                    if key == 'target_raster':
+                        result['target_raster'] = value  # The actual raster data
+                    else:
+                        result[f'target_raster_{key}'] = value
+            else:
+                result['has_target_raster'] = False
+
         # Print progress with overall count if total_tiles is provided
         if total_tiles > 0:
             imagery_status = []
@@ -1906,7 +2002,9 @@ def process_bbox(args):
             del uavsar_data
         if naip_data is not None:
             del naip_data
-            
+        if target_raster_data is not None:
+            del target_raster_data
+
         # Force garbage collection
         gc.collect()
 
@@ -1940,7 +2038,8 @@ def process_chunk(
     min_uav_points=1000,
     skip_uav_lidar=False,
     dep_stac_source=None,
-    fuel_metrics_raster=None
+    fuel_metrics_raster=None,
+    target_raster_map=None
 ):
     """
     Process a single chunk of tiles and save results as HDF5 files.
@@ -1952,7 +2051,7 @@ def process_chunk(
     # Prepare arguments for parallel processing, including voxel downsampling parameters
     args_list = [
         (i, tile_id, bbox, start_date, end_date, lidar_stac_source, bbox_crs, max_api_retries, initial_retry_delay,
-         current_tile_index + i, total_tiles, verbose, uavsar_stac_source, naip_stac_source, initial_voxel_size_cm, max_points_list, min_uav_points, skip_uav_lidar, dep_stac_source, tile_properties, fuel_metrics_raster)
+         current_tile_index + i, total_tiles, verbose, uavsar_stac_source, naip_stac_source, initial_voxel_size_cm, max_points_list, min_uav_points, skip_uav_lidar, dep_stac_source, tile_properties, fuel_metrics_raster, target_raster_map)
         for i, (tile_id, bbox, tile_properties) in enumerate(chunk, start=1)
     ]
     
@@ -2235,6 +2334,7 @@ def process_tiles_from_geojson(
     skip_uav_lidar=False,
     dep_stac_source=None,
     fuel_metrics_raster=None,
+    target_raster_map=None,
     resume=False
 ):
     """
@@ -2406,9 +2506,10 @@ def process_tiles_from_geojson(
             min_uav_points,
             skip_uav_lidar,
             dep_stac_source,
-            fuel_metrics_raster
+            fuel_metrics_raster,
+            target_raster_map
         )
-        
+
         # Give the system a moment to recover between chunks
         time.sleep(2)
         
@@ -2485,9 +2586,10 @@ def process_tiles_from_geojson(
                 min_uav_points,
                 skip_uav_lidar,
                 dep_stac_source,
-                fuel_metrics_raster
+                fuel_metrics_raster,
+                target_raster_map
             )
-            
+
             # Give the system more time to recover between retry chunks
             time.sleep(5)
             
@@ -2682,7 +2784,16 @@ if __name__ == "__main__":
         "--fuel-metrics-raster",
         type=str,
         default=None,
-        help="Path to fuel metrics GeoTIFF raster (173 bands: 23 summary + 150 bulk density)"
+        help="Path to fuel metrics GeoTIFF raster (173 bands: 23 summary + 150 bulk density). "
+             "DEPRECATED: Use --target-raster-map for multi-site support."
+    )
+
+    parser.add_argument(
+        "--target-raster-map",
+        type=str,
+        default=None,
+        help="Site-to-raster mapping for multi-site processing. Format: 'site1:path1,site2:path2' "
+             "or path to JSON file. Tiles are routed to the correct raster based on their 'site' property."
     )
 
     parser.add_argument(
@@ -2692,6 +2803,12 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Parse target raster map if provided
+    target_raster_map = None
+    if args.target_raster_map:
+        target_raster_map = parse_target_raster_map(args.target_raster_map)
+        print(f"Loaded target raster map with {len(target_raster_map)} site(s)")
 
     # Call processing function with the given tiles and other parameters
     process_tiles_from_geojson(
@@ -2716,5 +2833,6 @@ if __name__ == "__main__":
         skip_uav_lidar=args.skip_uav_lidar,
         dep_stac_source=args.dep_stac_source,
         fuel_metrics_raster=args.fuel_metrics_raster,
+        target_raster_map=target_raster_map,
         resume=args.resume
     )

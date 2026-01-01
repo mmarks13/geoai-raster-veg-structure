@@ -2,17 +2,17 @@
 """
 Data Augmentation for Raster-Based Model
 
-Extends point cloud augmentation functions to handle fuel metrics rasters [22, h, w].
+Extends point cloud augmentation functions to handle fuel metrics rasters [n_bands, h, w].
 
 Key principle:
   - Geometric transforms (rotation, reflection): Applied to BOTH inputs AND fuel_metrics
   - Intensity/noise augmentation: Applied to inputs ONLY
   - Ensures spatial correspondence between inputs and targets
 
-RASTER MODEL AUGMENTATION STRATEGY (Phase 1):
-  Addresses distribution gaps between training data (Volcan) and forest plots:
+RASTER MODEL AUGMENTATION STRATEGY:
+  Addresses distribution gaps between training data and inference sites:
   - Gap 2: Aggressive sparse point removal (simulates ultra-sparse 3DEP tiles)
-  - Gap 3: UAVSAR temporal augmentation (duplication/subsampling for sequence length variance)
+  - Gap 3: Temporal subsampling for NAIP and UAVSAR (handles natural variation: NAIP 5-10 images, UAVSAR 4-15 frames)
   - Gap 1: Modality dropout handled in training loop (not here)
 
 Usage:
@@ -58,29 +58,29 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RASTER_AUGMENTATION_CONFIG = {
     # Geometric transforms (applied to BOTH inputs and targets)
-    'rotate_probability': 0.9,
+    'rotate_probability': 1.0,
     'reflect_probability': 0.5,
     
     # Point cloud augmentations (inputs only)
-    'jitter_probability': 0.2,
-    'jitter_xy_scale': 0.02,
-    'jitter_z_scale': 0.01,
+    'jitter_probability': 0.0,
+    'jitter_xy_scale': 0.05,
+    'jitter_z_scale': 0.02,
     
-    'add_points_probability': 0.1,
+    'add_points_probability': 0.15,
     'add_points_ratio': 0.05,
-    'add_points_max_distance': 0.02,
+    'add_points_max_distance': 0.06,
     
     # Regular point removal (mild sparsification)
-    'remove_points_probability': 0.3,
+    'remove_points_probability': 0.0,
     'remove_points_ratio': 0.05,
     
     # RASTER MODEL: Aggressive sparse removal (Gap 2 - simulates ultra-sparse 3DEP tiles)
-    # 50% of tiles get heavy point removal (50-90% of points removed)
-    # Floor of 50 points ensures grid attention still works
-    'aggressive_sparse_probability': 0.5,
-    'aggressive_sparse_min_ratio': 0.5,  # Remove at least 50% of points
-    'aggressive_sparse_max_ratio': 0.9,  # Remove up to 90% of points
-    'aggressive_sparse_min_points': 20,  # Never go below 20 points
+    # X% of tiles get heavy point removal 
+    # Floor of X points ensures grid attention still works
+    'aggressive_sparse_probability': 0.7,
+    'aggressive_sparse_min_ratio': 0.05,  # Remove at least X% of points
+    'aggressive_sparse_max_ratio': 0.9,  # Remove up to X% of points
+    'aggressive_sparse_min_points': 20,  # Never go below X points
 
     # Spatial masking
     'mask_points_probability': 0.0,
@@ -99,15 +99,15 @@ DEFAULT_RASTER_AUGMENTATION_CONFIG = {
     'horizontal_slice_max_removal_ratio': 0.8,
     
     # Temporal augmentations (inputs only)
-    'temporal_shift_probability': 0.2,  # Disabled: shifts dates, not useful
-    'max_shift_days': 30,
-    
-    # RASTER MODEL: UAVSAR temporal sequence augmentation (Gap 3)
-    # Addresses sequence length mismatch: Training=15 frames, BluffMesa/NorthBigBear=4 frames
-    'uavsar_temporal_duplicate_probability': 0.0,  # Duplicate short sequences
-    'uavsar_temporal_duplicate_target_frames': 15,  # Target number of frames after duplication
-    'uavsar_temporal_subsample_probability': 0.05,  # Subsample long sequences
-    'uavsar_temporal_subsample_min_frames': 1,  # Can go down to 1 frame
+    'temporal_shift_probability': 0.2,
+    'max_shift_days': 90,
+
+    # RASTER MODEL: Temporal sequence subsampling (addresses natural variation in acquisition counts)
+    # NAIP: 5-10 images depending on quad boundaries; UAVSAR: 4-15 images across sites
+    'naip_temporal_subsample_probability': 0.2,  # Subsample NAIP sequences
+    'naip_temporal_subsample_min_frames': 3,  # Minimum NAIP frames 
+    'uavsar_temporal_subsample_probability': 0.2,  # Subsample UAVSAR sequences
+    'uavsar_temporal_subsample_min_frames': 1,  # Minimum UAVSAR frames
     
     # Attribute augmentations (inputs only)
     'attribute_augment_probability': 0.0,  # Disabled
@@ -115,11 +115,11 @@ DEFAULT_RASTER_AUGMENTATION_CONFIG = {
     'attribute_shift_range': (-0.1, 0.1),
     
     # Spectral augmentations (imagery inputs only)
-    'spectral_band_probability': 0.2,
+    'spectral_band_probability': 0.0,
     'band_scale_range': (0.9, 1.1),
     
     # Sensor effects (imagery inputs only)
-    'sensor_effects_probability': 0.2,
+    'sensor_effects_probability': 0.0,
     'sensor_effect_strength': 0.1,
     'uavsar_noise_variance': 0.1,
     
@@ -199,7 +199,7 @@ def duplicate_uavsar_temporally(tile, target_frames=15):
     
     This addresses Gap 3: Training data has 15 UAVSAR acquisition events (T), but forest plots
     (BluffMesa, NorthBigBear) have only 4. By duplicating acquisition events during
-    augmentation, the model learns to handle the GRU temporal encoder with
+    augmentation, the model learns to handle the temporal encoder with
     varying effective sequence lengths.
     
     UAVSAR format: [T, G_max, n_bands, h, w] where:
@@ -334,6 +334,67 @@ def subsample_uavsar_temporally(tile, min_frames=1):
     return tile_copy
 
 
+def subsample_naip_temporally(tile, min_frames=2):
+    """
+    RASTER MODEL: Subsample NAIP temporal sequence to vary sequence length.
+
+    This provides data augmentation by randomly reducing the number of NAIP
+    acquisition images, helping the model be robust to varying temporal coverage.
+    Natural variation exists (5-10 images depending on NAIP quad boundaries), and
+    this augmentation extends that variability.
+
+    NAIP format: [n_images, n_bands, h, w] where n_bands=4 (RGBN)
+
+    Strategy: Randomly select a subset of images (preserving temporal order).
+
+    Parameters:
+        tile (dict): Tile with 'naip' dict containing 'images' [n_images, 4, h, w]
+        min_frames (int): Minimum number of images to keep (default 2)
+
+    Returns:
+        dict: Tile with subsampled NAIP images
+    """
+    tile_copy = copy.deepcopy(tile)
+
+    if 'naip' not in tile_copy or tile_copy['naip'] is None:
+        return tile_copy
+
+    naip_data = tile_copy['naip']
+
+    if 'images' not in naip_data or naip_data['images'] is None:
+        return tile_copy
+
+    images = naip_data['images']  # [n_images, 4, h, w]
+
+    # Verify 4D format
+    if images.ndim != 4:
+        logger.warning(f"NAIP images have {images.ndim}D, expected 4D. Skipping temporal subsampling.")
+        return tile_copy
+
+    n_images = images.shape[0]  # Number of NAIP images
+
+    # Skip if already at minimum
+    if n_images <= min_frames:
+        return tile_copy
+
+    # Random number of images to keep (between min_frames and n_images-1)
+    n_keep = random.randint(min_frames, n_images - 1)
+
+    # Sorted random indices to preserve temporal order
+    keep_indices = sorted(random.sample(range(n_images), n_keep))
+    keep_indices = torch.tensor(keep_indices)
+
+    tile_copy['naip']['images'] = images[keep_indices]
+
+    # Also subsample relative_dates if present [n_images, 1] or [n_images]
+    if 'relative_dates' in naip_data and naip_data['relative_dates'] is not None:
+        rel_dates = naip_data['relative_dates']
+        if isinstance(rel_dates, torch.Tensor):
+            tile_copy['naip']['relative_dates'] = rel_dates[keep_indices]
+
+    return tile_copy
+
+
 # ============================================================================
 # Core Functions
 # ============================================================================
@@ -400,7 +461,7 @@ def renormalize_from_physical_space(tile):
 
 def rotate_fuel_metrics(tile, angle_degrees=None):
     """
-    Rotate fuel metrics raster [22, h, w] by specified angle.
+    Rotate fuel metrics raster [n_bands, h, w] by specified angle.
 
     Parameters:
         tile (dict): Tile with 'fuel_metrics' key
@@ -421,7 +482,7 @@ def rotate_fuel_metrics(tile, angle_degrees=None):
     if angle_degrees is None:
         angle_degrees = random.choice([90, 180, 270])
 
-    fuel_metrics = tile_copy['fuel_metrics']  # [22, h, w]
+    fuel_metrics = tile_copy['fuel_metrics']  # [n_bands, h, w]
 
     # Apply rotation to spatial dimensions (height, width)
     if angle_degrees == 90:
@@ -442,7 +503,7 @@ def rotate_fuel_metrics(tile, angle_degrees=None):
 
 def reflect_fuel_metrics(tile, axis='x'):
     """
-    Reflect fuel metrics raster [22, h, w] across specified axis.
+    Reflect fuel metrics raster [n_bands, h, w] across specified axis.
 
     Parameters:
         tile (dict): Tile with 'fuel_metrics' key
@@ -458,7 +519,7 @@ def reflect_fuel_metrics(tile, axis='x'):
     if 'fuel_metrics' not in tile_copy or tile_copy['fuel_metrics'] is None:
         return tile_copy
 
-    fuel_metrics = tile_copy['fuel_metrics']  # [22, h, w]
+    fuel_metrics = tile_copy['fuel_metrics']  # [n_bands, h, w]
 
     # Determine which dimensions to flip
     if axis == 'x':
@@ -589,20 +650,20 @@ def augment_tile_with_rasters(tile, config=None):
                 augmented_tile,
                 max_shift_days=config['max_shift_days']
             )
-        
-        # RASTER MODEL: UAVSAR temporal sequence augmentation (Gap 3)
-        # Duplicate short sequences to match training distribution (15 frames)
-        if random.random() < config.get('uavsar_temporal_duplicate_probability', 0.0):
-            augmented_tile = duplicate_uavsar_temporally(
+
+        # RASTER MODEL: Temporal sequence subsampling
+        # Subsample NAIP sequences to add temporal variation (natural variation: 5-10 images)
+        if random.random() < config.get('naip_temporal_subsample_probability', 0.0):
+            augmented_tile = subsample_naip_temporally(
                 augmented_tile,
-                target_frames=config.get('uavsar_temporal_duplicate_target_frames', 15)
+                min_frames=config.get('naip_temporal_subsample_min_frames', 2)
             )
-        
-        # Subsample long sequences to add variation
+
+        # Subsample UAVSAR sequences to add temporal variation
         if random.random() < config.get('uavsar_temporal_subsample_probability', 0.0):
             augmented_tile = subsample_uavsar_temporally(
                 augmented_tile,
-                min_frames=config.get('uavsar_temporal_subsample_min_frames', 1)
+                min_frames=config.get('uavsar_temporal_subsample_min_frames', 2)
             )
 
         # Attribute augmentation (disabled by default)
@@ -703,9 +764,9 @@ def validate_augmented_tile_raster(original_tile, augmented_tile, max_allowed_va
     if 'fuel_metrics' in augmented_tile:
         fm = augmented_tile['fuel_metrics']
         if fm is not None:
-            # Check dimensions [22, h, w]
-            if len(fm.shape) != 3 or fm.shape[0] != 22:
-                raise ValueError(f"Invalid fuel_metrics shape: {fm.shape}, expected [22, h, w]")
+            # Check dimensions [n_bands, h, w] - don't hardcode band count
+            if len(fm.shape) != 3:
+                raise ValueError(f"Invalid fuel_metrics shape: {fm.shape}, expected [n_bands, h, w]")
             # Check for NaN/Inf (but allow -999 sentinel value)
             if torch.isnan(fm).any():
                 raise ValueError("NaN values in fuel_metrics")
@@ -742,9 +803,9 @@ def main():
         help='Disable aggressive sparse point removal (Gap 2)'
     )
     parser.add_argument(
-        '--disable_uavsar_temporal',
-        action='store_true', 
-        help='Disable UAVSAR temporal augmentation (Gap 3)'
+        '--disable_temporal_subsampling',
+        action='store_true',
+        help='Disable temporal subsampling for both NAIP and UAVSAR'
     )
 
     args = parser.parse_args()
@@ -765,12 +826,12 @@ def main():
     if args.disable_aggressive_sparse:
         config['aggressive_sparse_probability'] = 0.0
         logger.info("Aggressive sparse point removal DISABLED")
-    
-    if args.disable_uavsar_temporal:
-        config['uavsar_temporal_duplicate_probability'] = 0.0
+
+    if args.disable_temporal_subsampling:
+        config['naip_temporal_subsample_probability'] = 0.0
         config['uavsar_temporal_subsample_probability'] = 0.0
-        logger.info("UAVSAR temporal augmentation DISABLED")
-    
+        logger.info("Temporal subsampling (NAIP and UAVSAR) DISABLED")
+
     # Log key augmentation settings
     logger.info("\nAugmentation Configuration:")
     logger.info(f"  Geometric: rotate={config['rotate_probability']:.0%}, reflect={config['reflect_probability']:.0%}")
@@ -778,8 +839,8 @@ def main():
     logger.info(f"  Point removal (aggressive): {config['aggressive_sparse_probability']:.0%} prob, "
                 f"{config['aggressive_sparse_min_ratio']:.0%}-{config['aggressive_sparse_max_ratio']:.0%} ratio, "
                 f"floor={config['aggressive_sparse_min_points']} pts")
-    logger.info(f"  UAVSAR temporal: duplicate={config['uavsar_temporal_duplicate_probability']:.0%}, "
-                f"subsample={config['uavsar_temporal_subsample_probability']:.0%}")
+    logger.info(f"  Temporal subsampling: NAIP={config['naip_temporal_subsample_probability']:.0%} (min={config['naip_temporal_subsample_min_frames']}), "
+                f"UAVSAR={config['uavsar_temporal_subsample_probability']:.0%} (min={config['uavsar_temporal_subsample_min_frames']})")
     logger.info(f"  Min points after augmentation: {config['min_points_after_augmentation']}")
 
     # Augment dataset

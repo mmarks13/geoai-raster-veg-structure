@@ -687,7 +687,7 @@ class PreLNResidualBlock(nn.Module):
     Pre-LayerNorm residual block: x = x + DropPath(MLP(LayerNorm(x)))
 
     Architecture:
-        LayerNorm → Linear → GELU → Dropout → Linear → Dropout
+        LayerNorm → Linear → GELU → Dropout → Linear
         + stochastic depth on residual connection
 
     Args:
@@ -696,15 +696,14 @@ class PreLNResidualBlock(nn.Module):
         drop_path: Stochastic depth probability (0.0 = disabled)
     """
 
-    def __init__(self, feature_dim: int, dropout: float = 0.35, drop_path: float = 0.0):
+    def __init__(self, feature_dim: int, dropout: float = 0.10, drop_path: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(feature_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
+            nn.Linear(feature_dim, feature_dim*2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(feature_dim, feature_dim),
-            nn.Dropout(dropout)
+            nn.Linear(feature_dim*2, feature_dim)
         )
         # Stochastic depth - drops entire residual branch with probability drop_path
         self.drop_path = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
@@ -742,6 +741,7 @@ class RasterPredictionHead(nn.Module):
         pre_agg_k_neighbors: KNN neighbors for pre-aggregation (default 15)
         position_encoding_dim: Position encoding dimension (default 24)
         point_attn_drop_path: Stochastic depth for PosAwareGlobalFlashAttention in pre-agg blocks (default 0.0)
+        use_v2_attention: Use PosAwareGlobalFlashAttentionV2 with decoupled Q/K/V (default False)
     """
 
     def __init__(
@@ -764,7 +764,8 @@ class RasterPredictionHead(nn.Module):
         pre_agg_dropout: float = 0.1,
         pre_agg_k_neighbors: int = 15,
         position_encoding_dim: int = 24,
-        point_attn_drop_path: float = 0.0
+        point_attn_drop_path: float = 0.0,
+        use_v2_attention: bool = False
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -784,7 +785,8 @@ class RasterPredictionHead(nn.Module):
                     dropout=pre_agg_dropout,
                     up_ratio=None,  # No upsampling
                     k_neighbors=pre_agg_k_neighbors,
-                    global_drop_path=point_attn_drop_path
+                    global_drop_path=point_attn_drop_path,
+                    use_v2_attention=use_v2_attention
                 )
                 for _ in range(num_pre_agg_blocks)
             ])

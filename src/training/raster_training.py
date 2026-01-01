@@ -27,7 +27,6 @@ except ImportError:
     HAS_TENSORBOARD = False
     print("Warning: TensorBoard not available")
 
-import subprocess
 
 # Import raster-specific components
 from src.models.multimodal_raster_model import MultimodalRasterPredictor, MultimodalRasterConfig
@@ -110,30 +109,17 @@ def compute_correlation_loss(predictions: torch.Tensor, targets: torch.Tensor) -
     return corr_loss.mean()
 
 
-def get_gpu_stats() -> Optional[dict]:
-    """Get GPU memory and utilization stats via nvidia-smi subprocess.
+def get_gpu_stats_native(device_id: int = 0) -> dict:
+    """Get GPU memory stats using PyTorch native functions (no subprocess).
 
-    Returns dict with 'gpus' list containing per-GPU stats, or None on failure.
+    Returns dict with memory stats in GB for the specified device.
+    Note: GPU utilization % requires nvidia-smi and is not available via PyTorch.
     """
-    try:
-        result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=memory.used,memory.total,utilization.gpu',
-             '--format=csv,nounits,noheader'],
-            capture_output=True, text=True, timeout=1.0
-        )
-        lines = result.stdout.strip().split('\n')
-        stats = {'gpus': []}
-        for line in lines:
-            parts = line.split(', ')
-            if len(parts) == 3:
-                stats['gpus'].append({
-                    'memory_used_mb': int(parts[0]),
-                    'memory_total_mb': int(parts[1]),
-                    'utilization_pct': int(parts[2])
-                })
-        return stats
-    except Exception:
-        return None
+    return {
+        'memory_allocated_gb': torch.cuda.memory_allocated(device_id) / (1024 ** 3),
+        'memory_reserved_gb': torch.cuda.memory_reserved(device_id) / (1024 ** 3),
+        'max_memory_allocated_gb': torch.cuda.max_memory_allocated(device_id) / (1024 ** 3),
+    }
 
 
 def create_raster_shards(data_list: List, world_size: int, temp_dir: str, prefix: str) -> List[str]:
@@ -219,9 +205,6 @@ def process_raster_batch(
     is_training: bool = True,
     rank: int = 0,
     logger: Optional[logging.Logger] = None,
-    training_edge_dropout: float = 0.0,
-    training_modality_dropout_naip: float = 0.0,
-    training_modality_dropout_uavsar: float = 0.0,
     correlation_loss_weight: float = 0.0,
     huber_delta: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -230,7 +213,8 @@ def process_raster_batch(
 
     Args:
         model: Raster prediction model
-        batch: 12-element tuple from raster_variable_size_collate
+        batch: 11-element tuple from raster_variable_size_collate
+               (edge_index removed - global-only attention doesn't use KNN graphs)
         device: Device to run on
         use_naip: Whether NAIP imagery is used
         use_uavsar: Whether UAVSAR imagery is used
@@ -248,57 +232,34 @@ def process_raster_batch(
         - per_band_losses: Dict with per-band MSE losses, huber_loss, and correlation loss
         - diagnostics: Dict with batch status and bad tile info
     """
-    # Unpack batch (12 elements)
-    (dep_points_batch, fuel_metrics_batch, edge_index_batch, dep_points_attr_batch,
+    # Unpack batch (11 elements - edge_index removed for global-only attention)
+    (dep_points_batch, fuel_metrics_batch, dep_points_attr_batch,
      naip_data_batch, uavsar_data_batch, centers, scales, bboxes, tile_ids,
      norm_params_list, batch_indices) = batch
 
     # Move tensors to device
     dep_points_batch = dep_points_batch.to(device)
     fuel_metrics_batch = fuel_metrics_batch.to(device)
-    edge_index_batch = edge_index_batch.to(device)
     dep_points_attr_batch = dep_points_attr_batch.to(device)
     batch_indices = batch_indices.to(device)
     bboxes = bboxes.to(device) if bboxes is not None else None
-
-    # =========================================================================
-    # Training-time dropout (applied during training only, not validation)
-    # These are SEPARATE from augmentation-time dropout
-    # =========================================================================
-
-    # Edge dropout: randomly mask edges in KNN graph for sparse-robustness
-    # This only changes input data, not model structure - safe for DDP
-    if is_training and training_edge_dropout > 0:
-        n_edges = edge_index_batch.shape[1]
-        edge_keep_mask = torch.rand(n_edges, device=device) > training_edge_dropout
-        edge_index_batch = edge_index_batch[:, edge_keep_mask]
 
     # Handle imagery data (list of dicts)
     naip_data = naip_data_batch if use_naip else None
     uavsar_data = uavsar_data_batch if use_uavsar else None
 
-    # Modality dropout: randomly drop modalities per-tile for modality-robustness
-    # IMPORTANT: We NEVER set the entire modality to None during training
-    # because that would change the computation graph and break DDP.
-    # Instead, we keep per-tile None entries - the encoder handles this gracefully.
-    if is_training and naip_data is not None and training_modality_dropout_naip > 0:
-        import random
-        naip_data = [
-            None if random.random() < training_modality_dropout_naip else tile_naip
-            for tile_naip in naip_data
-        ]
+    # ====== GPU Training Augmentation (Geometric) ======
+    # Applied in training loop because it needs access to targets (fuel_metrics)
+    if is_training and hasattr(model, 'training_aug'):
+        (dep_points_batch, naip_data, uavsar_data, fuel_metrics_batch) = \
+            model.training_aug.augment_batch_geometric(
+                dep_points_batch, batch_indices, naip_data, uavsar_data, fuel_metrics_batch
+            )
 
-    if is_training and uavsar_data is not None and training_modality_dropout_uavsar > 0:
-        import random
-        uavsar_data = [
-            None if random.random() < training_modality_dropout_uavsar else tile_uavsar
-            for tile_uavsar in uavsar_data
-        ]
-
-    # Forward pass
+    # Forward pass (edge_index=None for global-only attention)
     predictions = model(
         dep_points=dep_points_batch,
-        edge_index=edge_index_batch,
+        edge_index=None,
         batch_indices=batch_indices,
         norm_params=norm_params_list,
         dep_attr=dep_points_attr_batch,
@@ -466,6 +427,16 @@ def train_one_epoch_ddp(
     running_sum_grad_norm = torch.zeros(1, device=device)
     n_optimizer_steps_local = 0
 
+    # NOTE: Per-module gradient norm tracking DISABLED for optimizer speed
+    # Uncomment below if debugging gradient flow issues
+    # module_grad_norms = {
+    #     'feature_extractor': {'sum': 0.0, 'max': 0.0, 'count': 0},
+    #     'naip_encoder': {'sum': 0.0, 'max': 0.0, 'count': 0},
+    #     'uavsar_encoder': {'sum': 0.0, 'max': 0.0, 'count': 0},
+    #     'fusion': {'sum': 0.0, 'max': 0.0, 'count': 0},
+    #     'raster_head': {'sum': 0.0, 'max': 0.0, 'count': 0},
+    # }
+
     # Overall running statistics for variance/correlation metrics
     running_sum_pred = torch.zeros(1, device=device)
     running_sum_targ = torch.zeros(1, device=device)
@@ -474,6 +445,11 @@ def train_one_epoch_ddp(
     running_sum_cross = torch.zeros(1, device=device)
     running_mae = torch.zeros(1, device=device)
     n_samples = 0
+
+    # Pre-allocate tensors for epoch-end all_reduce (avoids repeated allocations)
+    batch_count_tensor = torch.zeros(1, device=device, dtype=torch.long)
+    n_samples_tensor = torch.zeros(1, device=device, dtype=torch.long)
+    n_optimizer_steps_tensor = torch.zeros(1, device=device, dtype=torch.long)
 
     for batch_idx, batch in enumerate(train_loader):
         # Track data loading time
@@ -490,28 +466,22 @@ def train_one_epoch_ddp(
                 is_training=True,
                 rank=rank,
                 logger=logger,
-                training_edge_dropout=config.training_edge_dropout,
-                training_modality_dropout_naip=config.training_modality_dropout_naip,
-                training_modality_dropout_uavsar=config.training_modality_dropout_uavsar,
                 correlation_loss_weight=config.correlation_loss_weight,
                 huber_delta=config.huber_delta
             )
         forward_time += (time.time() - forward_start)
 
-        # Synchronize skip decision across all GPUs (critical for DDP)
-        # If ANY GPU has invalid loss, ALL GPUs must skip to avoid gradient sync deadlock
-        skip_batch = int(not diagnostics['loss_is_valid'] or diagnostics['all_bad'])
-        skip_batch_tensor = torch.tensor(skip_batch, device=device, dtype=torch.int32)
-        dist.all_reduce(skip_batch_tensor, op=dist.ReduceOp.MAX)  # If any GPU wants to skip, all skip
-
-        if skip_batch_tensor.item() > 0:
-            # All GPUs skip this batch together
-            if not diagnostics['loss_is_valid']:
-                n_bad_tiles += len(diagnostics['bad_tiles'])
-            if rank == 0 and logger and not diagnostics['loss_is_valid']:
-                logger.warning(f"Batch {batch_idx}: Skipping batch due to NaN loss (synchronized across all GPUs)")
-            batch_start_time = time.time()  # Reset timer for next batch
-            continue
+        # Handle invalid loss locally without global synchronization
+        # NOTE: Removed per-batch all_reduce for GPU efficiency. NaN losses should be
+        # extremely rare after preprocessing. If NaN occurs, we replace with zero loss
+        # to avoid DDP deadlock (all GPUs must participate in backward pass).
+        if not diagnostics['loss_is_valid'] or diagnostics['all_bad']:
+            n_bad_tiles += len(diagnostics['bad_tiles'])
+            if rank == 0 and logger:
+                logger.warning(f"Batch {batch_idx}: Invalid loss on GPU {rank}, using zero loss to avoid deadlock")
+            # Replace NaN loss with zero to keep DDP in sync (all GPUs must do backward)
+            loss = torch.zeros(1, device=device, requires_grad=True)
+            # Note: This batch contributes zero gradient but DDP stays synchronized
 
         # Scale loss for gradient accumulation
         scaled_loss = loss / accumulation_steps
@@ -557,13 +527,12 @@ def train_one_epoch_ddp(
         # NOTE: Per-batch TensorBoard logging removed for GPU efficiency
         # Epoch-level metrics are sufficient for monitoring
 
-        # GPU monitoring via subprocess (every 20 batches, minimal overhead)
+        # GPU monitoring via PyTorch native (every 20 batches, no subprocess overhead)
         if batch_idx % 20 == 0 and rank == 0 and writer is not None:
-            gpu_stats = get_gpu_stats()
-            if gpu_stats:
-                for gpu_idx, gpu in enumerate(gpu_stats['gpus']):
-                    writer.add_scalar(f'GPU/memory_used_mb_gpu{gpu_idx}', gpu['memory_used_mb'], current_batch_step)
-                    writer.add_scalar(f'GPU/utilization_pct_gpu{gpu_idx}', gpu['utilization_pct'], current_batch_step)
+            gpu_stats = get_gpu_stats_native(device.index if device.index is not None else 0)
+            writer.add_scalar('GPU/memory_allocated_gb', gpu_stats['memory_allocated_gb'], current_batch_step)
+            writer.add_scalar('GPU/memory_reserved_gb', gpu_stats['memory_reserved_gb'], current_batch_step)
+            writer.add_scalar('GPU/max_memory_allocated_gb', gpu_stats['max_memory_allocated_gb'], current_batch_step)
 
         # Optimizer step (every gradient_accumulation_steps)
         is_last_batch = (batch_idx == len(train_loader) - 1)
@@ -582,6 +551,34 @@ def train_one_epoch_ddp(
             running_max_grad_norm = torch.maximum(running_max_grad_norm, grad_norm_before_clip.unsqueeze(0))
             running_sum_grad_norm += grad_norm_before_clip
             n_optimizer_steps_local += 1
+
+            # NOTE: Per-module gradient norm tracking DISABLED for optimizer speed
+            # This was causing 10 CPU syncs per optimizer step on rank 0
+            # Uncomment below if debugging gradient flow issues
+            # if rank == 0:
+            #     base_model = model.module if hasattr(model, 'module') else model
+            #     module_prefixes = {
+            #         'feature_extractor': 'feature_extractor',
+            #         'naip_encoder': 'naip_encoder',
+            #         'uavsar_encoder': 'uavsar_encoder',
+            #         'fusion': 'fusion',
+            #         'raster_head': 'raster_head',
+            #     }
+            #     for cat, prefix in module_prefixes.items():
+            #         # Collect all gradients for this module
+            #         grads = [
+            #             p.grad.flatten()
+            #             for n, p in base_model.named_parameters()
+            #             if n.startswith(prefix) and p.grad is not None
+            #         ]
+            #         if grads:
+            #             all_grads = torch.cat(grads)
+            #             # Compute stats in bulk on GPU, single .item() call per module
+            #             module_norm = all_grads.norm().item()
+            #             module_max = all_grads.abs().max().item()
+            #             module_grad_norms[cat]['sum'] += module_norm
+            #             module_grad_norms[cat]['max'] = max(module_grad_norms[cat]['max'], module_max)
+            #             module_grad_norms[cat]['count'] += 1
 
             # NOTE: Per-batch gradient norm logging removed for GPU efficiency
             # Epoch-level max and mean gradient norms logged at epoch end
@@ -623,10 +620,10 @@ def train_one_epoch_ddp(
     dist.all_reduce(running_max_grad_norm, op=dist.ReduceOp.MAX)
     dist.all_reduce(running_sum_grad_norm, op=dist.ReduceOp.SUM)
 
-    # Reduce batch_count and n_samples across GPUs
-    batch_count_tensor = torch.tensor([batch_count], device=device)
-    n_samples_tensor = torch.tensor([n_samples], device=device)
-    n_optimizer_steps_tensor = torch.tensor([n_optimizer_steps_local], device=device)
+    # Reduce batch_count and n_samples across GPUs (reuse pre-allocated tensors)
+    batch_count_tensor.fill_(batch_count)
+    n_samples_tensor.fill_(n_samples)
+    n_optimizer_steps_tensor.fill_(n_optimizer_steps_local)
     dist.all_reduce(batch_count_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(n_samples_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(n_optimizer_steps_tensor, op=dist.ReduceOp.SUM)
@@ -704,27 +701,34 @@ def train_one_epoch_ddp(
         writer.add_scalar('Gradients/max_norm_epoch', max_grad_norm_epoch, epoch)
         writer.add_scalar('Gradients/mean_norm_epoch', mean_grad_norm_epoch, epoch)
 
+        # NOTE: Per-module gradient norm logging DISABLED (tracking was disabled above)
+        # for module_name, stats in module_grad_norms.items():
+        #     if stats['count'] > 0:
+        #         avg_norm = stats['sum'] / stats['count']
+        #         writer.add_scalar(f'Gradients_PerModule/{module_name}_avg', avg_norm, epoch)
+        #         writer.add_scalar(f'Gradients_PerModule/{module_name}_max', stats['max'], epoch)
+
         # Overall variance/correlation metrics (replacing per-band detailed metrics)
         writer.add_scalar('Variance/train_overall_pred_std', overall_pred_std, epoch)
         writer.add_scalar('Variance/train_overall_target_std', overall_targ_std, epoch)
         writer.add_scalar('Variance/train_overall_ratio', overall_variance_ratio, epoch)
         writer.add_scalar('Correlation/train_overall_pearson_r', overall_correlation, epoch)
-        writer.add_scalar('MAE/train_overall', overall_mae, epoch)
 
-        # Log timing breakdown
-        total_time = data_load_time + forward_time + backward_time + optimizer_time
-        if total_time > 0:
-            writer.add_scalar('Timing/data_load_time_s', data_load_time, epoch)
-            writer.add_scalar('Timing/forward_time_s', forward_time, epoch)
-            writer.add_scalar('Timing/backward_time_s', backward_time, epoch)
-            writer.add_scalar('Timing/optimizer_time_s', optimizer_time, epoch)
-            writer.add_scalar('Timing/total_time_s', total_time, epoch)
+        # Log timing breakdown (every 5 epochs to reduce overhead)
+        if epoch % 5 == 0:
+            total_time = data_load_time + forward_time + backward_time + optimizer_time
+            if total_time > 0:
+                writer.add_scalar('Timing/data_load_time_s', data_load_time, epoch)
+                writer.add_scalar('Timing/forward_time_s', forward_time, epoch)
+                writer.add_scalar('Timing/backward_time_s', backward_time, epoch)
+                writer.add_scalar('Timing/optimizer_time_s', optimizer_time, epoch)
+                writer.add_scalar('Timing/total_time_s', total_time, epoch)
 
-            # Percentages
-            writer.add_scalar('Timing/data_load_pct', 100 * data_load_time / total_time, epoch)
-            writer.add_scalar('Timing/forward_pct', 100 * forward_time / total_time, epoch)
-            writer.add_scalar('Timing/backward_pct', 100 * backward_time / total_time, epoch)
-            writer.add_scalar('Timing/optimizer_pct', 100 * optimizer_time / total_time, epoch)
+                # Percentages
+                writer.add_scalar('Timing/data_load_pct', 100 * data_load_time / total_time, epoch)
+                writer.add_scalar('Timing/forward_pct', 100 * forward_time / total_time, epoch)
+                writer.add_scalar('Timing/backward_pct', 100 * backward_time / total_time, epoch)
+                writer.add_scalar('Timing/optimizer_pct', 100 * optimizer_time / total_time, epoch)
 
     return {
         'loss': train_loss_avg,
@@ -788,6 +792,10 @@ def validate_one_epoch_ddp(
     running_ss_res = torch.zeros(1, device=device)  # For R²
     n_samples = 0
 
+    # Pre-allocate tensors for epoch-end all_reduce (avoids repeated allocations)
+    batch_count_tensor = torch.zeros(1, device=device, dtype=torch.long)
+    n_samples_tensor = torch.zeros(1, device=device, dtype=torch.long)
+
     # Per-band running statistics (for extended metrics every 5 epochs)
     do_extended_metrics = (epoch % 5 == 0)
     if do_extended_metrics:
@@ -813,14 +821,12 @@ def validate_one_epoch_ddp(
                     huber_delta=config.huber_delta
                 )
 
-                # Synchronize skip decision across all GPUs (critical for DDP)
-                skip_batch = int(not diagnostics['loss_is_valid'] or diagnostics['all_bad'])
-                skip_batch_tensor = torch.tensor(skip_batch, device=device, dtype=torch.int32)
-                dist.all_reduce(skip_batch_tensor, op=dist.ReduceOp.MAX)
-
-                if skip_batch_tensor.item() > 0:
-                    if rank == 0 and logger and not diagnostics['loss_is_valid']:
-                        logger.warning(f"Validation batch: Skipping due to NaN loss (synchronized)")
+                # Handle invalid loss locally without global synchronization
+                # NOTE: Removed per-batch all_reduce for GPU efficiency. In validation,
+                # we simply skip invalid batches locally since no backward pass is needed.
+                if not diagnostics['loss_is_valid'] or diagnostics['all_bad']:
+                    if rank == 0 and logger:
+                        logger.warning(f"Validation batch: Skipping due to invalid loss on GPU {rank}")
                     continue
 
                 # =====================================================================
@@ -893,9 +899,9 @@ def validate_one_epoch_ddp(
         dist.all_reduce(running_sum_sq_targ_per_band, op=dist.ReduceOp.SUM)
         dist.all_reduce(running_sum_cross_per_band, op=dist.ReduceOp.SUM)
 
-    # Reduce counts across GPUs
-    batch_count_tensor = torch.tensor([batch_count], device=device)
-    n_samples_tensor = torch.tensor([n_samples], device=device)
+    # Reduce counts across GPUs (reuse pre-allocated tensors)
+    batch_count_tensor.fill_(batch_count)
+    n_samples_tensor.fill_(n_samples)
     dist.all_reduce(batch_count_tensor, op=dist.ReduceOp.SUM)
     dist.all_reduce(n_samples_tensor, op=dist.ReduceOp.SUM)
 
@@ -975,34 +981,26 @@ def validate_one_epoch_ddp(
         writer.add_scalar('Variance/val_overall_ratio', overall_variance_ratio, epoch)
         writer.add_scalar('Correlation/val_overall_pearson_r', overall_correlation, epoch)
 
-        # Per-band extended metrics (every 5 epochs)
+        # Per-band extended metrics (every 5 epochs) - compute for metrics dict only
+        # TensorBoard per-band logging removed for GPU efficiency
         if do_extended_metrics and total_n_samples > 0:
-            n_samples_band_tensor = torch.tensor([n_samples_per_band], device=device)
-            dist.all_reduce(n_samples_band_tensor, op=dist.ReduceOp.SUM)
-            total_n_samples_band = n_samples_band_tensor.item()
-
+            total_n_samples_band = total_n_samples
             if total_n_samples_band > 0:
                 for band_idx in range(n_bands):
-                    # Per-band MAE
+                    # Per-band MAE (metrics dict only)
                     band_mae = running_mae_per_band[band_idx].item() / (total_n_samples_band / n_bands)
-                    writer.add_scalar(f'Val_Metrics/band_{band_idx}_mae', band_mae, epoch)
                     metrics[f'band_{band_idx}_mae'] = band_mae
 
-                    # Per-band variance/correlation
+                    # Per-band correlation (metrics dict only)
                     n_per_band = total_n_samples_band / n_bands
                     pred_mean_band = running_sum_pred_per_band[band_idx].item() / n_per_band
                     targ_mean_band = running_sum_targ_per_band[band_idx].item() / n_per_band
                     pred_var_band = (running_sum_sq_pred_per_band[band_idx].item() / n_per_band) - (pred_mean_band ** 2)
                     targ_var_band = (running_sum_sq_targ_per_band[band_idx].item() / n_per_band) - (targ_mean_band ** 2)
                     cov_band = (running_sum_cross_per_band[band_idx].item() / n_per_band) - (pred_mean_band * targ_mean_band)
-
                     pred_std_band = math.sqrt(max(pred_var_band, 0))
                     targ_std_band = math.sqrt(max(targ_var_band, 0))
                     corr_band = cov_band / (pred_std_band * targ_std_band + 1e-8) if pred_std_band > 1e-8 and targ_std_band > 1e-8 else 0.0
-
-                    writer.add_scalar(f'Variance/val_band_{band_idx}_pred_std', pred_std_band, epoch)
-                    writer.add_scalar(f'Variance/val_band_{band_idx}_target_std', targ_std_band, epoch)
-                    writer.add_scalar(f'Correlation/val_band_{band_idx}_pearson_r', corr_band, epoch)
                     metrics[f'band_{band_idx}_correlation'] = corr_band
 
     return metrics
@@ -1015,8 +1013,6 @@ def train_raster_worker(
     train_shard_dir: str,
     train_shard_prefix: str,
     val_data_path: str,
-    aug_shard_dir: Optional[str],
-    aug_shard_prefix: Optional[str],
     output_dir: str,
     num_epochs: int = 100,
     batch_size: int = 15,
@@ -1044,8 +1040,6 @@ def train_raster_worker(
         train_shard_dir: Directory containing pre-sharded training data
         train_shard_prefix: Prefix for training shard files
         val_data_path: Path to validation data .pt file
-        aug_shard_dir: Directory containing pre-sharded augmented data (optional)
-        aug_shard_prefix: Prefix for augmented shard files (optional)
         output_dir: Directory to save checkpoints
         num_epochs: Number of training epochs
         batch_size: Batch size per GPU
@@ -1104,36 +1098,20 @@ def train_raster_worker(
     train_shard_path = os.path.join(train_shard_dir, f"{train_shard_prefix}_shard_{rank}.pt")
 
     # Load pre-sharded training data
+    # Note: k (KNN neighbors) not passed - global-only attention doesn't use KNN graphs
     print(f"[GPU {rank}] Loading training shard from {train_shard_path}")
     train_dataset = ShardedRasterDataset(
         shard_path=train_shard_path,
-        k=config.k,
         use_naip=config.use_naip,
         use_uavsar=config.use_uavsar,
         target_band_indices=config.target_band_indices
     )
-
-    # Load augmented data if provided
-    if aug_shard_dir and aug_shard_prefix:
-        aug_shard_path = os.path.join(aug_shard_dir, f"{aug_shard_prefix}_shard_{rank}.pt")
-        if os.path.exists(aug_shard_path):
-            print(f"[GPU {rank}] Loading augmented shard from {aug_shard_path}")
-            aug_dataset = ShardedRasterDataset(
-                shard_path=aug_shard_path,
-                k=config.k,
-                use_naip=config.use_naip,
-                use_uavsar=config.use_uavsar,
-                target_band_indices=config.target_band_indices
-            )
-            train_dataset.data = train_dataset.data + aug_dataset.data
-            print(f"[GPU {rank}] Combined dataset size: {len(train_dataset)}")
 
     # Load validation data
     if rank == 0:
         print(f"[GPU {rank}] Loading validation data from {val_data_path}")
     val_dataset = ShardedRasterDataset(
         shard_path=val_data_path,
-        k=config.k,
         use_naip=config.use_naip,
         use_uavsar=config.use_uavsar,
         target_band_indices=config.target_band_indices
@@ -1189,7 +1167,14 @@ def train_raster_worker(
     # Create model
     model = MultimodalRasterPredictor(config).to(device)
 
+    # NOTE: torch.compile() disabled - incompatible with Kornia augmentations
+    # Kornia uses .item() calls and CPU/GPU mixed operations that cause graph breaks
+    # and compilation failures. If augmentations are disabled, torch.compile() could
+    # be re-enabled for additional speedup.
+
     # Wrap with DDP
+    # find_unused_parameters=False is safe because embedding dropout uses * 0.0
+    # which preserves gradient flow through encoder params even when modalities are "dropped"
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
     # Calculate warmup steps from percentage of total training steps
@@ -1322,6 +1307,9 @@ def train_raster_worker(
 
     training_history = {'train_loss': [], 'val_loss': [], 'val_mae': [], 'learning_rates': []}
 
+    # Pre-allocate tensor for early stopping broadcast (avoids repeated allocations)
+    early_stop_tensor = torch.zeros(1, device=device, dtype=torch.int)
+
     for epoch in range(start_epoch, num_epochs):
         epoch_start_time = time.time()
 
@@ -1415,8 +1403,8 @@ def train_raster_worker(
         else:
             early_stop = False
 
-        # Broadcast early stopping decision to all GPUs
-        early_stop_tensor = torch.tensor(int(early_stop), device=device)
+        # Broadcast early stopping decision to all GPUs (reuse pre-allocated tensor)
+        early_stop_tensor.fill_(int(early_stop))
         dist.broadcast(early_stop_tensor, src=0)
         if early_stop_tensor.item():
             if rank == 0 and logger:
@@ -1496,7 +1484,6 @@ def train_raster_model(
     train_data_path: str,
     val_data_path: str,
     output_dir: str,
-    augmented_data_path: Optional[str] = None,
     num_epochs: int = 100,
     batch_size: int = 15,
     learning_rate: float = 5e-4,
@@ -1522,7 +1509,6 @@ def train_raster_model(
         train_data_path: Path to training data
         val_data_path: Path to validation data
         output_dir: Output directory for checkpoints
-        augmented_data_path: Path to augmented data (optional)
         num_epochs: Number of epochs
         batch_size: Batch size per GPU
         learning_rate: Learning rate
@@ -1557,7 +1543,6 @@ def train_raster_model(
     # Create cache key based on data paths
     cache_key = hashlib.md5((train_data_path + val_data_path).encode()).hexdigest()[:10]
     train_shard_prefix = f"{cache_key}_train"
-    aug_shard_prefix = f"{cache_key}_aug"
 
     # Check if shards already exist (cached)
     train_shard_paths = [str(shard_cache_dir / f"{train_shard_prefix}_shard_{i}.pt")
@@ -1578,28 +1563,11 @@ def train_raster_model(
             train_data, world_size, str(shard_cache_dir), train_shard_prefix
         )
         del train_data
-
-        # If augmented data provided, create shards for it too
-        aug_shard_paths = [None] * world_size
-        if augmented_data_path and os.path.exists(augmented_data_path):
-            print(f"\nLoading augmented data from {augmented_data_path}")
-            aug_data = torch.load(augmented_data_path, weights_only=False)
-            print(f"  ✓ Loaded {len(aug_data)} augmented samples")
-
-            # Create augmented shards
-            aug_shard_paths = create_raster_shards(
-                aug_data, world_size, str(shard_cache_dir), aug_shard_prefix
-            )
-            del aug_data
         print(f"{'='*80}\n")
     else:
         print(f"\n{'='*80}")
         print("Using cached shards (loading from disk)...")
         print(f"{'='*80}\n")
-        # Check for augmented shards
-        aug_shard_paths = [str(shard_cache_dir / f"{aug_shard_prefix}_shard_{i}.pt")
-                          for i in range(world_size)]
-        aug_shard_paths = aug_shard_paths if all(os.path.exists(p) for p in aug_shard_paths) else [None] * world_size
 
     # Setup distributed training environment
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -1613,8 +1581,6 @@ def train_raster_model(
     torch.multiprocessing.spawn(
         train_raster_worker,
         args=(world_size, config, str(shard_cache_dir), train_shard_prefix, val_data_path,
-              str(shard_cache_dir) if aug_shard_paths[0] is not None else None,
-              aug_shard_prefix if aug_shard_paths[0] is not None else None,
               output_dir, num_epochs, batch_size,
               learning_rate, weight_decay, gradient_accumulation_steps,
               save_every_n_epochs, use_amp, early_stopping_patience, early_stopping_metric, seed,

@@ -293,6 +293,130 @@ class PosAwareGlobalFlashAttention(nn.Module):
         return output
 
 
+class PosAwareGlobalFlashAttentionV2(nn.Module):
+    """
+    V2: Position-Aware Global Flash Attention with decoupled position injection.
+
+    Key difference from V1: Q and K are position-aware (attend based on location),
+    while V carries pure semantic features (no position leakage into aggregated values).
+
+    This separates "where to attend" from "what to aggregate."
+    """
+    def __init__(self, dim, pos_encoding_dim=32, num_heads=4, dropout=0,
+                 ffn_expansion_factor=2, drop_path=0.0):
+        """
+        Initialize V2 Position-Aware Global Flash Attention module.
+
+        Args:
+            dim: Feature dimension
+            pos_encoding_dim: Dimension for positional encoding (default: 32)
+            num_heads: Number of attention heads
+            dropout: Dropout probability for attention
+            ffn_expansion_factor: Expansion factor for feedforward network
+            drop_path: Stochastic depth probability (default: 0.0)
+        """
+        super().__init__()
+        self.dim = dim
+        self.pos_encoding_dim = pos_encoding_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+
+        assert dim % num_heads == 0, f"Dimension {dim} must be divisible by number of heads {num_heads}"
+        self.head_dim = dim // num_heads
+
+        # Position encoder (3D coords -> pos_encoding_dim)
+        self.pos_encoder = nn.Sequential(
+            nn.Linear(3, pos_encoding_dim),
+            nn.GELU(),
+            nn.Linear(pos_encoding_dim, pos_encoding_dim)
+        )
+
+        # Decoupled projections:
+        # Q and K take (dim + pos_encoding_dim) - they know WHERE to attend
+        self.q_proj = nn.Linear(dim + pos_encoding_dim, dim)
+        self.k_proj = nn.Linear(dim + pos_encoding_dim, dim)
+        # V takes only dim - carries WHAT to aggregate (pure semantics)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+        # Standard Pre-LN (2 norms)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        # Single stochastic depth module
+        self.drop_path = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
+
+        # Feedforward network
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ffn_expansion_factor),
+            nn.GELU(),
+            nn.Linear(dim * ffn_expansion_factor, dim)
+        )
+
+    def forward(self, x, pos):
+        """
+        Apply V2 position-aware flash attention followed by FFN.
+
+        Args:
+            x: Input feature tensor [N, dim] or [B, N, dim]
+            pos: Point position tensor [N, 3] or [B, N, 3]
+
+        Returns:
+            Output tensor of same shape as input
+        """
+        # Handle unbatched input (add batch dim if needed)
+        orig_shape = x.shape
+        if len(orig_shape) == 2:
+            x = x.unsqueeze(0)  # [1, N, dim]
+            pos = pos.unsqueeze(0) if len(pos.shape) == 2 else pos
+
+        B, N, _ = x.shape
+
+        # --- Block 1: Attention with Pre-LN ---
+        residual = x
+        x_norm = self.norm1(x)
+
+        # Encode positions
+        pos_enc = self.pos_encoder(pos)  # [B, N, pos_encoding_dim]
+
+        # Concatenate features with position for Q and K only
+        x_with_pos = torch.cat([x_norm, pos_enc], dim=-1)  # [B, N, dim + pos_encoding_dim]
+
+        # Decoupled projections
+        q = self.q_proj(x_with_pos)  # Position-aware
+        k = self.k_proj(x_with_pos)  # Position-aware
+        v = self.v_proj(x_norm)      # Pure semantics (no position)
+
+        # Reshape for multi-head attention [B, num_heads, N, head_dim]
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Flash attention
+        x_attn = scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False
+        )
+
+        # Reshape back [B, N, dim]
+        x_attn = x_attn.transpose(1, 2).contiguous().view(B, N, self.dim)
+        x_attn = self.out_proj(x_attn)
+
+        # Residual connection 1
+        x = residual + self.drop_path(x_attn)
+
+        # --- Block 2: FFN with Pre-LN ---
+        x = x + self.drop_path(self.ffn(self.norm2(x)))
+
+        # Remove batch dim if it was added
+        if len(orig_shape) == 2:
+            x = x.squeeze(0)
+
+        return x
+
+
 class MultiHeadPointTransformer(nn.Module):
     """
     A multi-head implementation using multiple PointTransformerConv layers.
@@ -407,7 +531,8 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                  up_ratio=None,
                  k_neighbors=15,
                  pos_gen_hidden_dim=64,
-                 global_drop_path=0.0):
+                 global_drop_path=0.0,
+                 use_v2_attention: bool = False):
         """
         Initialize the LocalGlobalPointAttentionBlock
 
@@ -422,6 +547,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
             k_neighbors: Number of neighbors for KNN graph construction when edge_index is None
             pos_gen_hidden_dim: Hidden dimension for position generator network
             global_drop_path: Stochastic depth for global attention (default 0.0)
+            use_v2_attention: If True, use PosAwareGlobalFlashAttentionV2 (decoupled Q/K/V)
         """
         super().__init__()
         self.in_channels = in_channels
@@ -433,6 +559,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
         self.up_ratio = up_ratio
         self.k_neighbors = k_neighbors
         self.global_drop_path = global_drop_path
+        self.use_v2_attention = use_v2_attention
         
         # Flag to determine whether to use local/global attention
         self.use_local_attention = num_lcl_heads > 0
@@ -461,9 +588,10 @@ class LocalGlobalPointAttentionBlock(nn.Module):
             self.local_projection = nn.Linear(in_channels, self.pt_out_channels)
     
 
-        # 2. Global context module (PosAwareGlobalFlashAttention) if enabled
+        # 2. Global context module (PosAwareGlobalFlashAttention V1 or V2) if enabled
         if self.use_global_attention:
-            self.pos_flash_attention = PosAwareGlobalFlashAttention(
+            attention_cls = PosAwareGlobalFlashAttentionV2 if use_v2_attention else PosAwareGlobalFlashAttention
+            self.pos_flash_attention = attention_cls(
                 dim=self.flash_attn_dim,
                 pos_encoding_dim=pos_encoding_dim,
                 num_heads=num_glbl_heads,

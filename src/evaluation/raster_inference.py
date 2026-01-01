@@ -34,6 +34,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Add project root to path for src imports (avoids PYTHONPATH requirement)
+# Goes up 3 levels: evaluation -> src -> project_root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -257,11 +261,11 @@ def denormalize_predictions(
     device = predictions.device
 
     # Get mean/std for target bands
-    # Note: fuel_stats uses 1-indexed band names (band_1, band_2, ...),
-    # but target_band_indices are 0-indexed
-    means = torch.tensor([fuel_stats[f'band_{i+1}_mean'] for i in target_band_indices],
+    # Note: fuel_stats uses 0-indexed band names (band_0, band_1, ..., band_23)
+    # For tile tensor index i, use band_{i}_mean
+    means = torch.tensor([fuel_stats[f'band_{i}_mean'] for i in target_band_indices],
                         device=device, dtype=predictions.dtype)
-    stds = torch.tensor([fuel_stats[f'band_{i+1}_std'] for i in target_band_indices],
+    stds = torch.tensor([fuel_stats[f'band_{i}_std'] for i in target_band_indices],
                        device=device, dtype=predictions.dtype)
 
     # Reshape for broadcasting [1, n_bands, 1, 1]
@@ -273,7 +277,7 @@ def denormalize_predictions(
 
     # Apply inverse log transform to TFL if it was log-transformed during preprocessing
     use_log_tfl = fuel_stats.get('use_log_tfl', False)
-    tfl_band_index = fuel_stats.get('tfl_band_index', 7)  # Default TFL = band 8 (index 7)
+    tfl_band_index = fuel_stats.get('tfl_band_index', 15)  # TFL = band index 15 (per band_config.py)
 
     if use_log_tfl and tfl_band_index in target_band_indices:
         # Find position of TFL in the prediction tensor
@@ -406,9 +410,9 @@ def run_inference(
                 'bbox_ymax': batch['bbox'][i, 3].item(),
             }
             
-            # Add per-band statistics
-            band_names = ['Canopy_cover', 'TFL'] if target_band_indices == [11, 7] else [f'band_{j}' for j in range(pred.shape[0])]
-            for j, band_name in enumerate(band_names):
+            # Add per-band statistics (use generic band_0, band_1, etc. names)
+            for j in range(pred.shape[0]):
+                band_name = f'band_{j}'
                 band_vals = pred[j]
                 result[f'{band_name}_mean'] = np.nanmean(band_vals)
                 result[f'{band_name}_std'] = np.nanstd(band_vals)
@@ -448,7 +452,7 @@ def main():
     parser.add_argument(
         '--fuel-stats',
         type=str,
-        default='data/processed/model_data_raster/fuel_metrics_normalization_stats.json',
+        default='data/processed/model_data_veg_structure/target_raster_normalization_stats_train.json',
         help='Path to fuel metrics normalization stats (for denormalization)'
     )
     parser.add_argument(
@@ -526,16 +530,14 @@ def main():
     for site in predictions_df['site_name'].unique():
         site_df = predictions_df[predictions_df['site_name'] == site]
         logger.info(f"\n{site} ({len(site_df)} tiles):")
-        
-        if 'Canopy_cover_mean' in site_df.columns:
-            cover_vals = site_df['Canopy_cover_mean']
-            logger.info(f"  Canopy_cover: mean={cover_vals.mean():.3f}, std={cover_vals.std():.3f}, "
-                       f"range=[{cover_vals.min():.3f}, {cover_vals.max():.3f}]")
-        
-        if 'TFL_mean' in site_df.columns:
-            tfl_vals = site_df['TFL_mean']
-            logger.info(f"  TFL (kg/m²):  mean={tfl_vals.mean():.3f}, std={tfl_vals.std():.3f}, "
-                       f"range=[{tfl_vals.min():.3f}, {tfl_vals.max():.3f}]")
+
+        # Log statistics for each band
+        for j in range(len([col for col in site_df.columns if col.endswith('_mean')])):
+            band_name = f'band_{j}'
+            if f'{band_name}_mean' in site_df.columns:
+                band_vals = site_df[f'{band_name}_mean']
+                logger.info(f"  {band_name}: mean={band_vals.mean():.3f}, std={band_vals.std():.3f}, "
+                           f"range=[{band_vals.min():.3f}, {band_vals.max():.3f}]")
     
     logger.info("\n" + "=" * 60)
     logger.info("Inference complete!")

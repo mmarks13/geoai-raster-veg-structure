@@ -457,6 +457,7 @@ dependencies:
   - torchaudio
   - torchvision
   - seaborn
+  - kornia>=0.7.0
   # Note: R packages for LidarForFuel fuel metrics are now in a separate environment
   # Use environment_r_fuel_metrics.yml for fuel metrics processing
 prefix: /home/jovyan/geoai_env

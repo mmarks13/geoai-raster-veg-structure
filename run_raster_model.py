@@ -14,6 +14,19 @@ from src.training.raster_training import train_raster_model
 from pathlib import Path
 import datetime
 
+# ====== CUDA Performance Optimizations ======
+# Enable cuDNN benchmark for faster convolution algorithm selection
+torch.backends.cudnn.benchmark = True
+
+# Enable TensorCore optimization for float32 matmul operations
+# 'high' uses TF32 on Ampere+ GPUs for ~3x faster matmul with minimal precision loss
+torch.set_float32_matmul_precision('high')
+
+# Enable TF32 for CUDA matmul and cuDNN operations (complementary to set_float32_matmul_precision)
+# These flags ensure TF32 is used at the CUDA backend level
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 def main():
     """Main training function."""
@@ -22,32 +35,32 @@ def main():
     config = MultimodalRasterConfig(
         # Model architecture
         k=15,
-        feature_dim=512,
-        pt_attn_dropout=0.02,
+        feature_dim=256,
+        pt_attn_dropout=0.00,
 
         # Feature extractor heads
         extractor_lcl_heads=4,
-        extractor_glbl_heads=4,
+        extractor_glbl_heads=8,
 
         # Modality selection (set to True to enable)
         use_naip=True,
         use_uavsar=True,
 
         # Image encoder parameters
-        img_embed_dim=256,
+        img_embed_dim=128,
         img_num_patches=16,
-        naip_dropout=0.02,
-        uavsar_dropout=0.02,
+        naip_dropout=0.00,
+        uavsar_dropout=0.00,
         temporal_encoder="gru",
 
         # Fusion parameters
         fusion_type="cross_attention",
         fusion_num_heads=4,
-        fusion_dropout=0.05,
+        fusion_dropout=0.00,
         max_dist_ratio=8.0,  # Distance ratio in meters for cross-attention masking
 
         # Position Encoders
-        position_encoding_dim=96,  # Must be divisible by 6 for 3D positions
+        position_encoding_dim=48,  # Must be divisible by 6 for 3D positions
 
         # Raster-specific parameters
 
@@ -79,17 +92,18 @@ def main():
         # MULTI-SCALE ATTENTION: Per-head sigma values
         # 2 heads @ σ=0.5m (very local), 4 heads @ σ=2.0m (medium), 2 heads @ σ=5.0m (wide)
         raster_distance_sigma=[0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0],
-        raster_hidden_dim=512,
-        raster_decoder_layers=4,
-        raster_attention_dropout=0.1,
-        raster_decoder_dropout=0.5,
-        raster_use_wide_decoder=True,  
+        raster_hidden_dim=256,
+        raster_decoder_layers=1,
+        raster_attention_dropout=0.00,
+        raster_decoder_dropout=0.00,
+        raster_use_wide_decoder=True,
+
 
         # Pre-aggregation LG-PAB refinement parameters
-        num_pre_agg_blocks=2,  # Number of pre-aggregation LG-PAB blocks (0-5 configurable)
+        num_pre_agg_blocks=0,  # Number of pre-aggregation LG-PAB blocks (0-5 configurable)
         pre_agg_lcl_heads=0,  # Local attention heads for pre-aggregation
-        pre_agg_glbl_heads=4,  # Global attention heads for pre-aggregation
-        pre_agg_dropout=0.2,  # Dropout for pre-aggregation blocks
+        pre_agg_glbl_heads=8,  # Global attention heads for pre-aggregation
+        pre_agg_dropout=0.1,  # Dropout for pre-aggregation blocks
         pre_agg_k_neighbors=15,  # KNN neighbors for pre-aggregation
 
         # Optional: Transfer learning (only loads weights, not optimizer state)
@@ -97,26 +111,19 @@ def main():
         layers_to_load=None,
         layers_to_freeze=None,
 
-        # Training-time dropout (applied during training only, not validation)
-        # Edge dropout: randomly mask KNN edges for sparse-robustness
-        training_edge_dropout=0.0,  # 0% edge dropout
-        # Modality dropout: randomly drop modalities per-tile for modality-robustness
-        training_modality_dropout_naip=0.1,  # 0% NAIP dropout
-        training_modality_dropout_uavsar=0.2,  # 0% UAVSAR dropout
-
         # Stochastic depth (DropPath) - regularization for residual connections
         encoder_drop_path=0.0,      # Drop path for image encoder TransformerBlocks
-        decoder_drop_path=0.3,      # Drop path for WideRasterDecoder (linearly increasing per block)
-        extractor_point_attn_drop_path=0.0,  # Drop path for feature extractor (keep stable)
-        pre_agg_point_attn_drop_path=0.3,    # Drop path for pre-aggregation refinement blocks
+        decoder_drop_path=0.0,      # Drop path for WideRasterDecoder (linearly increasing per block)
+        extractor_point_attn_drop_path=0.3,  # Drop path for feature extractor 
+        pre_agg_point_attn_drop_path=0.0,    # Drop path for pre-aggregation refinement blocks
 
         # Huber loss - robust to outliers in fuel metrics
-        huber_delta=1.0,  # Delta threshold (errors > delta use linear penalty)
+        huber_delta=3.0,  # Delta threshold (errors > delta use linear penalty)
 
         # Correlation loss weight (addresses variance collapse)
         # Total loss = MSE + correlation_loss_weight * (1 - pearson_r)
         # Higher values encourage model to preserve variance in predictions
-        correlation_loss_weight=0.3,
+        correlation_loss_weight=0,
 
         # ===============================================================
         # GPU Training Augmentation (Kornia + Custom PyTorch)
@@ -128,28 +135,57 @@ def main():
 
         # --- Point Cloud Augmentation ---
         # Coordinate jitter: adds Gaussian noise to x,y,z coords
+        # x,y,z standard deviations are    2.9, 2.9, 6.2 respectively
         # Physical effect: simulates point position uncertainty (~0.1m)
-        aug_coord_jitter_sigma=0.02,    # Noise std in z-score units (~0.1m physical)
-        aug_coord_jitter_prob=0.33,      # Probability of applying jitter per tile
+        aug_coord_jitter_sigma=0.03,    # Noise std in z-score units
+        aug_coord_jitter_prob=0.85,      # Probability of applying jitter per tile
 
         # Intensity noise: adds Gaussian noise to intensity values
         # Physical effect: simulates sensor noise and atmospheric effects
         aug_intensity_noise_sigma=0.05,  # Noise std in z-score units
-        aug_intensity_noise_prob=0.2,    # Probability per tile
+        aug_intensity_noise_prob=0.3,    # Probability per tile
 
         # Intensity outliers: randomly replaces intensity values with extreme values
         # Physical effect: simulates sensor saturation, multipath returns
-        aug_intensity_outlier_prob=0.002,  # Per-point probability of outlier
+        aug_intensity_outlier_prob=0.005,  # Per-point probability of outlier
 
         # Bird simulation: adds extreme z-offset to 1 random point
         # Physical effect: simulates bird/drone flyover returns in LiDAR
-        aug_bird_outlier_prob=0.003,           # Probability per tile
-        aug_bird_z_offset_range=(5.0, 15.0),  # Z-score offset (≈25-75m physical)
+        aug_bird_outlier_prob=0.03,           # Probability per tile
+        aug_bird_z_offset_range=(5.0, 30.0),  # Z-score offset (≈25-75m physical)
+
+
+        ####### DO NOT USE UNTIL FIXED ########
+        ## IMPORTANT: THIS DOES NOT WORK DUE TO BATCH INDICES ISSUE. TURNED OFF ##
+        # Point duplication (models redundant LiDAR returns)
+        aug_point_dup_tile_prob=0.0,          # % of tiles get duplication
+        aug_point_dup_min_point_prob=0.00,    # min-max% of points duplicated per tile
+        aug_point_dup_max_point_prob=0.0,
+        aug_point_dup_min_offset=0.001,       # Offset range: 0.001-0.2 z-score units
+        aug_point_dup_max_offset=0.2,
+        ################################################################
+
+
+        # Omnidirectional outliers
+        aug_omni_outlier_tile_prob=0.3,       # 20% of tiles get outliers
+        aug_omni_outlier_point_prob=0.002,     # 0.2% of points become outliers
+        aug_omni_outlier_min_magnitude=2.0,   # Magnitude: 2-20 std dev
+        aug_omni_outlier_max_magnitude=20.0,
+
+        # --- Return Attribute Augmentation (return_num, n_returns) ---
+        # Makes model robust to variations in LiDAR return patterns
+        coordinate_normalization_stats_path="data/processed/model_data_veg_structure/coordinate_normalization_stats_train.json",
+        aug_return_scale_prob=0.6,            # Probability of scaling (stretch/shrink)
+        aug_return_scale_range=(0.5, 1.8),    # Scale multiplier for raw integer values
+        aug_return_noise_prob=0.2,            # Probability of adding Gaussian noise
+        aug_return_noise_sigma=0.1,           # Noise std in z-score units
+        aug_return_zero_prob=0.05,            # Probability of zeroing out return attrs
+        aug_return_shuffle_prob=0.05,          # Probability of shuffling among points
 
         # --- NAIP Augmentation (4-channel optical: RGBN) ---
         # Gaussian noise: simulates sensor noise
         aug_naip_noise_sigma=0.03,
-        aug_naip_noise_prob=0.2,
+        aug_naip_noise_prob=0.15,
 
         # Gaussian blur: simulates atmospheric haze, focus issues
         aug_naip_blur_kernel=3,
@@ -159,43 +195,82 @@ def main():
         # Motion blur: simulates aircraft motion, wind effects
         aug_naip_motion_blur_kernel=5,
         aug_naip_motion_blur_angle=(-45.0, 45.0),
-        aug_naip_motion_blur_prob=0.05,
+        aug_naip_motion_blur_prob=0.1,
 
-        # Random erasing: simulates cloud shadows, occlusions
+        # Random erasing (sets value to 0, mean is z-score space)
         aug_naip_erasing_scale=(0.02, 0.15),  # Erased area as fraction of image
-        aug_naip_erasing_prob=0.1,
+        aug_naip_erasing_prob=0.05,
 
         # Sharpness: simulates varying focus quality
         aug_naip_sharpness_range=(0.5, 1.5),
         aug_naip_sharpness_prob=0.1,
 
         # Histogram equalization: simulates varying exposure/contrast
-        aug_naip_equalize_prob=0.1,
+        aug_naip_equalize_prob=0.3,
 
         # --- UAVSAR Augmentation (6-channel SAR: polarimetric) ---
         # Gaussian noise: simulates thermal/system noise (valid in dB domain)
         aug_uavsar_noise_sigma=0.05,
-        aug_uavsar_noise_prob=0.2,
+        aug_uavsar_noise_prob=0.15,
 
         # Gaussian blur: simulates multi-looking (speckle filtering)
         aug_uavsar_blur_kernel=3,
-        aug_uavsar_blur_sigma=(0.1, 1.5),
+        aug_uavsar_blur_sigma=(0.1, 1.0),
         aug_uavsar_blur_prob=0.1,
 
         # Motion blur: simulates platform motion effects
         aug_uavsar_motion_blur_kernel=3,
         aug_uavsar_motion_blur_angle=(-30.0, 30.0),
-        aug_uavsar_motion_blur_prob=0.05,
+        aug_uavsar_motion_blur_prob=0.15,
 
-        # Random erasing: simulates RFI (radio freq interference), dropouts
-        aug_uavsar_erasing_scale=(0.02, 0.10),
+        # Random erasing (sets value to 0, mean is z-score space)
+        aug_uavsar_erasing_scale=(0.10, 0.20),
         aug_uavsar_erasing_prob=0.05,
+
+        # --- Synchronized Geometric Augmentation ---
+        # Applies identical rotation/reflection to points, images, and targets
+        aug_geometric_enabled=True,
+        aug_rotation_prob=0.75,  # Probability of 90°/180°/270° rotation
+        aug_reflection_prob=0.3,  # Probability of X or Y axis reflection
+
+        # --- Temporal Subsampling Augmentation ---
+        # Randomly subsamples temporal dimension to improve generalization
+        aug_temporal_enabled=True,
+        aug_naip_subsample_prob=0.3,  # Probability of NAIP temporal subsampling
+        aug_naip_min_frames=1,  # Minimum NAIP frames to keep
+        aug_uavsar_t_subsample_prob=0.2,  # Probability of UAVSAR T-dim subsampling
+        aug_uavsar_t_min_frames=1,  # Minimum UAVSAR temporal groups to keep
+        aug_uavsar_g_mask_prob=0.2,  # Probability of G-dim masking within groups
+        aug_uavsar_g_min_images=1,  # Minimum images to keep per group
+
+
+        aug_temporal_shift_prob=0.95,          # 95% of tiles get temporal shift
+        aug_temporal_max_shift_days=365.0,    # ±365 days (12 months)
+
+
+        # --- Modality Dropout Augmentation ---
+        # Randomly drops entire modalities for robustness (e.g., Laguna has no UAVSAR)
+        aug_modality_dropout_enabled=True,
+        aug_naip_dropout_prob=0.20,  # Probability of dropping NAIP entirely
+        aug_uavsar_dropout_prob=0.20,  # Probability of dropping UAVSAR entirely
+
+        # --- Point Cloud Sparse Augmentation (Global-Only Mode) ---
+        # Randomly removes points (only when use_global_only=True)
+        aug_point_removal_enabled=True,  # Enable only with use_global_only=True
+        aug_point_removal_prob=0.99,  # Probability of applying point removal
+        aug_point_min_removal_ratio=0.001,  # Min fraction of points to remove
+        aug_point_max_removal_ratio=0.95,  # Max fraction of points to remove
+        aug_point_min_points=20,  # Minimum points to keep
+
+        # --- Global-Only Attention Mode ---
+        # Uses two consecutive global attention blocks (no local KNN)
+        # Enables online point removal since global attention computes positions dynamically
+        use_global_only=True,
     )
 
     # ====== Data Paths ======
     train_data_path = "data/processed/model_data_veg_structure/precomputed_training_tiles_raster_32bit.pt"
     val_data_path = "data/processed/model_data_veg_structure/precomputed_validation_tiles_raster_32bit.pt"
-    augmented_data_path = "data/processed/model_data_veg_structure/augmented_tiles_raster_32bit.pt" 
 
     # ====== Output Directory ======
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -212,29 +287,28 @@ def main():
     output_dir = f"data/output/raster_model_{modality_str}_{timestamp}"
 
     # ====== Training Hyperparameters ======
-    num_epochs = 120
-    batch_size = 30  # Batch size per GPU
-    learning_rate = 2e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
-    weight_decay = 0.01  # Weight regularization
+    num_epochs = 450
+    batch_size = 10  # Batch size per GPU
+    learning_rate = 3e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
+    weight_decay = 0.5  # Weight regularization
     beta1 = 0.95  # AdamW momentum (exponential moving average of gradients)
     beta2 = 0.999  # AdamW momentum (exponential moving average of squared gradients)
-    gradient_accumulation_steps = 2  # Gradient accumulation for effective larger batches
+    gradient_accumulation_steps = 6  # Gradient accumulation for effective larger batches
     max_grad_norm = 3  # prevent large gradient updates
-    save_every_n_epochs = 2  # Save checkpoint every N epochs
+    save_every_n_epochs = 5  # Save checkpoint every N epochs
     use_amp = True  # Automatic mixed precision (bfloat16)
-    early_stopping_patience = 200  # Epochs without improvement before stopping
+    early_stopping_patience = 80  # Epochs without improvement before stopping
     early_stopping_metric = "loss"  # Metric to monitor for early stopping
-    warmup_steps_percentage = 0.15
+    warmup_steps_percentage = 0.02
     seed = 42
     num_gpus = None  # None = use all available GPUs
-
 
 
     # ====== Resume Training from Checkpoint (Optional) ======
     # Set this to resume training from a checkpoint (loads model weights + optimizer state)
     # This is different from checkpoint_path in config (which only loads weights for transfer learning)
     # Note: Use best_model.pth (has correct epoch) instead of final_model.pth (had a bug with epoch number)
-    resume_checkpoint_path = None #"data/output/raster_model_fused_20251226_065021/checkpoints/epoch_2.pth"
+    resume_checkpoint_path = None #"data/output/raster_model_fused_20251228_220537/checkpoints/best_model.pth"
 
 
     # ====== Print Configuration ======
@@ -245,7 +319,6 @@ def main():
     print(f"Output directory: {output_dir}")
     print(f"Training data: {train_data_path}")
     print(f"Validation data: {val_data_path}")
-    print(f"Augmented data: {augmented_data_path}")
     print(f"\nHyperparameters:")
     print(f"  Epochs: {num_epochs}")
     print(f"  Batch size per GPU: {batch_size}")
@@ -274,10 +347,6 @@ def main():
     print(f"  Decoder layers: {config.raster_decoder_layers}")
     print(f"  Attention dropout: {config.raster_attention_dropout:.1%}")
     print(f"  Decoder dropout: {config.raster_decoder_dropout:.1%}")
-    print(f"\nTraining-time dropout:")
-    print(f"  Edge dropout: {config.training_edge_dropout:.1%}")
-    print(f"  NAIP modality dropout: {config.training_modality_dropout_naip:.1%}")
-    print(f"  UAVSAR modality dropout: {config.training_modality_dropout_uavsar:.1%}")
     print(f"\nStochastic depth (DropPath):")
     print(f"  Encoder drop path: {config.encoder_drop_path:.1%}")
     print(f"  Decoder drop path: {config.decoder_drop_path:.1%}")
@@ -296,7 +365,6 @@ def main():
         train_data_path=train_data_path,
         val_data_path=val_data_path,
         output_dir=output_dir,
-        augmented_data_path=augmented_data_path,
         num_epochs=num_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,

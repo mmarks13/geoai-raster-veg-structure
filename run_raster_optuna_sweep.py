@@ -141,18 +141,12 @@ def objective(trial):
         # 2 heads @ σ=0.5m (very local), 4 heads @ σ=2.0m (medium), 2 heads @ σ=5.0m (wide)
         raster_distance_sigma=[0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0],
         pre_agg_k_neighbors=15,
-
-        # Training-time dropout (applied during training only, not validation)
-        training_edge_dropout=0.00,
-        training_modality_dropout_naip=0.05,
-        training_modality_dropout_uavsar=0.15,
     )
 
 
     # ====== Data Paths ======
     train_data_path = "data/processed/model_data_raster/precomputed_training_tiles_raster_32bit.pt"
     val_data_path = "data/processed/model_data_raster/precomputed_validation_tiles_raster_32bit.pt"
-    augmented_data_path = "data/processed/model_data_raster/augmented_tiles_raster_32bit.pt"
 
 
     # ====== Training Hyperparameters ======
@@ -206,7 +200,6 @@ def objective(trial):
             config=config,
             train_data_path=train_data_path,
             val_data_path=val_data_path,
-            augmented_data_path=augmented_data_path,
             output_dir=output_dir,
             num_epochs=num_epochs,
             batch_size=batch_size,
