@@ -84,6 +84,10 @@ class MultimodalRasterConfig:
     uavsar_dropout: float = 0.1
     temporal_encoder: str = "gru"
 
+    # Position encoder regularization
+    pos_encoder_dropout: float = 0.1
+    stochastic_pos_dropout_prob: float = 0.0
+
     # Raster-specific parameters
     n_bands: int = 3  # Number of fuel metrics bands to predict (default: Height, TFL, Total_cover)
     target_band_indices: List[int] = None  # Indices of target bands (set in __post_init__)
@@ -130,13 +134,22 @@ class MultimodalRasterConfig:
     extractor_point_attn_drop_path: float = 0.0  # Drop path for feature extractor's PosAwareGlobalFlashAttention
     pre_agg_point_attn_drop_path: float = 0.0  # Drop path for pre-aggregation blocks' PosAwareGlobalFlashAttention
 
+    # Spectral normalization (Lipschitz constraint for OOD robustness)
+    use_spectral_norm: bool = False  # Apply spectral norm to PreLNResidualBlock and DistanceMaskedAttention.out_proj
+
+    # Stochastic Weight Averaging (SWA) for OOD robustness
+    swa_enabled: bool = False  # Enable SWA model averaging
+    swa_start_epoch: int = 50  # Epoch to start averaging (typically 50-75% into training)
+    swa_update_freq: int = 1   # Update average every N epochs (1 = every epoch)
+
     # ===== GPU Training Augmentation (raster model only) =====
     # Master switch for GPU-native augmentation (Kornia + custom PyTorch ops)
     # See docs/training_augmentation.md for full documentation
     training_augmentation_enabled: bool = False
 
     # Point cloud augmentation
-    aug_coord_jitter_sigma: float = 0.02   # Z-score units (~0.1m physical)
+    aug_coord_jitter_sigma_xy: float = 0.03  # Separate sigma for x,y
+    aug_coord_jitter_sigma_z: float = 0.01   # Separate sigma for z
     aug_coord_jitter_prob: float = 0.5
     aug_intensity_noise_sigma: float = 0.05
     aug_intensity_noise_prob: float = 0.3
@@ -256,6 +269,8 @@ class MultimodalRasterConfig:
                 self.naip_dropout,
                 self.uavsar_dropout,
                 self.temporal_encoder,
+                self.pos_encoder_dropout,
+                self.stochastic_pos_dropout_prob,
                 self.n_bands,
                 self.target_band_indices,
                 self.grid_size,
@@ -281,9 +296,15 @@ class MultimodalRasterConfig:
                 self.decoder_drop_path,
                 self.extractor_point_attn_drop_path,
                 self.pre_agg_point_attn_drop_path,
+                # OOD robustness
+                self.use_spectral_norm,
+                self.swa_enabled,
+                self.swa_start_epoch,
+                self.swa_update_freq,
                 # GPU augmentation parameters
                 self.training_augmentation_enabled,
-                self.aug_coord_jitter_sigma,
+                self.aug_coord_jitter_sigma_xy,
+                self.aug_coord_jitter_sigma_z,
                 self.aug_coord_jitter_prob,
                 self.aug_intensity_noise_sigma,
                 self.aug_intensity_noise_prob,
@@ -393,6 +414,10 @@ class MultimodalRasterPredictor(nn.Module):
         # Get position generation hidden dimension
         pos_gen_hidden_dim = getattr(config, 'pos_gen_hidden_dim', 64)
 
+        # Get position encoder parameters with fallback
+        pos_encoder_dropout = getattr(config, 'pos_encoder_dropout', 0.1)
+        stochastic_pos_dropout_prob = getattr(config, 'stochastic_pos_dropout_prob', 0.0)
+
         # Track global-only mode
         self.use_global_only = getattr(config, 'use_global_only', False)
 
@@ -409,7 +434,9 @@ class MultimodalRasterPredictor(nn.Module):
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
-                use_v2_attention=config.use_v2_attention
+                use_v2_attention=config.use_v2_attention,
+                pos_encoder_dropout=0,
+                stochastic_pos_dropout_prob=0
             )
             self.feature_extractor_2 = LocalGlobalPointAttentionBlock(
                 in_channels=config.feature_dim,  # Takes output of first block
@@ -420,7 +447,9 @@ class MultimodalRasterPredictor(nn.Module):
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
-                use_v2_attention=config.use_v2_attention
+                use_v2_attention=config.use_v2_attention,
+                pos_encoder_dropout=pos_encoder_dropout,
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
             self.feature_extractor_3 = LocalGlobalPointAttentionBlock(
                 in_channels=config.feature_dim,  # Takes output of first block
@@ -431,7 +460,9 @@ class MultimodalRasterPredictor(nn.Module):
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path/2,
-                use_v2_attention=config.use_v2_attention
+                use_v2_attention=config.use_v2_attention,
+                pos_encoder_dropout=pos_encoder_dropout,
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
             self.feature_extractor_4 = LocalGlobalPointAttentionBlock(
                 in_channels=config.feature_dim,  # Takes output of first block
@@ -442,7 +473,9 @@ class MultimodalRasterPredictor(nn.Module):
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path,
-                use_v2_attention=config.use_v2_attention
+                use_v2_attention=config.use_v2_attention,
+                pos_encoder_dropout=pos_encoder_dropout,
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
         else:
             # Standard mode: Single block with local+global attention
@@ -455,7 +488,9 @@ class MultimodalRasterPredictor(nn.Module):
                 dropout=extractor_dropout,
                 k_neighbors=config.k,
                 global_drop_path=config.extractor_point_attn_drop_path,
-                use_v2_attention=config.use_v2_attention
+                use_v2_attention=config.use_v2_attention,
+                pos_encoder_dropout=pos_encoder_dropout,
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
 
         # ====== 2) Imagery Encoders (shared with point cloud model) ======
@@ -517,7 +552,10 @@ class MultimodalRasterPredictor(nn.Module):
             pre_agg_k_neighbors=config.pre_agg_k_neighbors,
             position_encoding_dim=config.position_encoding_dim,
             point_attn_drop_path=config.pre_agg_point_attn_drop_path,  # Stochastic depth for pre-agg blocks
-            use_v2_attention=config.use_v2_attention  # V2 attention for pre-agg blocks
+            use_v2_attention=config.use_v2_attention,  # V2 attention for pre-agg blocks
+            use_spectral_norm=config.use_spectral_norm,  # Spectral normalization for OOD robustness
+            pos_encoder_dropout=pos_encoder_dropout,
+            stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
         )
 
         # ====== 5) GPU Training Augmentation (raster model only) ======
@@ -566,10 +604,14 @@ class MultimodalRasterPredictor(nn.Module):
         # Clamp extreme Z values (bird returns)
         dep_points[:, 2] = torch.clamp(dep_points[:, 2], -10, 10)  # In z-score space, ±10 is ~70m from mean
 
-        # ====== GPU Training Augmentation (Point Removal - Global-Only Mode) ======
+        # ====== GPU Training Augmentation (Point Count Changes - Global-Only Mode) ======
         # Only when use_global_only=True, since global attention doesn't need pre-computed KNN
+        # Both point removal and point duplication change point count, breaking KNN
         if self.training and self.use_global_only:
             dep_points, dep_attr, batch_indices = self.training_aug.apply_point_removal(
+                dep_points, dep_attr, batch_indices
+            )
+            dep_points, dep_attr, batch_indices = self.training_aug.apply_point_duplication(
                 dep_points, dep_attr, batch_indices
             )
 

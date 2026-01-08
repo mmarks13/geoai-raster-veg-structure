@@ -85,6 +85,10 @@ class MultimodalModelConfig:
 
     temporal_encoder: str = "gru"  # Type of temporal encoder: 'gru' or 'transformer'
 
+    # Position encoder regularization
+    pos_encoder_dropout: float = 0.1          # Dropout for position encoder (MLP + embedding)
+    stochastic_pos_dropout_prob: float = 0.0  # Probability of zeroing position vectors (0.0 = disabled)
+
     # Checkpoint loading parameters
     checkpoint_path: str = None  # Path to checkpoint file for weight initialization
     layers_to_load: list = None  # Specific layers to load from checkpoint
@@ -132,6 +136,8 @@ class MultimodalModelConfig:
                 self.checkpoint_path,
                 self.layers_to_load,
                 self.layers_to_freeze,
+                self.pos_encoder_dropout,
+                self.stochastic_pos_dropout_prob,
             )
         )
 
@@ -303,7 +309,9 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
     This separates "where to attend" from "what to aggregate."
     """
     def __init__(self, dim, pos_encoding_dim=32, num_heads=4, dropout=0,
-                 ffn_expansion_factor=2, drop_path=0.0):
+                 ffn_expansion_factor=2, drop_path=0.0,
+                 pos_encoder_dropout=0.1,
+                 stochastic_pos_dropout_prob=0.0):
         """
         Initialize V2 Position-Aware Global Flash Attention module.
 
@@ -324,12 +332,18 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
         assert dim % num_heads == 0, f"Dimension {dim} must be divisible by number of heads {num_heads}"
         self.head_dim = dim // num_heads
 
-        # Position encoder (3D coords -> pos_encoding_dim)
+        # Position encoder with dropout and LayerNorm
         self.pos_encoder = nn.Sequential(
             nn.Linear(3, pos_encoding_dim),
             nn.GELU(),
-            nn.Linear(pos_encoding_dim, pos_encoding_dim)
+            nn.Dropout(pos_encoder_dropout),     # Dropout after first MLP
+            nn.Linear(pos_encoding_dim, pos_encoding_dim),
+            nn.LayerNorm(pos_encoding_dim),      # LayerNorm on embedding (always enabled)
+            nn.Dropout(pos_encoder_dropout)      # Dropout on embedding output (same rate)
         )
+
+        # Stochastic position injection
+        self.stochastic_pos_dropout_prob = stochastic_pos_dropout_prob
 
         # Decoupled projections:
         # Q and K take (dim + pos_encoding_dim) - they know WHERE to attend
@@ -376,8 +390,15 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
         residual = x
         x_norm = self.norm1(x)
 
-        # Encode positions
+        # Encode positions (with dropout + LayerNorm applied inside encoder)
         pos_enc = self.pos_encoder(pos)  # [B, N, pos_encoding_dim]
+
+        # Stochastic Position Injection: randomly zero out position embeddings during training
+        if self.training and self.stochastic_pos_dropout_prob > 0.0:
+            # Create mask [B, N, 1] - same dropout for all dimensions of each position
+            keep_prob = 1.0 - self.stochastic_pos_dropout_prob
+            pos_mask = torch.bernoulli(torch.full((B, N, 1), keep_prob, device=pos_enc.device))
+            pos_enc = pos_enc * pos_mask  # Zero out position embeddings for dropped samples
 
         # Concatenate features with position for Q and K only
         x_with_pos = torch.cat([x_norm, pos_enc], dim=-1)  # [B, N, dim + pos_encoding_dim]
@@ -532,7 +553,9 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                  k_neighbors=15,
                  pos_gen_hidden_dim=64,
                  global_drop_path=0.0,
-                 use_v2_attention: bool = False):
+                 use_v2_attention: bool = False,
+                 pos_encoder_dropout: float = 0.1,
+                 stochastic_pos_dropout_prob: float = 0.0):
         """
         Initialize the LocalGlobalPointAttentionBlock
 
@@ -596,7 +619,9 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                 pos_encoding_dim=pos_encoding_dim,
                 num_heads=num_glbl_heads,
                 dropout=dropout,
-                drop_path=global_drop_path
+                drop_path=global_drop_path,
+                pos_encoder_dropout=pos_encoder_dropout,
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
         
         
@@ -717,7 +742,11 @@ class MultimodalPointUpsampler(nn.Module):
         extractor_dropout = getattr(config, 'extractor_dropout', config.pt_attn_dropout)
         expansion_dropout = getattr(config, 'expansion_dropout', config.pt_attn_dropout)
         refinement_dropout = getattr(config, 'refinement_dropout', config.pt_attn_dropout)
-        
+
+        # Get position encoder parameters with fallback
+        pos_encoder_dropout = getattr(config, 'pos_encoder_dropout', 0.1)
+        stochastic_pos_dropout_prob = getattr(config, 'stochastic_pos_dropout_prob', 0.0)
+
         # Get granular attention head counts - use specific values if available,
         # otherwise fall back to the global defaults
         extractor_lcl_heads = getattr(config, 'extractor_lcl_heads', config.num_lcl_heads)
@@ -735,10 +764,12 @@ class MultimodalPointUpsampler(nn.Module):
             in_channels=6,
             out_channels=config.feature_dim,
             num_lcl_heads=extractor_lcl_heads,
-            num_glbl_heads=extractor_glbl_heads, 
+            num_glbl_heads=extractor_glbl_heads,
             pos_encoding_dim=config.position_encoding_dim,
             dropout=extractor_dropout,
-            k_neighbors=config.k
+            k_neighbors=config.k,
+            pos_encoder_dropout=pos_encoder_dropout,
+            stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
         )
         
         # ====== 2) Imagery Encoders ======
@@ -798,7 +829,9 @@ class MultimodalPointUpsampler(nn.Module):
             dropout=expansion_dropout,
             up_ratio=config.up_ratio,
             pos_gen_hidden_dim=pos_gen_hidden_dim,
-            k_neighbors=config.k
+            k_neighbors=config.k,
+            pos_encoder_dropout=pos_encoder_dropout,
+            stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
         )
         
         # ====== 5) Additional Feature Refinement (LocalGlobalPointAttentionBlock) ======
@@ -809,7 +842,9 @@ class MultimodalPointUpsampler(nn.Module):
             num_glbl_heads=refinement_glbl_heads,
             pos_encoding_dim=config.position_encoding_dim,
             dropout=refinement_dropout,
-            k_neighbors=config.k
+            k_neighbors=config.k,
+            pos_encoder_dropout=pos_encoder_dropout,
+            stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
         )
         
         # ====== 6) Point Decoder ======

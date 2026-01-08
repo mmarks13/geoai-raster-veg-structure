@@ -12,6 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.amp import autocast
+from torch.optim.swa_utils import AveragedModel, update_bn
 import os
 import time
 import logging
@@ -1177,6 +1178,14 @@ def train_raster_worker(
     # which preserves gradient flow through encoder params even when modalities are "dropped"
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
+    # Create SWA averaged model (if enabled)
+    swa_model = None
+    if config.swa_enabled:
+        # AveragedModel wraps the base model (not DDP) for averaging
+        swa_model = AveragedModel(model.module)
+        if rank == 0:
+            print(f"[GPU {rank}] SWA enabled: averaging starts at epoch {config.swa_start_epoch}")
+
     # Calculate warmup steps from percentage of total training steps
     total_batches = len(train_loader)
     total_training_steps = total_batches * num_epochs
@@ -1333,6 +1342,13 @@ def train_raster_worker(
             writer=writer, epoch=epoch, rank=rank, logger=logger
         )
 
+        # Update SWA model if enabled and past start epoch
+        if swa_model is not None and epoch >= config.swa_start_epoch:
+            if (epoch - config.swa_start_epoch) % config.swa_update_freq == 0:
+                swa_model.update_parameters(model.module)
+                if rank == 0:
+                    print(f"  → SWA: Updated averaged model (epoch {epoch})")
+
         epoch_time = time.time() - epoch_start_time
 
         # Log progress (rank 0 only)
@@ -1438,6 +1454,35 @@ def train_raster_worker(
         }, final_checkpoint_path)
         if logger:
             logger.info(f"Final model saved to {final_checkpoint_path}")
+
+        # Save SWA averaged model if enabled
+        if swa_model is not None:
+            # Note: Our model uses LayerNorm (not BatchNorm), so update_bn is not needed
+            # If you add BatchNorm layers in the future, uncomment:
+            # swa_model.train()
+            # update_bn(train_loader, swa_model, device=device)
+            # swa_model.eval()
+
+            swa_checkpoint_path = Path(output_dir) / 'checkpoints' / 'swa_model.pth'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': swa_model.module.state_dict(),
+                'config': config
+            }, swa_checkpoint_path)
+            if logger:
+                logger.info(f"SWA averaged model saved to {swa_checkpoint_path}")
+            print(f"  → SWA averaged model saved to {swa_checkpoint_path}")
+
+            # Validate SWA model performance
+            swa_model.eval()
+            swa_val_metrics = validate_one_epoch_ddp(
+                swa_model, val_loader, device, config,
+                writer=None, epoch=epoch, rank=rank, logger=logger
+            )
+            swa_mae = swa_val_metrics.get('mae', float('nan'))
+            print(f"  → SWA Model Validation - Loss: {swa_val_metrics['loss']:.6f}, MAE: {swa_mae:.6f}")
+            if logger:
+                logger.info(f"SWA validation - Loss: {swa_val_metrics['loss']:.6f}, MAE: {swa_mae:.6f}")
 
         history_path = Path(output_dir) / 'training_history.json'
         with open(history_path, 'w') as f:

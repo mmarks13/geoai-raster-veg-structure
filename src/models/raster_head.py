@@ -175,7 +175,8 @@ class DistanceMaskedAttention(nn.Module):
         feature_dim: int = 256,
         num_heads: int = 8,
         distance_sigma: float | List[float] = 2.0,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_spectral_norm: bool = False
     ):
         super().__init__()
         assert feature_dim % num_heads == 0, "feature_dim must be divisible by num_heads"
@@ -201,6 +202,10 @@ class DistanceMaskedAttention(nn.Module):
         self.k_proj = nn.Linear(feature_dim, feature_dim)
         self.v_proj = nn.Linear(feature_dim, feature_dim)
         self.out_proj = nn.Linear(feature_dim, feature_dim)
+
+        # Apply spectral normalization to out_proj only
+        if use_spectral_norm:
+            self.out_proj = nn.utils.spectral_norm(self.out_proj)
 
     def forward(
         self,
@@ -439,7 +444,8 @@ class PointToGridAggregator(nn.Module):
         distance_sigma: float | List[float] = 2.0,
         grid_size: int = 5,
         tile_extent: float = 10.0,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_spectral_norm: bool = False
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -457,7 +463,8 @@ class PointToGridAggregator(nn.Module):
             feature_dim=feature_dim,
             num_heads=num_heads,
             distance_sigma=distance_sigma,
-            dropout=dropout
+            dropout=dropout,
+            use_spectral_norm=use_spectral_norm
         )
 
     def forward(
@@ -637,7 +644,8 @@ class WideRasterDecoder(nn.Module):
         n_bands: int = 2,
         num_layers: int = 2,
         dropout: float = 0.35,
-        drop_path: float = 0.0
+        drop_path: float = 0.0,
+        use_spectral_norm: bool = False
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -651,10 +659,10 @@ class WideRasterDecoder(nn.Module):
         self.blocks = nn.ModuleList()
         for i in range(num_layers):
             self.blocks.append(
-                PreLNResidualBlock(feature_dim, dropout, drop_path=drop_path_rates[i])
+                PreLNResidualBlock(feature_dim, dropout, drop_path=drop_path_rates[i], use_spectral_norm=use_spectral_norm)
             )
 
-        # Final projection to n_bands (no residual, no drop_path)
+        # Final projection to n_bands (NO spectral norm - this is the output layer)
         self.final_proj = nn.Linear(feature_dim, n_bands)
 
     def forward(self, grid_features: torch.Tensor) -> torch.Tensor:
@@ -696,14 +704,24 @@ class PreLNResidualBlock(nn.Module):
         drop_path: Stochastic depth probability (0.0 = disabled)
     """
 
-    def __init__(self, feature_dim: int, dropout: float = 0.10, drop_path: float = 0.0):
+    def __init__(self, feature_dim: int, dropout: float = 0.10, drop_path: float = 0.0, use_spectral_norm: bool = False):
         super().__init__()
         self.norm = nn.LayerNorm(feature_dim)
+
+        # Build linear layers - optionally apply spectral normalization to BOTH
+        # Note: Final projection to n_bands is in WideRasterDecoder, not here
+        linear1 = nn.Linear(feature_dim, feature_dim*2)
+        linear2 = nn.Linear(feature_dim*2, feature_dim)
+
+        if use_spectral_norm:
+            linear1 = nn.utils.spectral_norm(linear1)
+            linear2 = nn.utils.spectral_norm(linear2)
+
         self.mlp = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim*2),
+            linear1,
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(feature_dim*2, feature_dim)
+            linear2
         )
         # Stochastic depth - drops entire residual branch with probability drop_path
         self.drop_path = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
@@ -765,7 +783,10 @@ class RasterPredictionHead(nn.Module):
         pre_agg_k_neighbors: int = 15,
         position_encoding_dim: int = 24,
         point_attn_drop_path: float = 0.0,
-        use_v2_attention: bool = False
+        use_v2_attention: bool = False,
+        use_spectral_norm: bool = False,
+        pos_encoder_dropout: float = 0.1,
+        stochastic_pos_dropout_prob: float = 0.0
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -786,7 +807,9 @@ class RasterPredictionHead(nn.Module):
                     up_ratio=None,  # No upsampling
                     k_neighbors=pre_agg_k_neighbors,
                     global_drop_path=point_attn_drop_path,
-                    use_v2_attention=use_v2_attention
+                    use_v2_attention=use_v2_attention,
+                    pos_encoder_dropout=pos_encoder_dropout,
+                    stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
                 )
                 for _ in range(num_pre_agg_blocks)
             ])
@@ -801,7 +824,8 @@ class RasterPredictionHead(nn.Module):
             distance_sigma=distance_sigma,
             grid_size=grid_size,
             tile_extent=tile_extent,
-            dropout=attention_dropout  # Split dropout: attention
+            dropout=attention_dropout,  # Split dropout: attention
+            use_spectral_norm=use_spectral_norm
         )
 
         # Raster decoder (uses decoder_dropout, can be higher for regularization)
@@ -812,7 +836,8 @@ class RasterPredictionHead(nn.Module):
                 n_bands=n_bands,
                 num_layers=num_decoder_layers,  # Number of residual blocks
                 dropout=decoder_dropout,
-                drop_path=decoder_drop_path
+                drop_path=decoder_drop_path,
+                use_spectral_norm=use_spectral_norm
             )
         else:
             # Original narrow decoder with dimension halving

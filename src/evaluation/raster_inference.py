@@ -22,6 +22,7 @@ Output:
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -31,12 +32,18 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 # Add project root to path for src imports (avoids PYTHONPATH requirement)
 # Goes up 3 levels: evaluation -> src -> project_root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+# Import helper from training module
+from src.training.raster_training import find_free_port
 
 # Configure logging
 logging.basicConfig(
@@ -293,46 +300,38 @@ def denormalize_predictions(
 
 
 @torch.no_grad()
-def run_inference(
+def run_inference_on_dataloader(
     model: nn.Module,
-    tiles: List[dict],
-    batch_size: int,
+    dataloader: DataLoader,
     device: torch.device,
     fuel_stats: Optional[dict] = None,
     target_band_indices: Optional[List[int]] = None
 ) -> Tuple[Dict[str, np.ndarray], pd.DataFrame]:
     """
-    Run inference on all tiles.
-    
+    Run inference on a pre-configured dataloader.
+
+    This function is extracted from run_inference() to allow code reuse
+    between single-GPU and multi-GPU inference paths.
+
     Args:
         model: Trained model in eval mode
-        tiles: List of preprocessed tile dicts
-        batch_size: Batch size for inference
+        dataloader: Pre-configured DataLoader (with appropriate sampler)
         device: Device to run on
         fuel_stats: Optional dict with normalization stats for denormalization
         target_band_indices: Band indices for labeling
-        
+
     Returns:
         Tuple of:
         - predictions_dict: {tile_id: prediction_array}
         - predictions_df: DataFrame with tile-level summary statistics
     """
     model.eval()
-    
+
     predictions_dict = {}
     results_list = []
-    
-    # Create dataloader
-    dataloader = DataLoader(
-        tiles,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_inference_batch,
-        num_workers=0  # Avoid multiprocessing issues
-    )
-    
-    logger.info(f"Running inference on {len(tiles)} tiles in {len(dataloader)} batches")
-    
+
+    logger.info(f"Running inference on {len(dataloader)} batches")
+
     for batch in tqdm(dataloader, desc="Inference"):
         # Move to device
         dep_points = batch['dep_points'].to(device)
@@ -340,11 +339,11 @@ def run_inference(
         edge_index = batch['edge_index'].to(device)
         batch_indices = batch['batch_indices'].to(device)
         norm_params = batch['norm_params']
-        
+
         # Handle imagery (move to device if present)
         naip = batch['naip']
         uavsar = batch['uavsar']
-        
+
         for i, naip_dict in enumerate(naip):
             if naip_dict is not None and 'images' in naip_dict:
                 naip[i] = {
@@ -352,7 +351,7 @@ def run_inference(
                     'img_bbox': naip_dict.get('img_bbox'),
                     'relative_dates': naip_dict.get('relative_dates'),
                 }
-        
+
         for i, uavsar_dict in enumerate(uavsar):
             if uavsar_dict is not None and 'images' in uavsar_dict:
                 uavsar[i] = {
@@ -383,10 +382,10 @@ def run_inference(
             bbox=batch['bbox'].to(device),
             debug_logging=debug_logging
         )
-        
+
         # predictions shape: [batch_size, n_bands, 5, 5]
         predictions = predictions.cpu()
-        
+
         # Denormalize if stats provided
         if fuel_stats is not None:
             predictions_denorm = denormalize_predictions(
@@ -394,12 +393,12 @@ def run_inference(
             )
         else:
             predictions_denorm = predictions
-        
+
         # Store results
         for i, tile_id in enumerate(batch['tile_ids']):
             pred = predictions_denorm[i].numpy()  # [n_bands, 5, 5]
             predictions_dict[tile_id] = pred
-            
+
             # Compute summary stats for each band
             result = {
                 'tile_id': tile_id,
@@ -409,7 +408,7 @@ def run_inference(
                 'bbox_xmax': batch['bbox'][i, 2].item(),
                 'bbox_ymax': batch['bbox'][i, 3].item(),
             }
-            
+
             # Add per-band statistics (use generic band_0, band_1, etc. names)
             for j in range(pred.shape[0]):
                 band_name = f'band_{j}'
@@ -419,12 +418,283 @@ def run_inference(
                 result[f'{band_name}_min'] = np.nanmin(band_vals)
                 result[f'{band_name}_max'] = np.nanmax(band_vals)
                 result[f'{band_name}_center'] = band_vals[2, 2]  # Center pixel value
-            
+
             results_list.append(result)
-    
+
     predictions_df = pd.DataFrame(results_list)
-    
+
     return predictions_dict, predictions_df
+
+
+@torch.no_grad()
+def run_inference(
+    model: nn.Module,
+    tiles: List[dict],
+    batch_size: int,
+    device: torch.device,
+    fuel_stats: Optional[dict] = None,
+    target_band_indices: Optional[List[int]] = None
+) -> Tuple[Dict[str, np.ndarray], pd.DataFrame]:
+    """
+    Run inference on all tiles (single-GPU version).
+
+    Args:
+        model: Trained model in eval mode
+        tiles: List of preprocessed tile dicts
+        batch_size: Batch size for inference
+        device: Device to run on
+        fuel_stats: Optional dict with normalization stats for denormalization
+        target_band_indices: Band indices for labeling
+
+    Returns:
+        Tuple of:
+        - predictions_dict: {tile_id: prediction_array}
+        - predictions_df: DataFrame with tile-level summary statistics
+    """
+    # Create dataloader
+    dataloader = DataLoader(
+        tiles,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_inference_batch,
+        num_workers=0  # Avoid multiprocessing issues
+    )
+
+    logger.info(f"Running inference on {len(tiles)} tiles in {len(dataloader)} batches")
+
+    # Use shared inference loop
+    return run_inference_on_dataloader(
+        model, dataloader, device, fuel_stats, target_band_indices
+    )
+
+
+def inference_worker(
+    rank: int,
+    world_size: int,
+    checkpoint_path: str,
+    input_path: str,
+    output_dir: str,
+    fuel_stats_path: str,
+    batch_size: int
+):
+    """
+    DDP worker for distributed multi-GPU inference.
+
+    Each worker:
+    1. Initializes its own DDP process group
+    2. Loads the model checkpoint onto its GPU
+    3. Uses DistributedSampler to get its shard of data
+    4. Runs inference on assigned tiles
+    5. Saves results to rank-specific file
+
+    Pattern from: src/training/raster_training.py:1009-1080
+
+    Args:
+        rank: Process rank (GPU ID)
+        world_size: Total number of processes (GPUs)
+        checkpoint_path: Path to model checkpoint
+        input_path: Path to preprocessed tiles (.pt file)
+        output_dir: Directory to save rank-specific predictions
+        fuel_stats_path: Path to fuel metrics normalization stats
+        batch_size: Batch size per GPU
+    """
+    # Initialize DDP (pattern from raster_training.py:1057-1059)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
+
+    # Setup logging for rank 0 only
+    if rank == 0:
+        logger.info(f"Starting distributed inference with {world_size} GPUs")
+
+    # Load model (use existing build_model_from_checkpoint)
+    if rank == 0:
+        logger.info(f"Loading model checkpoint: {checkpoint_path}")
+    model, config = build_model_from_checkpoint(checkpoint_path, device)
+
+    # Wrap with DDP
+    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+    model.eval()
+
+    # Load full dataset (NOT pre-sharded - DistributedSampler handles distribution)
+    if rank == 0:
+        logger.info(f"Loading tiles from {input_path}")
+    tiles = torch.load(input_path, weights_only=False)
+    if rank == 0:
+        logger.info(f"Loaded {len(tiles)} tiles total")
+
+    # Create DistributedSampler (pattern from raster_training.py:1127-1138)
+    sampler = DistributedSampler(
+        tiles,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False  # Keep deterministic order for inference
+    )
+
+    # Create DataLoader
+    dataloader = DataLoader(
+        tiles,
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=collate_inference_batch,
+        num_workers=0,
+        pin_memory=True
+    )
+
+    if rank == 0:
+        logger.info(f"Each GPU will process ~{len(tiles) // world_size} tiles in {len(dataloader)} batches")
+
+    # Load fuel stats for denormalization
+    fuel_stats = None
+    if Path(fuel_stats_path).exists():
+        with open(fuel_stats_path) as f:
+            fuel_stats = json.load(f)
+        if rank == 0:
+            logger.info(f"Loaded fuel stats from {fuel_stats_path}")
+    else:
+        if rank == 0:
+            logger.warning(f"Fuel stats not found, predictions will be normalized")
+
+    # Run inference (use extracted run_inference_on_dataloader)
+    predictions_dict, predictions_df = run_inference_on_dataloader(
+        model, dataloader, device, fuel_stats, config.target_band_indices
+    )
+
+    # Save rank-specific results
+    rank_predictions_path = Path(output_dir) / f'predictions_rank_{rank}.pt'
+    torch.save(predictions_dict, rank_predictions_path)
+
+    rank_csv_path = Path(output_dir) / f'predictions_rank_{rank}.csv'
+    predictions_df.to_csv(rank_csv_path, index=False)
+
+    if rank == 0:
+        logger.info(f"Rank {rank} saved {len(predictions_dict)} predictions")
+
+    # Cleanup (pattern from raster_training.py:1468-1479)
+    if dist.is_initialized():
+        dist.barrier()
+
+    try:
+        dist.destroy_process_group()
+    except Exception as e:
+        # Graceful timeout handling (NCCL cleanup may timeout)
+        if rank == 0:
+            logger.warning(f"DDP cleanup timeout (inference completed): {str(e)[:100]}")
+
+
+def run_multi_gpu_inference(args):
+    """
+    Main entry point for multi-GPU inference using DDP.
+
+    Spawns worker processes on each GPU, then aggregates results.
+
+    Pattern from: src/training/raster_training.py:1531-1599
+
+    Args:
+        args: Parsed command-line arguments
+    """
+    # Determine world size
+    if args.num_gpus is None:
+        world_size = torch.cuda.device_count()
+    else:
+        world_size = min(args.num_gpus, torch.cuda.device_count())
+
+    if world_size == 0:
+        raise RuntimeError("No GPUs available for multi-GPU inference")
+
+    logger.info(f"Running multi-GPU inference with {world_size} GPUs")
+
+    # Setup distributed environment
+    os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        free_port = find_free_port()
+        os.environ['MASTER_PORT'] = str(free_port)
+        logger.info(f"Using port {free_port} for distributed communication")
+
+    # Set NCCL environment variables (pattern from raster_training.py)
+    os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+    os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+
+    # Create output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Spawn workers
+    logger.info("Spawning worker processes...")
+    torch.multiprocessing.spawn(
+        inference_worker,
+        args=(
+            world_size,
+            args.checkpoint,
+            args.input,
+            str(output_dir),
+            args.fuel_stats,
+            args.batch_size
+        ),
+        nprocs=world_size,
+        join=True
+    )
+
+    # Aggregate results from all ranks
+    logger.info("Aggregating results from all GPUs...")
+    predictions_dict = {}
+    predictions_dfs = []
+
+    for rank in range(world_size):
+        rank_pred_path = output_dir / f'predictions_rank_{rank}.pt'
+        rank_csv_path = output_dir / f'predictions_rank_{rank}.csv'
+
+        if not rank_pred_path.exists():
+            logger.warning(f"Rank {rank} predictions not found at {rank_pred_path}")
+            continue
+
+        # Load and merge predictions
+        rank_preds = torch.load(rank_pred_path, weights_only=False)
+        predictions_dict.update(rank_preds)
+        logger.info(f"Loaded {len(rank_preds)} predictions from rank {rank}")
+
+        # Load and concatenate DataFrames
+        rank_df = pd.read_csv(rank_csv_path)
+        predictions_dfs.append(rank_df)
+
+        # Clean up intermediate files
+        rank_pred_path.unlink()
+        rank_csv_path.unlink()
+
+    # Combine all DataFrames
+    predictions_df = pd.concat(predictions_dfs, ignore_index=True)
+    logger.info(f"Total predictions: {len(predictions_dict)} tiles")
+
+    # Save final aggregated results (existing pattern)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    final_path = output_dir / f'forest_plot_predictions_{timestamp}.pt'
+    torch.save(predictions_dict, final_path)
+    logger.info(f"Saved aggregated predictions to {final_path}")
+
+    csv_path = output_dir / f'forest_plot_predictions_{timestamp}.csv'
+    predictions_df.to_csv(csv_path, index=False)
+    logger.info(f"Saved CSV summary to {csv_path}")
+
+    # Print summary statistics (same as single-GPU version)
+    logger.info("\n" + "=" * 60)
+    logger.info("PREDICTION SUMMARY")
+    logger.info("=" * 60)
+
+    for site in predictions_df['site_name'].unique():
+        site_df = predictions_df[predictions_df['site_name'] == site]
+        logger.info(f"\n{site} ({len(site_df)} tiles):")
+
+        # Log statistics for each band
+        for j in range(len([col for col in site_df.columns if col.endswith('_mean')])):
+            band_name = f'band_{j}'
+            if f'{band_name}_mean' in site_df.columns:
+                band_vals = site_df[f'{band_name}_mean']
+                logger.info(f"  {band_name}: mean={band_vals.mean():.3f}, std={band_vals.std():.3f}, "
+                           f"range=[{band_vals.min():.3f}, {band_vals.max():.3f}]")
+
+    logger.info("\n" + "=" * 60)
+    logger.info("Multi-GPU inference complete!")
 
 
 def main():
@@ -465,82 +735,99 @@ def main():
         '--device',
         type=str,
         default='cuda' if torch.cuda.is_available() else 'cpu',
-        help='Device to run inference on'
+        help='Device to run inference on (single-GPU mode only)'
     )
-    
+    parser.add_argument(
+        '--multi-gpu',
+        action='store_true',
+        help='Enable multi-GPU inference using DDP (default: single GPU)'
+    )
+    parser.add_argument(
+        '--num-gpus',
+        type=int,
+        default=None,
+        help='Number of GPUs to use for multi-GPU inference (default: all available)'
+    )
+
     args = parser.parse_args()
-    
-    # Setup
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(args.device)
-    
-    logger.info(f"Device: {device}")
-    
-    # Load model
-    model, config = build_model_from_checkpoint(args.checkpoint, device)
-    
-    # Load tiles
-    logger.info(f"Loading tiles from {args.input}")
-    tiles = torch.load(args.input, weights_only=False)
-    logger.info(f"Loaded {len(tiles)} tiles")
-    
-    # Load fuel stats for denormalization
-    fuel_stats = None
-    if Path(args.fuel_stats).exists():
-        with open(args.fuel_stats) as f:
-            fuel_stats = json.load(f)
-        logger.info(f"Loaded fuel stats from {args.fuel_stats}")
 
-        # Log if TFL log-transform will be inverted
-        if fuel_stats.get('use_log_tfl', False):
-            tfl_idx = fuel_stats.get('tfl_band_index', 7)
-            logger.info(f"TFL log-transform detected: will apply exp(x)-1 to band index {tfl_idx}")
+    # Dispatch to appropriate inference mode
+    if args.multi_gpu:
+        # Multi-GPU distributed inference
+        run_multi_gpu_inference(args)
     else:
-        logger.warning(f"Fuel stats not found at {args.fuel_stats}, predictions will be normalized")
-    
-    # Run inference
-    predictions_dict, predictions_df = run_inference(
-        model=model,
-        tiles=tiles,
-        batch_size=args.batch_size,
-        device=device,
-        fuel_stats=fuel_stats,
-        target_band_indices=config.target_band_indices
-    )
-    
-    # Save results
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save predictions dict
-    predictions_path = output_dir / f'forest_plot_predictions_{timestamp}.pt'
-    torch.save(predictions_dict, predictions_path)
-    logger.info(f"Saved predictions to {predictions_path}")
-    
-    # Save CSV summary
-    csv_path = output_dir / f'forest_plot_predictions_{timestamp}.csv'
-    predictions_df.to_csv(csv_path, index=False)
-    logger.info(f"Saved CSV summary to {csv_path}")
-    
-    # Print summary statistics
-    logger.info("\n" + "=" * 60)
-    logger.info("PREDICTION SUMMARY")
-    logger.info("=" * 60)
-    
-    for site in predictions_df['site_name'].unique():
-        site_df = predictions_df[predictions_df['site_name'] == site]
-        logger.info(f"\n{site} ({len(site_df)} tiles):")
+        # Single-GPU inference (original path)
+        # Setup
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        device = torch.device(args.device)
 
-        # Log statistics for each band
-        for j in range(len([col for col in site_df.columns if col.endswith('_mean')])):
-            band_name = f'band_{j}'
-            if f'{band_name}_mean' in site_df.columns:
-                band_vals = site_df[f'{band_name}_mean']
-                logger.info(f"  {band_name}: mean={band_vals.mean():.3f}, std={band_vals.std():.3f}, "
-                           f"range=[{band_vals.min():.3f}, {band_vals.max():.3f}]")
-    
-    logger.info("\n" + "=" * 60)
-    logger.info("Inference complete!")
+        logger.info(f"Device: {device}")
+
+        # Load model
+        model, config = build_model_from_checkpoint(args.checkpoint, device)
+
+        # Load tiles
+        logger.info(f"Loading tiles from {args.input}")
+        tiles = torch.load(args.input, weights_only=False)
+        logger.info(f"Loaded {len(tiles)} tiles")
+
+        # Load fuel stats for denormalization
+        fuel_stats = None
+        if Path(args.fuel_stats).exists():
+            with open(args.fuel_stats) as f:
+                fuel_stats = json.load(f)
+            logger.info(f"Loaded fuel stats from {args.fuel_stats}")
+
+            # Log if TFL log-transform will be inverted
+            if fuel_stats.get('use_log_tfl', False):
+                tfl_idx = fuel_stats.get('tfl_band_index', 7)
+                logger.info(f"TFL log-transform detected: will apply exp(x)-1 to band index {tfl_idx}")
+        else:
+            logger.warning(f"Fuel stats not found at {args.fuel_stats}, predictions will be normalized")
+
+        # Run inference
+        predictions_dict, predictions_df = run_inference(
+            model=model,
+            tiles=tiles,
+            batch_size=args.batch_size,
+            device=device,
+            fuel_stats=fuel_stats,
+            target_band_indices=config.target_band_indices
+        )
+
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Save predictions dict
+        predictions_path = output_dir / f'forest_plot_predictions_{timestamp}.pt'
+        torch.save(predictions_dict, predictions_path)
+        logger.info(f"Saved predictions to {predictions_path}")
+
+        # Save CSV summary
+        csv_path = output_dir / f'forest_plot_predictions_{timestamp}.csv'
+        predictions_df.to_csv(csv_path, index=False)
+        logger.info(f"Saved CSV summary to {csv_path}")
+
+        # Print summary statistics
+        logger.info("\n" + "=" * 60)
+        logger.info("PREDICTION SUMMARY")
+        logger.info("=" * 60)
+
+        for site in predictions_df['site_name'].unique():
+            site_df = predictions_df[predictions_df['site_name'] == site]
+            logger.info(f"\n{site} ({len(site_df)} tiles):")
+
+            # Log statistics for each band
+            for j in range(len([col for col in site_df.columns if col.endswith('_mean')])):
+                band_name = f'band_{j}'
+                if f'{band_name}_mean' in site_df.columns:
+                    band_vals = site_df[f'{band_name}_mean']
+                    logger.info(f"  {band_name}: mean={band_vals.mean():.3f}, std={band_vals.std():.3f}, "
+                               f"range=[{band_vals.min():.3f}, {band_vals.max():.3f}]")
+
+        logger.info("\n" + "=" * 60)
+        logger.info("Inference complete!")
 
 
 if __name__ == '__main__':

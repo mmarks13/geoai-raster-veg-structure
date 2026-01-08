@@ -36,7 +36,7 @@ def main():
         # Model architecture
         k=15,
         feature_dim=256,
-        pt_attn_dropout=0.00,
+        pt_attn_dropout=0.0,
 
         # Feature extractor heads
         extractor_lcl_heads=4,
@@ -49,14 +49,14 @@ def main():
         # Image encoder parameters
         img_embed_dim=128,
         img_num_patches=16,
-        naip_dropout=0.00,
-        uavsar_dropout=0.00,
+        naip_dropout=0.0,
+        uavsar_dropout=0.0,
         temporal_encoder="gru",
 
         # Fusion parameters
         fusion_type="cross_attention",
         fusion_num_heads=4,
-        fusion_dropout=0.00,
+        fusion_dropout=0.0,
         max_dist_ratio=8.0,  # Distance ratio in meters for cross-attention masking
 
         # Position Encoders
@@ -114,8 +114,12 @@ def main():
         # Stochastic depth (DropPath) - regularization for residual connections
         encoder_drop_path=0.0,      # Drop path for image encoder TransformerBlocks
         decoder_drop_path=0.0,      # Drop path for WideRasterDecoder (linearly increasing per block)
-        extractor_point_attn_drop_path=0.3,  # Drop path for feature extractor 
+        extractor_point_attn_drop_path=0.2,  # Drop path for feature extractor
         pre_agg_point_attn_drop_path=0.0,    # Drop path for pre-aggregation refinement blocks
+
+        # Position encoder regularization
+        pos_encoder_dropout=0.15,              # Dropout for position encoder (MLP + embedding) (point attn blocks 2+)
+        stochastic_pos_dropout_prob=0.20,     # Probability of zeroing position embedding (point attn blocks 2+)
 
         # Huber loss - robust to outliers in fuel metrics
         huber_delta=3.0,  # Delta threshold (errors > delta use linear penalty)
@@ -136,9 +140,10 @@ def main():
         # --- Point Cloud Augmentation ---
         # Coordinate jitter: adds Gaussian noise to x,y,z coords
         # x,y,z standard deviations are    2.9, 2.9, 6.2 respectively
-        # Physical effect: simulates point position uncertainty (~0.1m)
-        aug_coord_jitter_sigma=0.03,    # Noise std in z-score units
-        aug_coord_jitter_prob=0.85,      # Probability of applying jitter per tile
+        # Physical effect: simulates point position uncertainty 
+        aug_coord_jitter_sigma_xy=0.03,  # Noise std for x,y in z-score units
+        aug_coord_jitter_sigma_z=0.015,   # Noise std for z in z-score units
+        aug_coord_jitter_prob=0.4,      # Probability of applying jitter per tile
 
         # Intensity noise: adds Gaussian noise to intensity values
         # Physical effect: simulates sensor noise and atmospheric effects
@@ -147,7 +152,7 @@ def main():
 
         # Intensity outliers: randomly replaces intensity values with extreme values
         # Physical effect: simulates sensor saturation, multipath returns
-        aug_intensity_outlier_prob=0.005,  # Per-point probability of outlier
+        aug_intensity_outlier_prob=0.002,  # Per-point probability of outlier
 
         # Bird simulation: adds extreme z-offset to 1 random point
         # Physical effect: simulates bird/drone flyover returns in LiDAR
@@ -155,27 +160,25 @@ def main():
         aug_bird_z_offset_range=(5.0, 30.0),  # Z-score offset (≈25-75m physical)
 
 
-        ####### DO NOT USE UNTIL FIXED ########
-        ## IMPORTANT: THIS DOES NOT WORK DUE TO BATCH INDICES ISSUE. TURNED OFF ##
         # Point duplication (models redundant LiDAR returns)
-        aug_point_dup_tile_prob=0.0,          # % of tiles get duplication
-        aug_point_dup_min_point_prob=0.00,    # min-max% of points duplicated per tile
-        aug_point_dup_max_point_prob=0.0,
-        aug_point_dup_min_offset=0.001,       # Offset range: 0.001-0.2 z-score units
+        # Note: Only active when use_global_only=True (breaks precomputed KNN)
+        aug_point_dup_tile_prob=0.3,          # Probability tiles get duplication
+        aug_point_dup_min_point_prob=0.01,    # min probability of points duplicated per tile
+        aug_point_dup_max_point_prob=0.20,    # max probability of points duplicated per tile
+        aug_point_dup_min_offset=0.001,       # Offset range: z-score units
         aug_point_dup_max_offset=0.2,
-        ################################################################
 
 
         # Omnidirectional outliers
-        aug_omni_outlier_tile_prob=0.3,       # 20% of tiles get outliers
-        aug_omni_outlier_point_prob=0.002,     # 0.2% of points become outliers
+        aug_omni_outlier_tile_prob=0.15,       # fraction of tiles that get outliers
+        aug_omni_outlier_point_prob=0.002,     # fraction of points become outliers
         aug_omni_outlier_min_magnitude=2.0,   # Magnitude: 2-20 std dev
         aug_omni_outlier_max_magnitude=20.0,
 
         # --- Return Attribute Augmentation (return_num, n_returns) ---
         # Makes model robust to variations in LiDAR return patterns
         coordinate_normalization_stats_path="data/processed/model_data_veg_structure/coordinate_normalization_stats_train.json",
-        aug_return_scale_prob=0.6,            # Probability of scaling (stretch/shrink)
+        aug_return_scale_prob=0.3,            # Probability of scaling (stretch/shrink)
         aug_return_scale_range=(0.5, 1.8),    # Scale multiplier for raw integer values
         aug_return_noise_prob=0.2,            # Probability of adding Gaussian noise
         aug_return_noise_sigma=0.1,           # Noise std in z-score units
@@ -185,7 +188,7 @@ def main():
         # --- NAIP Augmentation (4-channel optical: RGBN) ---
         # Gaussian noise: simulates sensor noise
         aug_naip_noise_sigma=0.03,
-        aug_naip_noise_prob=0.15,
+        aug_naip_noise_prob=0.1,
 
         # Gaussian blur: simulates atmospheric haze, focus issues
         aug_naip_blur_kernel=3,
@@ -206,12 +209,12 @@ def main():
         aug_naip_sharpness_prob=0.1,
 
         # Histogram equalization: simulates varying exposure/contrast
-        aug_naip_equalize_prob=0.3,
+        aug_naip_equalize_prob=0.2,
 
         # --- UAVSAR Augmentation (6-channel SAR: polarimetric) ---
         # Gaussian noise: simulates thermal/system noise (valid in dB domain)
         aug_uavsar_noise_sigma=0.05,
-        aug_uavsar_noise_prob=0.15,
+        aug_uavsar_noise_prob=0.1,
 
         # Gaussian blur: simulates multi-looking (speckle filtering)
         aug_uavsar_blur_kernel=3,
@@ -221,11 +224,11 @@ def main():
         # Motion blur: simulates platform motion effects
         aug_uavsar_motion_blur_kernel=3,
         aug_uavsar_motion_blur_angle=(-30.0, 30.0),
-        aug_uavsar_motion_blur_prob=0.15,
+        aug_uavsar_motion_blur_prob=0.1,
 
         # Random erasing (sets value to 0, mean is z-score space)
         aug_uavsar_erasing_scale=(0.10, 0.20),
-        aug_uavsar_erasing_prob=0.05,
+        aug_uavsar_erasing_prob=0.0,
 
         # --- Synchronized Geometric Augmentation ---
         # Applies identical rotation/reflection to points, images, and targets
@@ -244,28 +247,37 @@ def main():
         aug_uavsar_g_min_images=1,  # Minimum images to keep per group
 
 
-        aug_temporal_shift_prob=0.95,          # 95% of tiles get temporal shift
+        aug_temporal_shift_prob=0.5,          # 50% of tiles get temporal shift
         aug_temporal_max_shift_days=365.0,    # ±365 days (12 months)
 
 
         # --- Modality Dropout Augmentation ---
         # Randomly drops entire modalities for robustness (e.g., Laguna has no UAVSAR)
         aug_modality_dropout_enabled=True,
-        aug_naip_dropout_prob=0.20,  # Probability of dropping NAIP entirely
-        aug_uavsar_dropout_prob=0.20,  # Probability of dropping UAVSAR entirely
+        aug_naip_dropout_prob=0.15,  # Probability of dropping NAIP entirely
+        aug_uavsar_dropout_prob=0.15,  # Probability of dropping UAVSAR entirely
 
         # --- Point Cloud Sparse Augmentation (Global-Only Mode) ---
         # Randomly removes points (only when use_global_only=True)
         aug_point_removal_enabled=True,  # Enable only with use_global_only=True
-        aug_point_removal_prob=0.99,  # Probability of applying point removal
+        aug_point_removal_prob=0.70,  # Probability of applying point removal
         aug_point_min_removal_ratio=0.001,  # Min fraction of points to remove
-        aug_point_max_removal_ratio=0.95,  # Max fraction of points to remove
+        aug_point_max_removal_ratio=0.9,  # Max fraction of points to remove
         aug_point_min_points=20,  # Minimum points to keep
 
         # --- Global-Only Attention Mode ---
         # Uses two consecutive global attention blocks (no local KNN)
         # Enables online point removal since global attention computes positions dynamically
         use_global_only=True,
+
+        # --- OOD Robustness (Spectral Normalization + SWA) ---
+        # Spectral Normalization (Lipschitz constraint for OOD robustness)
+        use_spectral_norm=True,  # Set to True to enable
+
+        # Stochastic Weight Averaging (model ensemble for OOD robustness)
+        swa_enabled=True,         # Set to True to enable
+        swa_start_epoch=110,       # Start averaging at this epoch (w/checkpoint this ignores the restart epoch. indexes at 0 again)
+        swa_update_freq=1,         # Update every epoch
     )
 
     # ====== Data Paths ======
@@ -287,19 +299,19 @@ def main():
     output_dir = f"data/output/raster_model_{modality_str}_{timestamp}"
 
     # ====== Training Hyperparameters ======
-    num_epochs = 450
+    num_epochs = 200
     batch_size = 10  # Batch size per GPU
-    learning_rate = 3e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
-    weight_decay = 0.5  # Weight regularization
+    learning_rate = 2.5e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)    
+    weight_decay = 0.05  # Weight regularization
     beta1 = 0.95  # AdamW momentum (exponential moving average of gradients)
     beta2 = 0.999  # AdamW momentum (exponential moving average of squared gradients)
-    gradient_accumulation_steps = 6  # Gradient accumulation for effective larger batches
+    gradient_accumulation_steps = 1  # Gradient accumulation for effective larger batches
     max_grad_norm = 3  # prevent large gradient updates
     save_every_n_epochs = 5  # Save checkpoint every N epochs
     use_amp = True  # Automatic mixed precision (bfloat16)
-    early_stopping_patience = 80  # Epochs without improvement before stopping
+    early_stopping_patience = 15  # Epochs without improvement before stopping
     early_stopping_metric = "loss"  # Metric to monitor for early stopping
-    warmup_steps_percentage = 0.02
+    warmup_steps_percentage = 0.06
     seed = 42
     num_gpus = None  # None = use all available GPUs
 
@@ -308,7 +320,7 @@ def main():
     # Set this to resume training from a checkpoint (loads model weights + optimizer state)
     # This is different from checkpoint_path in config (which only loads weights for transfer learning)
     # Note: Use best_model.pth (has correct epoch) instead of final_model.pth (had a bug with epoch number)
-    resume_checkpoint_path = None #"data/output/raster_model_fused_20251228_220537/checkpoints/best_model.pth"
+    resume_checkpoint_path = None #"data/output/raster_model_fused_20260103_181833/checkpoints/epoch_70.pth"
 
 
     # ====== Print Configuration ======
@@ -357,6 +369,12 @@ def main():
     print(f"  Correlation loss weight: {config.correlation_loss_weight}")
     print(f"  Loss = Huber(delta={config.huber_delta}) + {config.correlation_loss_weight} * (1 - pearson_r)")
     print(f"  (MSE also logged to TensorBoard for comparison)")
+    print(f"\nRegularization (OOD Robustness):")
+    print(f"  Spectral normalization: {config.use_spectral_norm}")
+    print(f"  SWA enabled: {config.swa_enabled}")
+    if config.swa_enabled:
+        print(f"    SWA start epoch: {config.swa_start_epoch}")
+        print(f"    SWA update frequency: every {config.swa_update_freq} epoch(s)")
     print("=" * 80)
 
     # ====== Start Training ======

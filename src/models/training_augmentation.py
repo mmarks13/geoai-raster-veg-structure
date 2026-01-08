@@ -27,7 +27,8 @@ class PointCloudAugmentation(nn.Module):
 
     def __init__(
         self,
-        coord_jitter_sigma: float = 0.02,  # In z-score units (~0.1m physical)
+        coord_jitter_sigma_xy: float = 0.03,  # Separate sigma for x,y
+        coord_jitter_sigma_z: float = 0.01,   # Separate sigma for z
         coord_jitter_prob: float = 0.5,
         intensity_noise_sigma: float = 0.05,
         intensity_noise_prob: float = 0.3,
@@ -49,7 +50,8 @@ class PointCloudAugmentation(nn.Module):
         aug_omni_outlier_max_magnitude: float = 20.0,
     ):
         super().__init__()
-        self.coord_jitter_sigma = coord_jitter_sigma
+        self.coord_jitter_sigma_xy = coord_jitter_sigma_xy
+        self.coord_jitter_sigma_z = coord_jitter_sigma_z
         self.coord_jitter_prob = coord_jitter_prob
         self.intensity_noise_sigma = intensity_noise_sigma
         self.intensity_noise_prob = intensity_noise_prob
@@ -77,9 +79,11 @@ class PointCloudAugmentation(nn.Module):
         if not self.training:
             return coords, attrs
 
-        # Coordinate jitter (all 3 dims) - zero GPU→CPU syncs
+        # Coordinate jitter (separate xy and z sigmas) - zero GPU→CPU syncs
         do_jitter = (torch.rand(1, device=coords.device) < self.coord_jitter_prob).float()
-        noise = torch.randn_like(coords) * self.coord_jitter_sigma * do_jitter
+        noise = torch.randn_like(coords) * do_jitter
+        noise[:, :2] *= self.coord_jitter_sigma_xy
+        noise[:, 2] *= self.coord_jitter_sigma_z
         coords = coords + noise
 
         # Intensity noise (first column of attrs only) - zero GPU→CPU syncs
@@ -115,68 +119,82 @@ class PointCloudAugmentation(nn.Module):
         if self.aug_omni_outlier_tile_prob > 0 and coords.shape[0] > 0:
             coords = self.augment_omnidirectional_outliers(coords, coords.device)
 
-        # Point duplication (last to avoid amplifying outliers)
-        if self.aug_point_dup_tile_prob > 0 and coords.shape[0] > 0:
-            coords = self.augment_point_duplication(coords, coords.device)
+        # Note: Point duplication is handled separately via augment_batch_point_duplication()
+        # because it needs to update batch_indices
 
         return coords, attrs
 
-    def augment_point_duplication(
+    def augment_batch_point_duplication(
         self,
-        coords: torch.Tensor,
-        device: torch.device
-    ) -> torch.Tensor:
+        coords: torch.Tensor,        # [N_total, 3]
+        attrs: torch.Tensor,         # [N_total, 3]
+        batch_indices: torch.Tensor  # [N_total]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Duplicate random points with small offsets.
-
-        Two-tier probability:
-        1. Tile-level: whether to apply duplication to this tile
-        2. Point-level: per-point probability (sampled from range)
+        Batch-aware point duplication that properly updates batch_indices.
+        GPU-native: all tensor operations on GPU, minimal CPU syncs.
 
         Args:
-            coords: [N, 3] point coordinates (z-score normalized)
-            device: torch device
+            coords: [N_total, 3] batched point coordinates
+            attrs: [N_total, 3] batched point attributes
+            batch_indices: [N_total] tile assignment for each point
 
         Returns:
-            augmented_coords: [N+K, 3] where K is number of duplicates
+            Tuple of (coords, attrs, batch_indices) with duplicates added.
         """
-        # Tile-level probability
-        do_dup = (torch.rand(1, device=device) < self.aug_point_dup_tile_prob).float()
+        if not self.training:
+            return coords, attrs, batch_indices
 
-        if do_dup.item() == 0:
-            return coords
+        if self.aug_point_dup_tile_prob == 0:
+            return coords, attrs, batch_indices
 
-        # Sample point-level probability from range
-        point_prob = torch.empty(1, device=device).uniform_(
-            self.aug_point_dup_min_point_prob,
-            self.aug_point_dup_max_point_prob
+        device = coords.device
+        batch_size = batch_indices.max().item() + 1  # Single GPU->CPU sync
+
+        # Pre-compute random decisions for all tiles (single GPU->CPU transfer)
+        do_dup_tiles = (torch.rand(batch_size, device=device) < self.aug_point_dup_tile_prob).cpu()
+        point_probs = torch.empty(batch_size, device=device).uniform_(
+            self.aug_point_dup_min_point_prob, self.aug_point_dup_max_point_prob
+        ).cpu()
+
+        # Collect augmented tensors per tile
+        new_coords_list = []
+        new_attrs_list = []
+        new_batch_list = []
+
+        for b in range(batch_size):
+            mask_b = (batch_indices == b)
+            coords_b = coords[mask_b]
+            attrs_b = attrs[mask_b]
+
+            if do_dup_tiles[b] and coords_b.shape[0] > 0:
+                # Per-point duplication (GPU operations)
+                dup_mask = torch.rand(coords_b.shape[0], device=device) < point_probs[b]
+                if dup_mask.any():
+                    points_to_dup = coords_b[dup_mask]
+                    attrs_to_dup = attrs_b[dup_mask]
+
+                    # Random offsets (GPU)
+                    offset_mags = torch.empty(points_to_dup.shape[0], device=device).uniform_(
+                        self.aug_point_dup_min_offset, self.aug_point_dup_max_offset
+                    )
+                    offset_dirs = torch.randn(points_to_dup.shape[0], 3, device=device)
+                    offset_dirs = offset_dirs / (offset_dirs.norm(dim=1, keepdim=True) + 1e-8)
+                    duplicated_points = points_to_dup + offset_mags.unsqueeze(1) * offset_dirs
+
+                    # Concatenate original + duplicated
+                    coords_b = torch.cat([coords_b, duplicated_points], dim=0)
+                    attrs_b = torch.cat([attrs_b, attrs_to_dup], dim=0)
+
+            new_coords_list.append(coords_b)
+            new_attrs_list.append(attrs_b)
+            new_batch_list.append(torch.full((coords_b.shape[0],), b, dtype=batch_indices.dtype, device=device))
+
+        return (
+            torch.cat(new_coords_list, dim=0),
+            torch.cat(new_attrs_list, dim=0),
+            torch.cat(new_batch_list, dim=0)
         )
-
-        # Point-level duplication mask
-        dup_mask = torch.rand(coords.shape[0], device=device) < point_prob
-
-        if not dup_mask.any():
-            return coords
-
-        # Get points to duplicate
-        points_to_dup = coords[dup_mask]  # [K, 3]
-
-        # Sample offset magnitudes from range
-        offset_mags = torch.empty(points_to_dup.shape[0], device=device).uniform_(
-            self.aug_point_dup_min_offset,
-            self.aug_point_dup_max_offset
-        )
-
-        # Sample random 3D directions (uniform on sphere)
-        offset_dirs = torch.randn(points_to_dup.shape[0], 3, device=device)
-        offset_dirs = offset_dirs / (offset_dirs.norm(dim=1, keepdim=True) + 1e-8)
-
-        # Apply offsets
-        offsets = offset_mags.unsqueeze(1) * offset_dirs
-        duplicated_points = points_to_dup + offsets
-
-        # Concatenate duplicates
-        return torch.cat([coords, duplicated_points], dim=0)
 
     def augment_omnidirectional_outliers(
         self,
@@ -906,7 +924,8 @@ class TrainingAugmentation(nn.Module):
         if self.enabled:
             # Point cloud augmentation
             self.point_aug = PointCloudAugmentation(
-                coord_jitter_sigma=getattr(config, 'aug_coord_jitter_sigma', 0.02),
+                coord_jitter_sigma_xy=getattr(config, 'aug_coord_jitter_sigma_xy', 0.03),
+                coord_jitter_sigma_z=getattr(config, 'aug_coord_jitter_sigma_z', 0.01),
                 coord_jitter_prob=getattr(config, 'aug_coord_jitter_prob', 0.5),
                 intensity_noise_sigma=getattr(config, 'aug_intensity_noise_sigma', 0.05),
                 intensity_noise_prob=getattr(config, 'aug_intensity_noise_prob', 0.3),
@@ -1319,6 +1338,28 @@ class TrainingAugmentation(nn.Module):
         if not getattr(self, 'point_removal_enabled', False):
             return coords, attrs, batch_indices
         return self.point_removal(coords, attrs, batch_indices)
+
+    def apply_point_duplication(
+        self,
+        coords: torch.Tensor,
+        attrs: torch.Tensor,
+        batch_indices: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply point duplication augmentation (only with global-only mode).
+
+        Note: Only use when use_global_only=True, since KNN graphs would be invalidated.
+
+        Args:
+            coords: [N, 3] point coordinates
+            attrs: [N, 3] point attributes
+            batch_indices: [N] batch index for each point
+
+        Returns:
+            Tuple of (coords, attrs, batch_indices) with duplicated points added.
+        """
+        if not self.enabled or not self.training:
+            return coords, attrs, batch_indices
+        return self.point_aug.augment_batch_point_duplication(coords, attrs, batch_indices)
 
     def augment_batch_geometric(
         self,
