@@ -71,13 +71,22 @@ class MultimodalRasterConfig:
     img_embed_dim: int = 128
     img_num_patches: int = 16
 
-    # Fusion parameters (cross-attention only for raster model)
+    # Fusion parameters
+    # fusion_type: "cross_attention" (points attend to images) or "grid_cross_attention" (grid queries attend to all)
     fusion_type: str = "cross_attention"
     max_dist_ratio: float = 5.0  # Maximum distance in METERS for cross-attention masking (note: parameter name is misleading)
     fusion_num_heads: int = 4
     fusion_dropout: float = 0.1
-    position_encoding_dim: int = 24  # Must be divisible by 6 for 3D positions (2 * D_pos = 2 * 3 = 6)
+    position_encoding_dim: int = 48  # Must be divisible by 6 for 3D positions (2 * D_pos = 2 * 3 = 6)
     use_batched_fusion: bool = True  # Use batched fusion (2x faster) vs original per-tile loop
+
+    # GridCrossAttention-specific parameters (used when fusion_type="grid_cross_attention")
+    # Grid queries attend to all sources: [N points + 16 NAIP patches + 16 UAVSAR patches]
+    grid_fusion_num_heads: int = 8  # 8 heads → 32 dim per head (with feature_dim=256)
+    grid_fusion_distance_sigma: Union[float, List[float]] = field(
+        default_factory=lambda: [1.0, 1.5, 2.5, 3.0, 3.5, 4.0, 6.0, 8.0]
+    )  # 2 local (point-dominant), 4 balanced, 2 wide (patch-inclusive)
+    grid_fusion_dropout: float = 0.1
 
     # Encoder dropouts
     naip_dropout: float = 0.1
@@ -266,6 +275,10 @@ class MultimodalRasterConfig:
                 self.fusion_dropout,
                 self.position_encoding_dim,
                 self.use_batched_fusion,
+                # Grid fusion parameters
+                self.grid_fusion_num_heads,
+                self.grid_fusion_distance_sigma,
+                self.grid_fusion_dropout,
                 self.naip_dropout,
                 self.uavsar_dropout,
                 self.temporal_encoder,
@@ -518,45 +531,83 @@ class MultimodalRasterPredictor(nn.Module):
                 drop_path=config.encoder_drop_path
             )
 
-        # ====== 3) Fusion Module (shared, with norm_params support) ======
-        self.fusion = CrossAttentionFusion(
-            point_dim=config.feature_dim,
-            patch_dim=config.img_embed_dim,
-            use_naip=self.use_naip,
-            use_uavsar=self.use_uavsar,
-            num_patches=config.img_num_patches,
-            max_dist_ratio=config.max_dist_ratio,
-            num_heads=config.fusion_num_heads,
-            attention_dropout=config.fusion_dropout,
-            position_encoding_dim=config.position_encoding_dim
-        )
+        # ====== 3) Fusion and Raster Head ======
+        # Two approaches:
+        # - "cross_attention": Points attend to images → RasterPredictionHead (grid queries attend to points)
+        # - "grid_cross_attention": Grid queries attend to all sources (points + patches) directly
+        if config.fusion_type == "grid_cross_attention":
+            # Grid Cross-Attention: Single unified step
+            from .grid_cross_attention import GridCrossAttentionFusion
+            from .raster_head import WideRasterDecoder
 
-        # ====== 4) Raster Prediction Head (raster-specific) ======
-        self.raster_head = RasterPredictionHead(
-            feature_dim=config.feature_dim,
-            n_bands=config.n_bands,
-            num_heads=config.raster_num_heads,
-            distance_sigma=config.raster_distance_sigma,  # RASTER MODEL: Soft Gaussian weighting
-            grid_size=config.grid_size,
-            tile_extent=config.tile_extent,
-            hidden_dim=config.raster_hidden_dim,
-            num_decoder_layers=config.raster_decoder_layers,
-            attention_dropout=config.raster_attention_dropout,  # Split dropout: attention
-            decoder_dropout=config.raster_decoder_dropout,  # Split dropout: decoder MLP
-            use_wide_decoder=config.raster_use_wide_decoder,  # Wide decoder with Pre-LN residuals
-            decoder_drop_path=config.decoder_drop_path,  # Stochastic depth for decoder
-            num_pre_agg_blocks=config.num_pre_agg_blocks,
-            pre_agg_lcl_heads=config.pre_agg_lcl_heads,
-            pre_agg_glbl_heads=config.pre_agg_glbl_heads,
-            pre_agg_dropout=config.pre_agg_dropout,
-            pre_agg_k_neighbors=config.pre_agg_k_neighbors,
-            position_encoding_dim=config.position_encoding_dim,
-            point_attn_drop_path=config.pre_agg_point_attn_drop_path,  # Stochastic depth for pre-agg blocks
-            use_v2_attention=config.use_v2_attention,  # V2 attention for pre-agg blocks
-            use_spectral_norm=config.use_spectral_norm,  # Spectral normalization for OOD robustness
-            pos_encoder_dropout=pos_encoder_dropout,
-            stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
-        )
+            self.grid_fusion = GridCrossAttentionFusion(
+                point_dim=config.feature_dim,
+                patch_dim=config.img_embed_dim,
+                grid_size=config.grid_size,
+                tile_extent=config.tile_extent,
+                num_heads=config.grid_fusion_num_heads,
+                distance_sigma=config.grid_fusion_distance_sigma,
+                dropout=config.grid_fusion_dropout,
+                use_naip=self.use_naip,
+                use_uavsar=self.use_uavsar
+            )
+
+            # Raster decoder (grid_fusion outputs [B, 5, 5, feature_dim])
+            self.raster_decoder = WideRasterDecoder(
+                feature_dim=config.feature_dim,
+                n_bands=config.n_bands,
+                num_layers=config.raster_decoder_layers,
+                dropout=config.raster_decoder_dropout,
+                drop_path=config.decoder_drop_path,
+                use_spectral_norm=config.use_spectral_norm
+            )
+
+            # Set fusion and raster_head to None for compatibility checks
+            self.fusion = None
+            self.raster_head = None
+        else:
+            # Standard: CrossAttentionFusion + RasterPredictionHead
+            self.fusion = CrossAttentionFusion(
+                point_dim=config.feature_dim,
+                patch_dim=config.img_embed_dim,
+                use_naip=self.use_naip,
+                use_uavsar=self.use_uavsar,
+                num_patches=config.img_num_patches,
+                max_dist_ratio=config.max_dist_ratio,
+                num_heads=config.fusion_num_heads,
+                attention_dropout=config.fusion_dropout,
+                position_encoding_dim=config.position_encoding_dim
+            )
+
+            self.raster_head = RasterPredictionHead(
+                feature_dim=config.feature_dim,
+                n_bands=config.n_bands,
+                num_heads=config.raster_num_heads,
+                distance_sigma=config.raster_distance_sigma,
+                grid_size=config.grid_size,
+                tile_extent=config.tile_extent,
+                hidden_dim=config.raster_hidden_dim,
+                num_decoder_layers=config.raster_decoder_layers,
+                attention_dropout=config.raster_attention_dropout,
+                decoder_dropout=config.raster_decoder_dropout,
+                use_wide_decoder=config.raster_use_wide_decoder,
+                decoder_drop_path=config.decoder_drop_path,
+                num_pre_agg_blocks=config.num_pre_agg_blocks,
+                pre_agg_lcl_heads=config.pre_agg_lcl_heads,
+                pre_agg_glbl_heads=config.pre_agg_glbl_heads,
+                pre_agg_dropout=config.pre_agg_dropout,
+                pre_agg_k_neighbors=config.pre_agg_k_neighbors,
+                position_encoding_dim=config.position_encoding_dim,
+                point_attn_drop_path=config.pre_agg_point_attn_drop_path,
+                use_v2_attention=config.use_v2_attention,
+                use_spectral_norm=config.use_spectral_norm,
+                pos_encoder_dropout=pos_encoder_dropout,
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
+            )
+
+            # Set grid_fusion and raster_decoder to None for compatibility checks
+            self.grid_fusion = None
+            self.raster_decoder = None
 
         # ====== 5) GPU Training Augmentation (raster model only) ======
         self.training_aug = TrainingAugmentation(config)
@@ -780,121 +831,157 @@ class MultimodalRasterPredictor(nn.Module):
                 naip_embeddings_list, uavsar_embeddings_list, device
             )
 
-        # ====== 3) Fusion ======
-        if self.config.use_batched_fusion:
-            # Batched fusion (2x faster, no CPU sync)
-            # Stack embeddings into batched tensors for efficient processing
+        # ====== 3) Fusion and 4) Raster Prediction ======
+        # Stack embeddings into batched tensors (needed for both fusion types)
+        naip_stacked = None
+        uavsar_stacked = None
 
-            # Stack NAIP embeddings: [B, P, D_patch]
-            naip_stacked = None
-            naip_mask = None
-            if self.use_naip and len(naip_embeddings_list) > 0:
-                num_patches = self.config.img_num_patches
-                embed_dim = self.config.img_embed_dim
-                naip_stacked = torch.zeros(batch_size, num_patches, embed_dim, device=device)
-                naip_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-                for b, emb in enumerate(naip_embeddings_list):
-                    if emb is not None:
-                        naip_stacked[b] = emb
-                        naip_mask[b] = True
+        if self.use_naip and len(naip_embeddings_list) > 0:
+            num_patches = self.config.img_num_patches
+            embed_dim = self.config.img_embed_dim
+            naip_stacked = torch.zeros(batch_size, num_patches, embed_dim, device=device)
+            for b, emb in enumerate(naip_embeddings_list):
+                if emb is not None:
+                    naip_stacked[b] = emb
 
-            # Stack UAVSAR embeddings: [B, P, D_patch]
-            uavsar_stacked = None
-            uavsar_mask = None
-            if self.use_uavsar and len(uavsar_embeddings_list) > 0:
-                num_patches = self.config.img_num_patches
-                embed_dim = self.config.img_embed_dim
-                uavsar_stacked = torch.zeros(batch_size, num_patches, embed_dim, device=device)
-                uavsar_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-                for b, emb in enumerate(uavsar_embeddings_list):
-                    if emb is not None:
-                        uavsar_stacked[b] = emb
-                        uavsar_mask[b] = True
+        if self.use_uavsar and len(uavsar_embeddings_list) > 0:
+            num_patches = self.config.img_num_patches
+            embed_dim = self.config.img_embed_dim
+            uavsar_stacked = torch.zeros(batch_size, num_patches, embed_dim, device=device)
+            for b, emb in enumerate(uavsar_embeddings_list):
+                if emb is not None:
+                    uavsar_stacked[b] = emb
 
-            # Build modality mask dict
-            modality_mask = {}
-            if naip_mask is not None:
-                modality_mask['naip'] = naip_mask
-            if uavsar_mask is not None:
-                modality_mask['uavsar'] = uavsar_mask
-
-            # Batched fusion call
-            x_fused = self.fusion.forward_batched(
+        if self.config.fusion_type == "grid_cross_attention":
+            # Grid Cross-Attention: Single unified step
+            # Grid queries attend directly to [points + NAIP patches + UAVSAR patches]
+            grid_features = self.grid_fusion(
                 point_features=x_feat,
                 point_positions=dep_points,
                 batch_indices=batch_indices,
                 norm_params=norm_params,
                 naip_embeddings=naip_stacked,
-                uavsar_embeddings=uavsar_stacked,
-                modality_mask=modality_mask if modality_mask else None
-            )  # [N_total, feature_dim]
+                uavsar_embeddings=uavsar_stacked
+            )  # [batch_size, 5, 5, feature_dim]
 
             if debug_logging:
-                has_nan = torch.isnan(x_fused).any().item()
-                print(f"  [DEBUG] After batched fusion: NaN={has_nan}")
+                has_nan = torch.isnan(grid_features).any().item()
+                print(f"  [DEBUG] After grid_fusion: NaN={has_nan}")
                 if has_nan:
-                    print(f"    NaN count: {torch.isnan(x_fused).sum().item()}/{x_fused.numel()}")
+                    print(f"    NaN count: {torch.isnan(grid_features).sum().item()}/{grid_features.numel()}")
+
+            # Decode to raster
+            pred_raster = self.raster_decoder(grid_features)  # [batch_size, n_bands, 5, 5]
+
+            if debug_logging:
+                has_nan = torch.isnan(pred_raster).any().item()
+                print(f"  [DEBUG] After raster_decoder: NaN={has_nan}")
+                if has_nan:
+                    print(f"    NaN count: {torch.isnan(pred_raster).sum().item()}/{pred_raster.numel()}")
+
         else:
-            # Original per-tile loop (for comparison/debugging)
-            fused_features = []
+            # Standard: CrossAttentionFusion + RasterPredictionHead
+            if self.config.use_batched_fusion:
+                # Batched fusion (2x faster, no CPU sync)
+                naip_mask = None
+                uavsar_mask = None
 
-            for b in range(batch_size):
-                # Get points and features for this tile
-                mask_b = (batch_indices == b)
-                dep_points_b = dep_points[mask_b]  # [N_b, 3]
-                x_feat_b = x_feat[mask_b]  # [N_b, feature_dim]
+                if naip_stacked is not None:
+                    naip_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                    for b, emb in enumerate(naip_embeddings_list):
+                        if emb is not None:
+                            naip_mask[b] = True
 
-                # Get imagery embeddings for this tile
-                naip_emb_b = naip_embeddings_list[b] if len(naip_embeddings_list) > 0 else None
-                uavsar_emb_b = uavsar_embeddings_list[b] if len(uavsar_embeddings_list) > 0 else None
+                if uavsar_stacked is not None:
+                    uavsar_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                    for b, emb in enumerate(uavsar_embeddings_list):
+                        if emb is not None:
+                            uavsar_mask[b] = True
 
-                # Get imagery bboxes
-                naip_bbox_b = None
-                if naip is not None and naip[b] is not None:
-                    naip_bbox_b = naip[b].get('img_bbox', None)
+                # Build modality mask dict
+                modality_mask = {}
+                if naip_mask is not None:
+                    modality_mask['naip'] = naip_mask
+                if uavsar_mask is not None:
+                    modality_mask['uavsar'] = uavsar_mask
 
-                uavsar_bbox_b = None
-                if uavsar is not None and uavsar[b] is not None:
-                    uavsar_bbox_b = uavsar[b].get('img_bbox', None)
-
-                # Apply fusion with norm_params for denormalization
-                x_fused_b = self.fusion(
-                    point_features=x_feat_b,
-                    edge_index=None,
-                    point_positions=dep_points_b,
-                    naip_embeddings=naip_emb_b,
-                    uavsar_embeddings=uavsar_emb_b,
-                    main_bbox=None,
-                    naip_bbox=naip_bbox_b,
-                    uavsar_bbox=uavsar_bbox_b,
-                    center=None,
-                    scale=None,
-                    norm_params=norm_params[b]
-                )  # [N_b, feature_dim]
+                # Batched fusion call
+                x_fused = self.fusion.forward_batched(
+                    point_features=x_feat,
+                    point_positions=dep_points,
+                    batch_indices=batch_indices,
+                    norm_params=norm_params,
+                    naip_embeddings=naip_stacked,
+                    uavsar_embeddings=uavsar_stacked,
+                    modality_mask=modality_mask if modality_mask else None
+                )  # [N_total, feature_dim]
 
                 if debug_logging:
-                    has_nan = torch.isnan(x_fused_b).any().item()
-                    print(f"  [DEBUG] After fusion (tile {b}): NaN={has_nan}")
+                    has_nan = torch.isnan(x_fused).any().item()
+                    print(f"  [DEBUG] After batched fusion: NaN={has_nan}")
                     if has_nan:
-                        print(f"    NaN count: {torch.isnan(x_fused_b).sum().item()}/{x_fused_b.numel()}")
+                        print(f"    NaN count: {torch.isnan(x_fused).sum().item()}/{x_fused.numel()}")
+            else:
+                # Original per-tile loop (for comparison/debugging)
+                fused_features = []
 
-                fused_features.append(x_fused_b)
+                for b in range(batch_size):
+                    # Get points and features for this tile
+                    mask_b = (batch_indices == b)
+                    dep_points_b = dep_points[mask_b]  # [N_b, 3]
+                    x_feat_b = x_feat[mask_b]  # [N_b, feature_dim]
 
-            # Concatenate fused features back to full batch
-            x_fused = torch.cat(fused_features, dim=0)  # [N_total, feature_dim]
+                    # Get imagery embeddings for this tile
+                    naip_emb_b = naip_embeddings_list[b] if len(naip_embeddings_list) > 0 else None
+                    uavsar_emb_b = uavsar_embeddings_list[b] if len(uavsar_embeddings_list) > 0 else None
 
-        # ====== 4) Raster Prediction ======
-        pred_raster = self.raster_head(
-            point_features=x_fused,
-            point_positions=dep_points,
-            batch_indices=batch_indices,
-            norm_params=norm_params
-        )  # [batch_size, n_bands, 5, 5]
+                    # Get imagery bboxes
+                    naip_bbox_b = None
+                    if naip is not None and naip[b] is not None:
+                        naip_bbox_b = naip[b].get('img_bbox', None)
 
-        if debug_logging:
-            has_nan = torch.isnan(pred_raster).any().item()
-            print(f"  [DEBUG] After raster_head: NaN={has_nan}")
-            if has_nan:
-                print(f"    NaN count: {torch.isnan(pred_raster).sum().item()}/{pred_raster.numel()}")
+                    uavsar_bbox_b = None
+                    if uavsar is not None and uavsar[b] is not None:
+                        uavsar_bbox_b = uavsar[b].get('img_bbox', None)
+
+                    # Apply fusion with norm_params for denormalization
+                    x_fused_b = self.fusion(
+                        point_features=x_feat_b,
+                        edge_index=None,
+                        point_positions=dep_points_b,
+                        naip_embeddings=naip_emb_b,
+                        uavsar_embeddings=uavsar_emb_b,
+                        main_bbox=None,
+                        naip_bbox=naip_bbox_b,
+                        uavsar_bbox=uavsar_bbox_b,
+                        center=None,
+                        scale=None,
+                        norm_params=norm_params[b]
+                    )  # [N_b, feature_dim]
+
+                    if debug_logging:
+                        has_nan = torch.isnan(x_fused_b).any().item()
+                        print(f"  [DEBUG] After fusion (tile {b}): NaN={has_nan}")
+                        if has_nan:
+                            print(f"    NaN count: {torch.isnan(x_fused_b).sum().item()}/{x_fused_b.numel()}")
+
+                    fused_features.append(x_fused_b)
+
+                # Concatenate fused features back to full batch
+                x_fused = torch.cat(fused_features, dim=0)  # [N_total, feature_dim]
+
+            # Raster Prediction (standard path)
+            pred_raster = self.raster_head(
+                point_features=x_fused,
+                point_positions=dep_points,
+                batch_indices=batch_indices,
+                norm_params=norm_params
+            )  # [batch_size, n_bands, 5, 5]
+
+            if debug_logging:
+                has_nan = torch.isnan(pred_raster).any().item()
+                print(f"  [DEBUG] After raster_head: NaN={has_nan}")
+                if has_nan:
+                    print(f"    NaN count: {torch.isnan(pred_raster).sum().item()}/{pred_raster.numel()}")
 
         return pred_raster

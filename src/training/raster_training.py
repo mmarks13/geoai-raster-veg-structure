@@ -64,6 +64,325 @@ def find_free_port(start_port: int = 12355, max_attempts: int = 100) -> int:
     raise RuntimeError(f"Could not find free port after {max_attempts} attempts starting from {start_port}")
 
 
+# =============================================================================
+# Transfer Learning Utilities
+# =============================================================================
+
+def load_checkpoint_for_transfer(
+    model: nn.Module,
+    checkpoint_path,  # str or List[Tuple] for multi-checkpoint loading
+    layers_to_load: Optional[List[str]] = None,
+    layers_to_freeze: Optional[List[str]] = None,
+    key_prefix_map: Optional[Dict[str, str]] = None,
+    device: torch.device = None,
+    rank: int = 0
+) -> Tuple[nn.Module, set, set]:
+    """
+    Load weights from a checkpoint for transfer learning.
+
+    Handles dimension mismatches gracefully by skipping incompatible layers.
+    Supports prefix-based layer selection, freezing, and key remapping.
+
+    Args:
+        model: The model to load weights into (already on device)
+        checkpoint_path: Path to checkpoint file (.pth), OR a list of tuples for
+                        multi-checkpoint loading. Tuples can be:
+                        - (path, layers_to_load) - 2-element tuple
+                        - (path, layers_to_load, key_prefix_map) - 3-element tuple
+                        Example: [
+                            ("baseline.pth", ["feature_extractor"], None),
+                            ("naip.pth", ["encoder"], {"encoder": "naip_encoder"}),
+                        ]
+        layers_to_load: If None, load ALL matching layers. If list of prefixes,
+                        only load layers matching these prefixes (e.g., ['feature_extractor']).
+                        Ignored when checkpoint_path is a list (use per-checkpoint filters instead).
+        layers_to_freeze: List of layer name prefixes to freeze after loading
+        key_prefix_map: Dict mapping checkpoint key prefixes to model key prefixes.
+                       E.g., {"encoder": "naip_encoder"} remaps "encoder.conv1" to "naip_encoder.conv1"
+        device: Device for loading checkpoint
+        rank: GPU rank for logging
+
+    Returns:
+        Tuple of (model, loaded_layers, frozen_layers) where loaded_layers and
+        frozen_layers are sets of layer names
+    """
+    # Handle list of checkpoints (multi-checkpoint loading)
+    if isinstance(checkpoint_path, list):
+        all_loaded = set()
+        for item in checkpoint_path:
+            # Support both 2-element and 3-element tuples
+            if len(item) == 2:
+                path, layers = item
+                prefix_map = None
+            else:
+                path, layers, prefix_map = item
+
+            model, loaded, _ = load_checkpoint_for_transfer(
+                model=model,
+                checkpoint_path=path,
+                layers_to_load=layers,
+                layers_to_freeze=None,  # Don't freeze until all checkpoints loaded
+                key_prefix_map=prefix_map,
+                device=device,
+                rank=rank
+            )
+            all_loaded.update(loaded)
+
+        # Apply freezing after all checkpoints loaded (if specified)
+        frozen_layers = set()
+        if layers_to_freeze:
+            if rank == 0:
+                print(f"\n  Freezing layers matching prefixes: {layers_to_freeze}")
+            for name, param in model.named_parameters():
+                should_freeze = any(name.startswith(prefix) for prefix in layers_to_freeze)
+                if should_freeze and name in all_loaded:
+                    param.requires_grad = False
+                    frozen_layers.add(name)
+            if rank == 0:
+                print(f"  Frozen {len(frozen_layers)} layers")
+
+        return model, all_loaded, frozen_layers
+
+    # Single checkpoint loading (original behavior)
+    if rank == 0:
+        print(f"\n{'='*80}")
+        print(f"TRANSFER LEARNING: Loading from {checkpoint_path}")
+        print(f"{'='*80}")
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Extract state dict (handle both raw state dict and checkpoint dict)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        pretrained_dict = checkpoint['model_state_dict']
+    else:
+        pretrained_dict = checkpoint
+
+    # Get current model state
+    model_dict = model.state_dict()
+
+    # Helper function to remap checkpoint key to model key
+    def remap_key(ckpt_key: str, prefix_map: Optional[Dict[str, str]]) -> str:
+        """Apply key prefix remapping if provided."""
+        if prefix_map is None:
+            return ckpt_key
+        for src_prefix, dst_prefix in prefix_map.items():
+            if ckpt_key.startswith(src_prefix + "."):
+                return dst_prefix + ckpt_key[len(src_prefix):]
+            elif ckpt_key == src_prefix:
+                return dst_prefix
+        return ckpt_key
+
+    # Filter: only load layers that exist in both and have matching shapes
+    loaded_layers = set()
+    skipped_shape_mismatch = []
+    skipped_not_in_model = []
+    skipped_not_in_load_list = []
+    remapped_keys = []
+
+    for ckpt_key, pretrained_tensor in pretrained_dict.items():
+        # Apply key remapping (e.g., "encoder.conv1" → "naip_encoder.conv1")
+        model_key = remap_key(ckpt_key, key_prefix_map)
+
+        # Track remapped keys for logging
+        if model_key != ckpt_key:
+            remapped_keys.append((ckpt_key, model_key))
+
+        # Check if layer exists in model (using remapped key)
+        if model_key not in model_dict:
+            skipped_not_in_model.append(f"{ckpt_key} → {model_key}" if model_key != ckpt_key else ckpt_key)
+            continue
+
+        # Check shape compatibility
+        if pretrained_tensor.shape != model_dict[model_key].shape:
+            skipped_shape_mismatch.append(
+                (model_key, tuple(pretrained_tensor.shape), tuple(model_dict[model_key].shape))
+            )
+            continue
+
+        # Check if layer is in load list (if specified) - use CHECKPOINT key for prefix matching
+        if layers_to_load is not None:
+            if not any(ckpt_key.startswith(prefix) for prefix in layers_to_load):
+                skipped_not_in_load_list.append(ckpt_key)
+                continue
+
+        # This layer can be loaded (use remapped model_key)
+        model_dict[model_key] = pretrained_tensor
+        loaded_layers.add(model_key)
+
+    # Load the filtered state dict
+    model.load_state_dict(model_dict)
+
+    # Log what was loaded/skipped
+    if rank == 0:
+        print(f"\n  Loaded {len(loaded_layers)} layers from checkpoint")
+
+        if remapped_keys:
+            print(f"\n  Key remapping applied ({len(remapped_keys)} keys):")
+            for ckpt_key, model_key in remapped_keys:
+                print(f"    {ckpt_key} → {model_key}")
+
+        if skipped_shape_mismatch:
+            print(f"\n  Skipped {len(skipped_shape_mismatch)} layers (shape mismatch):")
+            for key, pre_shape, model_shape in skipped_shape_mismatch:
+                print(f"    - {key}: checkpoint {pre_shape} != model {model_shape}")
+
+        if skipped_not_in_model:
+            print(f"\n  Skipped {len(skipped_not_in_model)} layers (not in model):")
+            for key in skipped_not_in_model:
+                print(f"    - {key}")
+
+        if skipped_not_in_load_list:
+            print(f"\n  Skipped {len(skipped_not_in_load_list)} layers (not in layers_to_load list)")
+
+    # Apply freezing using prefix matching
+    frozen_layers = set()
+    if layers_to_freeze:
+        if rank == 0:
+            print(f"\n  Freezing layers matching prefixes: {layers_to_freeze}")
+
+        for name, param in model.named_parameters():
+            # Check if this param matches any freeze prefix
+            should_freeze = any(name.startswith(prefix) for prefix in layers_to_freeze)
+
+            if should_freeze:
+                # Only freeze if the layer was actually loaded
+                if name in loaded_layers:
+                    param.requires_grad = False
+                    frozen_layers.add(name)
+                elif rank == 0:
+                    # Warn about trying to freeze non-loaded layers
+                    print(f"    WARNING: {name} matches freeze prefix but was not loaded")
+
+        if rank == 0:
+            print(f"  Frozen {len(frozen_layers)} layers")
+
+    # Summary
+    if rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+
+        print(f"\n  Model Summary:")
+        print(f"    Total parameters: {total_params:,}")
+        print(f"    Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.1f}%)")
+        print(f"    Frozen parameters: {frozen_params:,} ({100*frozen_params/total_params:.1f}%)")
+        print(f"{'='*80}\n")
+
+    return model, loaded_layers, frozen_layers
+
+
+def create_transfer_learning_param_groups(
+    model: nn.Module,
+    loaded_layers: set,
+    base_lr: float,
+    transfer_lr_multiplier: float = 0.1,
+    weight_decay: float = 0.1,
+    rank: int = 0
+) -> List[Dict]:
+    """
+    Create optimizer parameter groups with differential learning rates for transfer learning.
+
+    Creates four groups:
+    1. Transferred layers with weight decay (lr * transfer_lr_multiplier)
+    2. Transferred layers without weight decay (lr * transfer_lr_multiplier)
+    3. New layers with weight decay (lr)
+    4. New layers without weight decay (lr)
+
+    Frozen layers are skipped (requires_grad=False).
+
+    Args:
+        model: The model with frozen/unfrozen parameters
+        loaded_layers: Set of layer names loaded from checkpoint
+        base_lr: Learning rate for new (random init) layers
+        transfer_lr_multiplier: Multiplier for transferred layers (e.g., 0.1 = 10x lower)
+        weight_decay: Weight decay for non-bias/norm parameters
+        rank: GPU rank for logging
+
+    Returns:
+        List of parameter group dicts for optimizer
+    """
+    new_decay = []
+    new_no_decay = []
+    transfer_decay = []
+    transfer_no_decay = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue  # Skip frozen
+
+        # Determine if this is a transferred or new layer
+        is_transferred = name in loaded_layers
+
+        # Determine if this should have weight decay
+        # Exclude: bias, norm layers (LayerNorm, BatchNorm, etc.)
+        is_no_decay = (
+            'bias' in name or
+            'norm' in name.lower() or
+            name.endswith('.gamma') or
+            name.endswith('.beta')
+        )
+
+        if is_transferred:
+            if is_no_decay:
+                transfer_no_decay.append(param)
+            else:
+                transfer_decay.append(param)
+        else:
+            if is_no_decay:
+                new_no_decay.append(param)
+            else:
+                new_decay.append(param)
+
+    # Create param groups
+    transfer_lr = base_lr * transfer_lr_multiplier
+
+    param_groups = []
+
+    if transfer_decay:
+        param_groups.append({
+            'params': transfer_decay,
+            'lr': transfer_lr,
+            'weight_decay': weight_decay,
+            'name': 'transfer_decay'
+        })
+
+    if transfer_no_decay:
+        param_groups.append({
+            'params': transfer_no_decay,
+            'lr': transfer_lr,
+            'weight_decay': 0.0,
+            'name': 'transfer_no_decay'
+        })
+
+    if new_decay:
+        param_groups.append({
+            'params': new_decay,
+            'lr': base_lr,
+            'weight_decay': weight_decay,
+            'name': 'new_decay'
+        })
+
+    if new_no_decay:
+        param_groups.append({
+            'params': new_no_decay,
+            'lr': base_lr,
+            'weight_decay': 0.0,
+            'name': 'new_no_decay'
+        })
+
+    if rank == 0:
+        print(f"\nOptimizer Parameter Groups (Transfer Learning):")
+        print(f"  Transferred layers (lr={transfer_lr:.1e}):")
+        print(f"    - with decay: {sum(p.numel() for p in transfer_decay):,} params")
+        print(f"    - no decay: {sum(p.numel() for p in transfer_no_decay):,} params")
+        print(f"  New layers (lr={base_lr:.1e}):")
+        print(f"    - with decay: {sum(p.numel() for p in new_decay):,} params")
+        print(f"    - no decay: {sum(p.numel() for p in new_no_decay):,} params")
+
+    return param_groups
+
+
 def compute_correlation_loss(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     Compute correlation loss as (1 - Pearson correlation coefficient).
@@ -1010,7 +1329,7 @@ def validate_one_epoch_ddp(
 def train_raster_worker(
     rank: int,
     world_size: int,
-    config: MultimodalRasterConfig,
+    config,  # MultimodalRasterConfig or compatible config (e.g., ImageEncoderPretrainConfig)
     train_shard_dir: str,
     train_shard_prefix: str,
     val_data_path: str,
@@ -1029,7 +1348,8 @@ def train_raster_worker(
     beta2: float = 0.999,
     max_grad_norm: float = 10.0,
     warmup_steps_percentage: float = 0.05,
-    resume_checkpoint_path: Optional[str] = None
+    resume_checkpoint_path: Optional[str] = None,
+    model_class: type = None,  # Custom model class (default: MultimodalRasterPredictor)
 ):
     """
     Training worker for distributed data parallel training.
@@ -1037,7 +1357,7 @@ def train_raster_worker(
     Args:
         rank: Process rank (GPU ID)
         world_size: Total number of processes (GPUs)
-        config: Model configuration
+        config: Model configuration (MultimodalRasterConfig or compatible)
         train_shard_dir: Directory containing pre-sharded training data
         train_shard_prefix: Prefix for training shard files
         val_data_path: Path to validation data .pt file
@@ -1053,6 +1373,7 @@ def train_raster_worker(
         early_stopping_metric: Metric to use for early stopping ('loss' or 'mae')
         seed: Random seed
         resume_checkpoint_path: Path to checkpoint to resume training from (optional)
+        model_class: Custom model class to instantiate. If None, uses MultimodalRasterPredictor.
     """
     # Setup distributed training (MASTER_ADDR and MASTER_PORT already set by parent process)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -1165,13 +1486,30 @@ def train_raster_worker(
         # NOTE: num_workers MUST be 0 (see train_loader comment)
     )
 
-    # Create model
-    model = MultimodalRasterPredictor(config).to(device)
+    # Create model (use custom model_class if provided, else default to MultimodalRasterPredictor)
+    if model_class is None:
+        model = MultimodalRasterPredictor(config).to(device)
+    else:
+        model = model_class(config).to(device)
 
     # NOTE: torch.compile() disabled - incompatible with Kornia augmentations
     # Kornia uses .item() calls and CPU/GPU mixed operations that cause graph breaks
     # and compilation failures. If augmentations are disabled, torch.compile() could
     # be re-enabled for additional speedup.
+
+    # ====== TRANSFER LEARNING: Load checkpoint and freeze layers ======
+    loaded_layers = set()
+    frozen_layers = set()
+
+    if config.checkpoint_path is not None:
+        model, loaded_layers, frozen_layers = load_checkpoint_for_transfer(
+            model=model,
+            checkpoint_path=config.checkpoint_path,
+            layers_to_load=config.layers_to_load,
+            layers_to_freeze=config.layers_to_freeze,
+            device=device,
+            rank=rank
+        )
 
     # Wrap with DDP
     # find_unused_parameters=False is safe because embedding dropout uses * 0.0
@@ -1195,24 +1533,64 @@ def train_raster_worker(
         print(f"[GPU {rank}] Total training steps: {total_training_steps} ({total_batches} batches × {num_epochs} epochs)")
         print(f"[GPU {rank}] Warmup steps: {warmup_steps} ({warmup_steps_percentage*100:.1f}% of total)")
 
-    # Separate parameters: exclude bias and norm layers from weight decay
-    # This is a best practice that prevents regularizing shift/scale params
-    decay_params = []
-    no_decay_params = []
+    # ====== OPTIMIZER PARAMETER GROUPS ======
+    # If transfer learning is active, use differential learning rates:
+    # - New layers (random init): base learning rate
+    # - Transferred layers (loaded from checkpoint): base_lr * 0.1
+    # - Frozen layers: excluded (requires_grad=False)
+    #
+    # IMPORTANT: When resuming from checkpoint, we must match the param group structure
+    # from that checkpoint for optimizer state loading to work.
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        # Exclude: bias terms, LayerNorm weight/bias, any param with 'norm' in name
-        if 'bias' in name or 'norm' in name.lower() or name.endswith('.gamma') or name.endswith('.beta'):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+    # Peek at resume checkpoint to check param group structure compatibility
+    use_transfer_param_groups = config.checkpoint_path is not None and len(loaded_layers) > 0
+    resume_checkpoint_n_groups = None
 
-    param_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
-    ]
+    if resume_checkpoint_path is not None:
+        resume_ckpt_peek = torch.load(resume_checkpoint_path, map_location='cpu', weights_only=False)
+        resume_checkpoint_n_groups = len(resume_ckpt_peek['optimizer_state_dict']['param_groups'])
+        del resume_ckpt_peek  # Free memory
+
+        # If checkpoint has 2 groups (standard) but we'd create 4 (transfer), use standard
+        # to ensure optimizer state can be loaded
+        if use_transfer_param_groups and resume_checkpoint_n_groups == 2:
+            use_transfer_param_groups = False
+            if rank == 0:
+                print(f"[GPU {rank}] Note: Resume checkpoint has 2 param groups (standard), "
+                      f"using standard param groups for compatibility")
+                print(f"[GPU {rank}] (Transfer learning differential LRs not applied to preserve optimizer state)")
+
+    if use_transfer_param_groups:
+        # Transfer learning: differential LRs for transferred vs new layers
+        param_groups = create_transfer_learning_param_groups(
+            model=model.module,  # Unwrap DDP
+            loaded_layers=loaded_layers,
+            base_lr=learning_rate,
+            transfer_lr_multiplier=0.1,  # Transferred layers get lr * 0.1
+            weight_decay=weight_decay,
+            rank=rank
+        )
+    else:
+        # Standard training: single LR with decay/no-decay split
+        decay_params = []
+        no_decay_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            # Exclude: bias terms, LayerNorm weight/bias, any param with 'norm' in name
+            if 'bias' in name or 'norm' in name.lower() or name.endswith('.gamma') or name.endswith('.beta'):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0}
+        ]
+
+        if rank == 0:
+            print(f"[GPU {rank}] Params with weight decay: {len(decay_params)}, without: {len(no_decay_params)}")
 
     # Create optimizer with parameter groups
     optimizer = AdamWScheduleFree(
@@ -1223,8 +1601,6 @@ def train_raster_worker(
         eps=1e-5
     )
 
-    if rank == 0:
-        print(f"[GPU {rank}] Params with weight decay: {len(decay_params)}, without: {len(no_decay_params)}")
     print(f"[GPU {rank}] Using AdamWScheduleFree with lr={learning_rate}, weight decay={weight_decay}, betas=({beta1}, {beta2}), warmup_steps={warmup_steps}")
 
     # AMP scaler for mixed precision
@@ -1525,7 +1901,7 @@ def train_raster_worker(
 
 
 def train_raster_model(
-    config: MultimodalRasterConfig,
+    config,  # MultimodalRasterConfig or compatible config
     train_data_path: str,
     val_data_path: str,
     output_dir: str,
@@ -1544,13 +1920,14 @@ def train_raster_model(
     beta2: float = 0.999,
     max_grad_norm: float = 10.0,
     warmup_steps_percentage: float = 0.05,
-    resume_checkpoint_path: Optional[str] = None
+    resume_checkpoint_path: Optional[str] = None,
+    model_class: type = None,  # Custom model class (default: MultimodalRasterPredictor)
 ):
     """
     Main entry point for training raster prediction model.
 
     Args:
-        config: Model configuration
+        config: Model configuration (MultimodalRasterConfig or compatible)
         train_data_path: Path to training data
         val_data_path: Path to validation data
         output_dir: Output directory for checkpoints
@@ -1570,6 +1947,7 @@ def train_raster_model(
         max_grad_norm: Gradient clipping threshold
         warmup_steps_percentage: Percentage of total steps for warmup
         resume_checkpoint_path: Path to checkpoint to resume training from (optional)
+        model_class: Custom model class to instantiate. If None, uses MultimodalRasterPredictor.
     """
     import hashlib
 
@@ -1629,7 +2007,8 @@ def train_raster_model(
               output_dir, num_epochs, batch_size,
               learning_rate, weight_decay, gradient_accumulation_steps,
               save_every_n_epochs, use_amp, early_stopping_patience, early_stopping_metric, seed,
-              beta1, beta2, max_grad_norm, warmup_steps_percentage, resume_checkpoint_path),
+              beta1, beta2, max_grad_norm, warmup_steps_percentage, resume_checkpoint_path,
+              model_class),
         nprocs=world_size,
         join=True
     )
