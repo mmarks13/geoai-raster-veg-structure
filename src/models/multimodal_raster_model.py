@@ -137,6 +137,18 @@ class MultimodalRasterConfig:
     # Errors > delta use linear penalty instead of quadratic
     huber_delta: float = 1.0
 
+    # Transfer learning rate multiplier (for fine-tuning pretrained layers)
+    # Transferred layers get lr * transfer_lr_multiplier
+    transfer_lr_multiplier: float = 0.1
+
+    # ===== Heteroscedastic (Gaussian NLL) Loss =====
+    # When enabled, model outputs (mean, log_variance) per pixel
+    # Loss = 0.5 * log(σ²) + (y - μ)² / (2σ²)
+    # High variance = "I don't know" (e.g., canopy-blocked pixels)
+    use_heteroscedastic_loss: bool = False
+    heteroscedastic_min_var: float = 1e-6  # Minimum variance for numerical stability
+    heteroscedastic_overconfidence_weight: float = 0.0  # Penalty for σ² < 1 (prevents overconfidence)
+
     # Stochastic depth (DropPath) - separate configs for different components
     encoder_drop_path: float = 0.0  # Drop path for image encoder TransformerBlocks (NAIPEncoder/UAVSAREncoder)
     decoder_drop_path: float = 0.0  # Drop path for WideRasterDecoder residual blocks
@@ -305,6 +317,10 @@ class MultimodalRasterConfig:
                 self.layers_to_freeze,
                 self.correlation_loss_weight,
                 self.huber_delta,
+                self.transfer_lr_multiplier,
+                self.use_heteroscedastic_loss,
+                self.heteroscedastic_min_var,
+                self.heteroscedastic_overconfidence_weight,
                 self.encoder_drop_path,
                 self.decoder_drop_path,
                 self.extractor_point_attn_drop_path,
@@ -420,6 +436,7 @@ class MultimodalRasterPredictor(nn.Module):
         # Track which modalities are being used
         self.use_naip = config.use_naip
         self.use_uavsar = config.use_uavsar
+        self.use_heteroscedastic_loss = config.use_heteroscedastic_loss
 
         # Get extractor dropout
         extractor_dropout = getattr(config, 'extractor_dropout', config.pt_attn_dropout)
@@ -559,7 +576,8 @@ class MultimodalRasterPredictor(nn.Module):
                 num_layers=config.raster_decoder_layers,
                 dropout=config.raster_decoder_dropout,
                 drop_path=config.decoder_drop_path,
-                use_spectral_norm=config.use_spectral_norm
+                use_spectral_norm=config.use_spectral_norm,
+                output_variance=config.use_heteroscedastic_loss
             )
 
             # Set fusion and raster_head to None for compatibility checks
@@ -602,7 +620,8 @@ class MultimodalRasterPredictor(nn.Module):
                 use_v2_attention=config.use_v2_attention,
                 use_spectral_norm=config.use_spectral_norm,
                 pos_encoder_dropout=pos_encoder_dropout,
-                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
+                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob,
+                output_variance=config.use_heteroscedastic_loss
             )
 
             # Set grid_fusion and raster_decoder to None for compatibility checks
@@ -623,7 +642,7 @@ class MultimodalRasterPredictor(nn.Module):
         uavsar: Optional[List[Dict]] = None,
         bbox: Optional[torch.Tensor] = None,
         debug_logging: bool = False
-    ) -> torch.Tensor:
+    ):
         """
         Forward pass of the multimodal raster predictor.
 
@@ -647,7 +666,12 @@ class MultimodalRasterPredictor(nn.Module):
             bbox: Bounding boxes [batch_size, 4] - currently not used but kept for compatibility
 
         Returns:
-            pred_raster: Predicted fuel metrics [batch_size, n_bands, 5, 5] (Z-SCORE NORMALIZED)
+            If use_heteroscedastic_loss=False:
+                pred_raster: Predicted fuel metrics [batch_size, n_bands, 5, 5] (Z-SCORE NORMALIZED)
+            If use_heteroscedastic_loss=True:
+                Tuple of (mean, log_var):
+                - mean: [batch_size, n_bands, 5, 5] - predicted mean values
+                - log_var: [batch_size, n_bands, 5, 5] - predicted log-variance
         """
         batch_size = len(norm_params)
         device = dep_points.device
@@ -871,13 +895,15 @@ class MultimodalRasterPredictor(nn.Module):
                     print(f"    NaN count: {torch.isnan(grid_features).sum().item()}/{grid_features.numel()}")
 
             # Decode to raster
-            pred_raster = self.raster_decoder(grid_features)  # [batch_size, n_bands, 5, 5]
+            pred_raster = self.raster_decoder(grid_features)  # [batch_size, n_bands, 5, 5] or (mean, log_var) tuple
 
             if debug_logging:
-                has_nan = torch.isnan(pred_raster).any().item()
+                # Handle tuple output from heteroscedastic loss
+                debug_tensor = pred_raster[0] if isinstance(pred_raster, tuple) else pred_raster
+                has_nan = torch.isnan(debug_tensor).any().item()
                 print(f"  [DEBUG] After raster_decoder: NaN={has_nan}")
                 if has_nan:
-                    print(f"    NaN count: {torch.isnan(pred_raster).sum().item()}/{pred_raster.numel()}")
+                    print(f"    NaN count: {torch.isnan(debug_tensor).sum().item()}/{debug_tensor.numel()}")
 
         else:
             # Standard: CrossAttentionFusion + RasterPredictionHead
@@ -976,12 +1002,14 @@ class MultimodalRasterPredictor(nn.Module):
                 point_positions=dep_points,
                 batch_indices=batch_indices,
                 norm_params=norm_params
-            )  # [batch_size, n_bands, 5, 5]
+            )  # [batch_size, n_bands, 5, 5] or (mean, log_var) tuple
 
             if debug_logging:
-                has_nan = torch.isnan(pred_raster).any().item()
+                # Handle tuple output from heteroscedastic loss
+                debug_tensor = pred_raster[0] if isinstance(pred_raster, tuple) else pred_raster
+                has_nan = torch.isnan(debug_tensor).any().item()
                 print(f"  [DEBUG] After raster_head: NaN={has_nan}")
                 if has_nan:
-                    print(f"    NaN count: {torch.isnan(pred_raster).sum().item()}/{pred_raster.numel()}")
+                    print(f"    NaN count: {torch.isnan(debug_tensor).sum().item()}/{debug_tensor.numel()}")
 
         return pred_raster

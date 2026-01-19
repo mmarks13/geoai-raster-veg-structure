@@ -162,10 +162,16 @@ class BasicImageRasterHead(nn.Module):
 
     Takes patch embeddings [16, embed_dim] and predicts fuel metrics [n_bands, 5, 5].
 
+    Spatial conventions match GridCrossAttentionFusion for transfer learning:
+    - Patches at [-7.5, -2.5, 2.5, 7.5]m (20×20m imagery, 4×4 grid)
+    - Target grid at [-4, -2, 0, 2, 4]m (10×10m target, 5×5 grid)
+    - Sinusoidal positional encoding ADDED to embeddings (not concatenated)
+
     Architecture:
-        1. Reshape 16 patches to 4×4 grid
-        2. Bilinear interpolate to 5×5
-        3. MLP: embed_dim → hidden_dims → n_bands
+        1. Add sinusoidal positional encoding to patch embeddings
+        2. Reshape 16 patches to 4×4 grid
+        3. grid_sample at correct target positions (not naive interpolation)
+        4. MLP: embed_dim → hidden_dims → n_bands
     """
 
     def __init__(
@@ -182,7 +188,26 @@ class BasicImageRasterHead(nn.Module):
         self.grid_in = 4  # 16 patches = 4×4 grid
         self.grid_out = 5  # Output 5×5 grid
 
-        # Build MLP layers
+        # Reuse PatchPositionEncoding from GridCrossAttentionFusion
+        # This ensures identical positional encoding for transfer learning
+        from src.models.grid_cross_attention import PatchPositionEncoding
+        self.patch_pos_encoding = PatchPositionEncoding(
+            feature_dim=embed_dim,
+            patch_grid_size=4,
+            patch_extent=20.0
+        )
+
+        # Precompute grid_sample coordinates for correct spatial mapping
+        # With align_corners=True on 4×4 grid:
+        #   - grid_coord -1.0 → pixel 0 center → -7.5m
+        #   - grid_coord +1.0 → pixel 3 center → +7.5m
+        # So: grid_coord = physical_position / 7.5
+        target_centers_1d = torch.tensor([-4.0, -2.0, 0.0, 2.0, 4.0])
+        tyy, txx = torch.meshgrid(target_centers_1d, target_centers_1d, indexing='ij')
+        grid_coords = torch.stack([txx, tyy], dim=-1) / 7.5  # [-0.533, -0.267, 0, 0.267, 0.533]
+        self.register_buffer('sample_grid', grid_coords.view(1, self.grid_out, self.grid_out, 2))
+
+        # Build MLP layers (input is embed_dim since we ADD pos encoding, not concatenate)
         layers = []
         in_dim = embed_dim
         for hidden_dim in hidden_dims:
@@ -206,13 +231,17 @@ class BasicImageRasterHead(nn.Module):
         Returns:
             raster: [n_bands, 5, 5] predicted fuel metrics
         """
-        # Reshape to 4×4 grid: [16, embed_dim] → [embed_dim, 4, 4]
-        x = patch_embeddings.view(self.grid_in, self.grid_in, self.embed_dim)
-        x = x.permute(2, 0, 1)  # [embed_dim, 4, 4]
+        # Add positional encoding (matches GridCrossAttentionFusion additive approach)
+        pos_enc, _ = self.patch_pos_encoding()  # [16, embed_dim]
+        patch_with_pos = patch_embeddings + pos_enc  # Additive, not concatenation
 
-        # Bilinear interpolate to 5×5: [embed_dim, 4, 4] → [embed_dim, 5, 5]
-        x = x.unsqueeze(0)  # [1, embed_dim, 4, 4]
-        x = F.interpolate(x, size=(self.grid_out, self.grid_out), mode='bilinear', align_corners=False)
+        # Reshape to 4×4 grid: [16, embed_dim] → [1, embed_dim, 4, 4]
+        x = patch_with_pos.view(self.grid_in, self.grid_in, self.embed_dim)
+        x = x.permute(2, 0, 1).unsqueeze(0)  # [1, embed_dim, 4, 4]
+
+        # Sample at correct target positions using grid_sample
+        # Patches at [-7.5,-2.5,2.5,7.5]m, targets at [-4,-2,0,2,4]m
+        x = F.grid_sample(x, self.sample_grid, mode='bilinear', align_corners=True)
         x = x.squeeze(0)  # [embed_dim, 5, 5]
 
         # Apply MLP per pixel: [embed_dim, 5, 5] → [n_bands, 5, 5]

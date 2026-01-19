@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import json
 import gc
+import math
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -429,6 +430,57 @@ def compute_correlation_loss(predictions: torch.Tensor, targets: torch.Tensor) -
     return corr_loss.mean()
 
 
+def gaussian_nll_loss(
+    mean: torch.Tensor,
+    log_var: torch.Tensor,
+    target: torch.Tensor,
+    min_var: float = 1e-6,
+    overconfidence_weight: float = 0.0
+) -> torch.Tensor:
+    """
+    Compute Gaussian Negative Log Likelihood loss for heteroscedastic regression.
+
+    NLL = 0.5 * log(σ²) + (y - μ)² / (2σ²) + overconfidence_weight * max(-log_var, 0)
+
+    The model outputs both mean (μ) and log-variance (log σ²) per pixel.
+    High variance = "I don't know" (e.g., canopy-blocked pixels).
+    Gradients are naturally down-weighted for uncertain predictions.
+
+    The overconfidence penalty discourages σ² < 1 (log_var < 0), which prevents
+    the model from becoming overconfident on training data in ways that don't
+    generalize to validation/test data.
+
+    Args:
+        mean: [batch_size, n_bands, H, W] predicted mean values
+        log_var: [batch_size, n_bands, H, W] predicted log-variance
+        target: [batch_size, n_bands, H, W] ground truth values
+        min_var: Minimum variance for numerical stability (default 1e-6)
+        overconfidence_weight: Weight for penalty on σ² < 1 (default 0.0, disabled)
+
+    Returns:
+        Scalar tensor: mean NLL loss across all pixels (with overconfidence penalty if enabled)
+    """
+    # Clamp log_var to prevent numerical instability
+    # min_var = 1e-6 → log(1e-6) ≈ -13.8
+    log_var = torch.clamp(log_var, min=math.log(min_var))
+
+    # Compute variance from log-variance
+    var = torch.exp(log_var)
+
+    # Compute NLL: 0.5 * log(σ²) + (y - μ)² / (2σ²)
+    # = 0.5 * log_var + 0.5 * (target - mean)² / var
+    nll = 0.5 * log_var + 0.5 * (target - mean).pow(2) / var
+
+    loss = nll.mean()
+
+    # Overconfidence penalty: penalize log_var < 0 (i.e., σ² < 1)
+    if overconfidence_weight > 0:
+        overconfidence_penalty = torch.clamp(-log_var, min=0).mean()
+        loss = loss + overconfidence_weight * overconfidence_penalty
+
+    return loss
+
+
 def get_gpu_stats_native(device_id: int = 0) -> dict:
     """Get GPU memory stats using PyTorch native functions (no subprocess).
 
@@ -526,7 +578,10 @@ def process_raster_batch(
     rank: int = 0,
     logger: Optional[logging.Logger] = None,
     correlation_loss_weight: float = 0.0,
-    huber_delta: float = 1.0
+    huber_delta: float = 1.0,
+    use_heteroscedastic_loss: bool = False,
+    heteroscedastic_min_var: float = 1e-6,
+    heteroscedastic_overconfidence_weight: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, Any]]:
     """
     Process a single batch for raster prediction with per-tile NaN diagnostics.
@@ -543,13 +598,16 @@ def process_raster_batch(
         logger: Logger instance
         correlation_loss_weight: Weight for correlation loss term (0 = disabled)
         huber_delta: Delta threshold for Huber loss (errors > delta use linear penalty)
+        use_heteroscedastic_loss: Whether model outputs (mean, log_var) tuple for GNLL
+        heteroscedastic_min_var: Minimum variance for GNLL numerical stability
+        heteroscedastic_overconfidence_weight: Penalty weight for σ² < 1 (prevents overconfidence)
 
     Returns:
         Tuple of (predictions, targets, loss, per_band_losses, diagnostics)
-        - predictions: [batch_size, n_bands, 5, 5] predicted rasters
+        - predictions: [batch_size, n_bands, 5, 5] predicted rasters (mean if heteroscedastic)
         - targets: [batch_size, n_bands, 5, 5] ground truth rasters
-        - loss: scalar combined loss (Huber + correlation_loss_weight * corr_loss)
-        - per_band_losses: Dict with per-band MSE losses, huber_loss, and correlation loss
+        - loss: scalar combined loss (GNLL or Huber + correlation_loss_weight * corr_loss)
+        - per_band_losses: Dict with per-band MSE losses, huber_loss/gnll_loss, and correlation loss
         - diagnostics: Dict with batch status and bad tile info
     """
     # Unpack batch (11 elements - edge_index removed for global-only attention)
@@ -577,7 +635,7 @@ def process_raster_batch(
             )
 
     # Forward pass (edge_index=None for global-only attention)
-    predictions = model(
+    model_output = model(
         dep_points=dep_points_batch,
         edge_index=None,
         batch_indices=batch_indices,
@@ -586,11 +644,18 @@ def process_raster_batch(
         naip=naip_data,
         uavsar=uavsar_data,
         bbox=bboxes
-    )  # [batch_size, n_bands, 5, 5]
+    )  # [batch_size, n_bands, 5, 5] or (mean, log_var) tuple
+
+    # Handle heteroscedastic output (mean + log_variance)
+    log_var = None
+    if use_heteroscedastic_loss:
+        predictions, log_var = model_output  # Unpack tuple
+    else:
+        predictions = model_output
 
     # Compute both MSE (for logging/comparison) and Huber (for training)
     mse_loss = nn.functional.mse_loss(predictions, fuel_metrics_batch)
-    huber_loss = nn.functional.huber_loss(predictions, fuel_metrics_batch, delta=huber_delta)
+    huber_loss_val = nn.functional.huber_loss(predictions, fuel_metrics_batch, delta=huber_delta)
 
     # Compute per-band losses (still use MSE for comparability across runs)
     per_band_losses = {}
@@ -599,17 +664,29 @@ def process_raster_batch(
         band_loss = nn.functional.mse_loss(predictions[:, band_idx], fuel_metrics_batch[:, band_idx])
         per_band_losses[f'Band_{band_idx}'] = band_loss
 
+    # Compute primary loss based on loss type
+    if use_heteroscedastic_loss and log_var is not None:
+        # Gaussian NLL loss: 0.5 * log(σ²) + (y - μ)² / (2σ²) + overconfidence penalty
+        gnll_loss = gaussian_nll_loss(
+            predictions, log_var, fuel_metrics_batch,
+            heteroscedastic_min_var, heteroscedastic_overconfidence_weight
+        )
+        base_loss = gnll_loss
+        per_band_losses['gnll_loss'] = gnll_loss
+    else:
+        base_loss = huber_loss_val  # Use Huber for standard training
+
     # Compute correlation loss if enabled
     if correlation_loss_weight > 0:
         corr_loss = compute_correlation_loss(predictions, fuel_metrics_batch)
         per_band_losses['correlation_loss'] = corr_loss
-        loss = huber_loss + correlation_loss_weight * corr_loss  # Use Huber as base
+        loss = base_loss + correlation_loss_weight * corr_loss
     else:
-        loss = huber_loss  # Use Huber for actual training
+        loss = base_loss
 
-    # Store both MSE and Huber for logging
+    # Store MSE and Huber for logging (always compute for comparison)
     per_band_losses['mse_loss'] = mse_loss      # For backward compatibility / comparison
-    per_band_losses['huber_loss'] = huber_loss  # New robust loss metric
+    per_band_losses['huber_loss'] = huber_loss_val  # Huber loss metric
 
     # Initialize diagnostics
     diagnostics = {
@@ -787,7 +864,10 @@ def train_one_epoch_ddp(
                 rank=rank,
                 logger=logger,
                 correlation_loss_weight=config.correlation_loss_weight,
-                huber_delta=config.huber_delta
+                huber_delta=config.huber_delta,
+                use_heteroscedastic_loss=getattr(config, 'use_heteroscedastic_loss', False),
+                heteroscedastic_min_var=getattr(config, 'heteroscedastic_min_var', 1e-6),
+                heteroscedastic_overconfidence_weight=getattr(config, 'heteroscedastic_overconfidence_weight', 0.0)
             )
         forward_time += (time.time() - forward_start)
 
@@ -1138,7 +1218,10 @@ def validate_one_epoch_ddp(
                     rank=rank,
                     logger=logger,
                     correlation_loss_weight=config.correlation_loss_weight,
-                    huber_delta=config.huber_delta
+                    huber_delta=config.huber_delta,
+                    use_heteroscedastic_loss=getattr(config, 'use_heteroscedastic_loss', False),
+                    heteroscedastic_min_var=getattr(config, 'heteroscedastic_min_var', 1e-6),
+                    heteroscedastic_overconfidence_weight=getattr(config, 'heteroscedastic_overconfidence_weight', 0.0)
                 )
 
                 # Handle invalid loss locally without global synchronization
@@ -1249,7 +1332,7 @@ def validate_one_epoch_ddp(
     val_loss_per_band['mse_loss'] = val_mse_avg
 
     # Compute overall metrics from running sums
-    metrics = {'loss': val_loss_avg, 'per_band': val_loss_per_band}
+    metrics = {'loss': val_loss_avg, 'mse': val_mse_avg, 'per_band': val_loss_per_band}
 
     if total_n_samples > 0:
         # MAE
@@ -1370,7 +1453,7 @@ def train_raster_worker(
         save_every_n_epochs: Save checkpoint every N epochs
         use_amp: Use automatic mixed precision
         early_stopping_patience: Epochs without improvement before stopping
-        early_stopping_metric: Metric to use for early stopping ('loss' or 'mae')
+        early_stopping_metric: Metric to use for early stopping ('loss', 'mae', or 'mse')
         seed: Random seed
         resume_checkpoint_path: Path to checkpoint to resume training from (optional)
         model_class: Custom model class to instantiate. If None, uses MultimodalRasterPredictor.
@@ -1390,8 +1473,8 @@ def train_raster_worker(
         checkpoint_dir.mkdir(exist_ok=True)
 
     # Validate early stopping metric
-    if early_stopping_metric not in ['loss', 'mae']:
-        raise ValueError(f"early_stopping_metric must be 'loss' or 'mae', got '{early_stopping_metric}'")
+    if early_stopping_metric not in ['loss', 'mae', 'mse']:
+        raise ValueError(f"early_stopping_metric must be 'loss', 'mae', or 'mse', got '{early_stopping_metric}'")
 
     # Setup logging (rank 0 only)
     logger = None
@@ -1566,7 +1649,7 @@ def train_raster_worker(
             model=model.module,  # Unwrap DDP
             loaded_layers=loaded_layers,
             base_lr=learning_rate,
-            transfer_lr_multiplier=0.1,  # Transferred layers get lr * 0.1
+            transfer_lr_multiplier=getattr(config, 'transfer_lr_multiplier', 0.1),  # Transferred layers get lr * multiplier
             weight_decay=weight_decay,
             rank=rank
         )
@@ -1673,6 +1756,10 @@ def train_raster_worker(
             best_early_stop_metric = checkpoint['val_mae']
             if rank == 0:
                 print(f"  ✓ Best MAE so far: {best_early_stop_metric:.6f}")
+        elif early_stopping_metric == 'mse' and 'val_mse' in checkpoint and checkpoint['val_mse'] is not None:
+            best_early_stop_metric = checkpoint['val_mse']
+            if rank == 0:
+                print(f"  ✓ Best MSE so far: {best_early_stop_metric:.6f}")
         elif early_stopping_metric == 'loss' and 'val_loss' in checkpoint:
             best_early_stop_metric = checkpoint['val_loss']
             if rank == 0:
@@ -1771,6 +1858,7 @@ def train_raster_worker(
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_loss': val_metrics['loss'],
                     'val_mae': val_metrics.get('mae', None),
+                    'val_mse': val_metrics.get('mse', None),
                     'config': config
                 }, checkpoint_path)
                 msg = f"✓ Saved best model ({early_stopping_metric}: {current_metric_value:.6f})"
@@ -1826,6 +1914,7 @@ def train_raster_worker(
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_metrics['loss'],
             'val_mae': val_metrics.get('mae', None),
+            'val_mse': val_metrics.get('mse', None),
             'config': config
         }, final_checkpoint_path)
         if logger:
@@ -1939,7 +2028,7 @@ def train_raster_model(
         save_every_n_epochs: Save frequency
         use_amp: Use mixed precision
         early_stopping_patience: Epochs without improvement before stopping
-        early_stopping_metric: Metric to use for early stopping ('loss' or 'mae')
+        early_stopping_metric: Metric to use for early stopping ('loss', 'mae', or 'mse')
         seed: Random seed
         num_gpus: Number of GPUs (None = all available)
         beta1: AdamW beta1 parameter

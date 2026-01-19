@@ -101,6 +101,175 @@ class PatchEmbedding(nn.Module):
         return x
 
 
+
+class PatchEmbeddingV2(nn.Module):
+    """
+    Convert image patches to embeddings (Shifted-Patch Tokenization variant).
+
+    Produces the same patch grid as before:
+      - If input is [B, C, 40, 40] and patch_size=10 -> output tokens are [B, 16, embed_dim]
+        corresponding to a 4x4 patch grid.
+
+    Key properties:
+      - Patch size / token count are unchanged.
+      - Patchification is learned (Conv2d with kernel=stride=patch_size) rather than AvgPool.
+      - A small conv stem (with GroupNorm) improves robustness to illumination/season/sensor shifts.
+      - Optional Shifted Patch Tokenization (SPT) injects local edge/context cues without changing
+        patch size.
+
+    Args:
+        in_channels (int): Number of input image channels
+        patch_size  (int): Down-sampling factor (e.g. 10 for 40×40 → 4×4)
+        embed_dim   (int): Output feature dimension per patch
+        stem_dim    (int): Internal stem channels (defaults to max(64, embed_dim))
+        dropout     (float): Token dropout after LayerNorm
+        use_spt     (bool): Enable shifted patch tokenization
+        spt_shift   (int): Shift in pixels for SPT (default 1)
+        gn_groups   (int): GroupNorm groups for the stem (default 8)
+                          If stem_dim is not divisible by gn_groups, falls back to 1.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        patch_size: int,
+        embed_dim: int,
+        stem_dim: int | None = None,
+        dropout: float = 0.0,
+        use_spt: bool = True,
+        spt_shift: int = 1,
+        gn_groups: int = 8,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.use_spt = use_spt
+        self.spt_shift = int(spt_shift)
+
+        # Stem width: keep enough capacity even when embed_dim is small (e.g., 32)
+        stem_dim = int(stem_dim) if stem_dim is not None else max(64, embed_dim)
+
+        # SPT concatenates original + 4 shifted copies (up/down/left/right)
+        stem_in_channels = in_channels * (5 if self.use_spt else 1)
+
+        # Ensure GroupNorm groups divides stem_dim; otherwise use 1 group
+        gn_groups = int(gn_groups)
+        gn_groups = gn_groups if (gn_groups > 0 and stem_dim % gn_groups == 0) else 1
+
+        # Local feature stem (batch-size agnostic)
+        self.stem = nn.Sequential(
+            nn.Conv2d(stem_in_channels, stem_dim, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.GroupNorm(gn_groups, stem_dim),
+            nn.GELU(),
+
+            # Depthwise conv captures local texture/edges cheaply
+            nn.Conv2d(stem_dim, stem_dim, kernel_size=3, stride=1, padding=1, groups=stem_dim, bias=False),
+            nn.GroupNorm(gn_groups, stem_dim),
+            nn.GELU(),
+
+            # Pointwise conv mixes channels
+            nn.Conv2d(stem_dim, stem_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.GroupNorm(gn_groups, stem_dim),
+            nn.GELU(),
+        )
+
+        # Learned patchification (same patch size and grid as before)
+        self.proj = nn.Conv2d(
+            stem_dim,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            padding=0,
+            bias=True,
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+        self.drop = nn.Dropout(dropout)
+
+        self._init_weights()
+
+    @staticmethod
+    def _shift_zeropad(x: torch.Tensor, dy: int, dx: int) -> torch.Tensor:
+        """
+        Zero-padded shift (no wrap-around).
+
+        dy > 0 shifts content down (top becomes zeros)
+        dy < 0 shifts content up   (bottom becomes zeros)
+        dx > 0 shifts content right (left becomes zeros)
+        dx < 0 shifts content left  (right becomes zeros)
+        """
+        if dy == 0 and dx == 0:
+            return x
+
+        B, C, H, W = x.shape
+
+        top = max(0, dy)
+        bottom = max(0, -dy)
+        left = max(0, dx)
+        right = max(0, -dx)
+
+        padded = F.pad(x, (left, right, top, bottom))  # (left, right, top, bottom)
+
+        y_start = bottom
+        x_start = right
+        return padded[:, :, y_start:y_start + H, x_start:x_start + W]
+
+    def _apply_spt(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Shifted Patch Tokenization (SPT):
+        Concatenate original input with 4 directional shifts.
+        """
+        s = self.spt_shift
+        if s <= 0:
+            return x
+
+        x_up = self._shift_zeropad(x, dy=-s, dx=0)
+        x_dn = self._shift_zeropad(x, dy=+s, dx=0)
+        x_lt = self._shift_zeropad(x, dy=0, dx=-s)
+        x_rt = self._shift_zeropad(x, dy=0, dx=+s)
+
+        return torch.cat([x, x_up, x_dn, x_lt, x_rt], dim=1)
+
+    def _init_weights(self) -> None:
+        # Kaiming init for convs; LayerNorm set to identity
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (Tensor): [B, C, H, W] input image batch
+        Returns:
+            patch_embed (Tensor): [B, N, embed_dim] where
+                                  N = (H // patch_size) × (W // patch_size)
+        """
+        if x.dim() != 4:
+            raise ValueError(f"Expected [B, C, H, W], got shape {tuple(x.shape)}")
+
+        B, C, H, W = x.shape
+        if (H % self.patch_size) != 0 or (W % self.patch_size) != 0:
+            raise ValueError(
+                f"Input H,W must be divisible by patch_size. Got {(H, W)} with patch_size={self.patch_size}."
+            )
+
+        if self.use_spt:
+            x = self._apply_spt(x)         # [B, C*5, H, W]
+
+        x = self.stem(x)                   # [B, stem_dim, H, W]
+        x = self.proj(x)                   # [B, embed_dim, H//p, W//p]
+
+        # Flatten to tokens
+        x = x.flatten(2).transpose(1, 2)   # [B, N, embed_dim]
+        x = self.norm(x)
+        x = self.drop(x)
+        return x
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -502,7 +671,7 @@ class NAIPEncoder(nn.Module):
             )
         
         # Patch embedding
-        self.patch_embed = PatchEmbedding(
+        self.patch_embed = PatchEmbeddingV2(
             in_channels=in_channels,
             patch_size=patch_size,
             embed_dim=embed_dim

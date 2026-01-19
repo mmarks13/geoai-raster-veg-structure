@@ -44,6 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 # Import helper from training module
 from src.training.raster_training import find_free_port
+from src.evaluation.inference_config_summary import generate_config_summary
 
 # Configure logging
 logging.basicConfig(
@@ -53,6 +54,73 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# MC Dropout Helper Functions
+# ============================================================================
+
+def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
+    """
+    Enable dropout layers for Monte Carlo dropout inference.
+
+    Switches dropout modules to training mode so they apply dropout
+    during inference. BatchNorm layers are NOT affected (remain in eval mode).
+
+    Args:
+        model: Model in eval mode
+
+    Returns:
+        List of modules that were modified (for later restoration)
+    """
+    modified = []
+
+    # Module classes that use dropout and need to be in train mode for MC
+    mc_dropout_classes = (
+        nn.Dropout,
+        nn.Dropout1d,
+        nn.Dropout2d,
+        nn.Dropout3d,
+    )
+
+    # Custom classes that use F.dropout with training=self.training
+    custom_dropout_class_names = (
+        'DistanceMaskedAttention',
+        'CrossAttentionFusion',
+        'PositionEnhancedCrossAttention',
+        'GridCrossAttentionLayer',
+        'PointTransformerConv',  # Uses dropout in attention
+        'LocalGlobalPointAttentionBlock',  # Contains dropout layers
+    )
+
+    for name, module in model.named_modules():
+        # Handle standard PyTorch dropout modules
+        if isinstance(module, mc_dropout_classes):
+            if not module.training:
+                module.train()
+                modified.append(module)
+        # Handle custom classes that use F.dropout with training=self.training
+        elif module.__class__.__name__ in custom_dropout_class_names:
+            if not module.training:
+                module.train()
+                modified.append(module)
+
+    return modified
+
+
+def disable_mc_dropout(modified: List[nn.Module]) -> None:
+    """
+    Restore modules to eval mode after MC dropout inference.
+
+    Args:
+        modified: List of modules that were switched to train mode
+    """
+    for m in modified:
+        m.eval()
+
+
+# ============================================================================
+# Checkpoint Loading
+# ============================================================================
 
 def load_checkpoint_and_config(checkpoint_path: str) -> Tuple[dict, dict]:
     """
@@ -90,15 +158,16 @@ def load_checkpoint_and_config(checkpoint_path: str) -> Tuple[dict, dict]:
 def build_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> nn.Module:
     """
     Build model architecture and load weights from checkpoint.
-    
+
     Args:
         checkpoint_path: Path to checkpoint file
         device: Device to load model onto
-        
+
     Returns:
         Loaded model in eval mode
     """
     from src.models.multimodal_raster_model import MultimodalRasterConfig, MultimodalRasterPredictor
+    from src.models.image_encoder_pretrain_model import ImageEncoderPretrainConfig, ImageEncoderPretrainModel
 
     state_dict, config_dict = load_checkpoint_and_config(checkpoint_path)
 
@@ -108,6 +177,17 @@ def build_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> n
         if isinstance(config_dict, MultimodalRasterConfig):
             logger.info("Using config object directly from checkpoint")
             config = config_dict
+        # Check if this is a pretrained image encoder checkpoint
+        elif isinstance(config_dict, ImageEncoderPretrainConfig):
+            logger.info("Using ImageEncoderPretrainConfig - building pretrained encoder model")
+            config = config_dict
+            # Build and load the pretrained encoder model
+            model = ImageEncoderPretrainModel(config)
+            model.load_state_dict(state_dict, strict=True)
+            model = model.to(device)
+            model.eval()
+            logger.info(f"Pretrained {config.encoder_type.upper()} encoder loaded ({sum(p.numel() for p in model.parameters()):,} parameters)")
+            return model, config
         else:
             # Reconstruct config from dict
             logger.info("Reconstructing config from checkpoint dict")
@@ -371,7 +451,7 @@ def run_inference_on_dataloader(
                     break
 
         # Forward pass
-        predictions = model(
+        model_output = model(
             dep_points=dep_points,
             edge_index=edge_index,
             batch_indices=batch_indices,
@@ -382,6 +462,13 @@ def run_inference_on_dataloader(
             bbox=batch['bbox'].to(device),
             debug_logging=debug_logging
         )
+
+        # Handle heteroscedastic output: (mean, log_var) tuple
+        # Store mean only for raster building (Option A: fully backward compatible)
+        if isinstance(model_output, tuple):
+            predictions, log_var = model_output  # Extract mean, discard variance
+        else:
+            predictions = model_output
 
         # predictions shape: [batch_size, n_bands, 5, 5]
         predictions = predictions.cpu()
@@ -424,6 +511,185 @@ def run_inference_on_dataloader(
     predictions_df = pd.DataFrame(results_list)
 
     return predictions_dict, predictions_df
+
+
+@torch.no_grad()
+def run_mc_dropout_inference(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    mc_samples: int,
+    fuel_stats: Optional[dict] = None,
+    target_band_indices: Optional[List[int]] = None
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], pd.DataFrame]:
+    """
+    Run Monte Carlo dropout inference for uncertainty quantification.
+
+    Runs N forward passes with dropout enabled, computing mean and std
+    across samples for each tile.
+
+    Args:
+        model: Trained model (will be put in MC dropout mode)
+        dataloader: Pre-configured DataLoader
+        device: Device to run on
+        mc_samples: Number of MC dropout samples (forward passes)
+        fuel_stats: Optional dict with normalization stats for denormalization
+        target_band_indices: Band indices for labeling
+
+    Returns:
+        Tuple of:
+        - mean_dict: {tile_id: mean_prediction_array} [n_bands, 5, 5]
+        - std_dict: {tile_id: std_prediction_array} [n_bands, 5, 5]
+        - predictions_df: DataFrame with tile-level statistics including uncertainty
+    """
+    logger.info(f"Running MC dropout inference with {mc_samples} samples")
+
+    # Enable MC dropout (dropout active, BatchNorm stays in eval)
+    modified_modules = enable_mc_dropout(model)
+    logger.info(f"Enabled dropout for {len(modified_modules)} modules")
+
+    # Collect samples per tile: {tile_id: list of [n_bands, 5, 5] tensors}
+    tile_samples: Dict[str, List[torch.Tensor]] = {}
+    tile_metadata: Dict[str, dict] = {}  # Store metadata for each tile
+
+    try:
+        for sample_idx in range(mc_samples):
+            logger.info(f"MC sample {sample_idx + 1}/{mc_samples}")
+
+            for batch in tqdm(dataloader, desc=f"Sample {sample_idx + 1}", leave=False):
+                # Move to device
+                dep_points = batch['dep_points'].to(device)
+                dep_attr = batch['dep_attr'].to(device)
+                edge_index = batch['edge_index'].to(device)
+                batch_indices = batch['batch_indices'].to(device)
+                norm_params = batch['norm_params']
+
+                # Handle imagery (move to device if present)
+                naip = batch['naip']
+                uavsar = batch['uavsar']
+
+                for i, naip_dict in enumerate(naip):
+                    if naip_dict is not None and 'images' in naip_dict:
+                        naip[i] = {
+                            'images': naip_dict['images'].to(device),
+                            'img_bbox': naip_dict.get('img_bbox'),
+                            'relative_dates': naip_dict.get('relative_dates'),
+                        }
+
+                for i, uavsar_dict in enumerate(uavsar):
+                    if uavsar_dict is not None and 'images' in uavsar_dict:
+                        uavsar[i] = {
+                            'images': uavsar_dict['images'].to(device),
+                            'img_bbox': uavsar_dict.get('img_bbox'),
+                            'attention_mask': uavsar_dict.get('attention_mask'),
+                            'relative_dates': uavsar_dict.get('relative_dates'),
+                        }
+
+                # Forward pass (with dropout active)
+                model_output = model(
+                    dep_points=dep_points,
+                    edge_index=edge_index,
+                    batch_indices=batch_indices,
+                    norm_params=norm_params,
+                    dep_attr=dep_attr,
+                    naip=naip,
+                    uavsar=uavsar,
+                    bbox=batch['bbox'].to(device),
+                    debug_logging=False
+                )
+
+                # Handle heteroscedastic output
+                if isinstance(model_output, tuple):
+                    predictions, _ = model_output
+                else:
+                    predictions = model_output
+
+                predictions = predictions.cpu()
+
+                # Denormalize if stats provided
+                if fuel_stats is not None:
+                    predictions = denormalize_predictions(
+                        predictions, fuel_stats, target_band_indices or [11, 7]
+                    )
+
+                # Store samples per tile
+                for i, tile_id in enumerate(batch['tile_ids']):
+                    pred = predictions[i]  # [n_bands, 5, 5]
+
+                    if tile_id not in tile_samples:
+                        tile_samples[tile_id] = []
+                        tile_metadata[tile_id] = {
+                            'site_name': batch['site_names'][i],
+                            'bbox': batch['bbox'][i],
+                        }
+
+                    tile_samples[tile_id].append(pred)
+
+    finally:
+        # Restore model to eval mode
+        disable_mc_dropout(modified_modules)
+        logger.info("Restored model to eval mode")
+
+    # Compute mean and std across samples
+    logger.info("Computing mean and std across MC samples")
+    mean_dict = {}
+    std_dict = {}
+    results_list = []
+
+    for tile_id, samples in tile_samples.items():
+        # Stack samples: [mc_samples, n_bands, 5, 5]
+        stacked = torch.stack(samples, dim=0)
+
+        # Compute statistics
+        mean_pred = stacked.mean(dim=0).numpy()  # [n_bands, 5, 5]
+        std_pred = stacked.std(dim=0).numpy()    # [n_bands, 5, 5]
+
+        mean_dict[tile_id] = mean_pred
+        std_dict[tile_id] = std_pred
+
+        # Build result row
+        metadata = tile_metadata[tile_id]
+        result = {
+            'tile_id': tile_id,
+            'site_name': metadata['site_name'],
+            'bbox_xmin': metadata['bbox'][0].item(),
+            'bbox_ymin': metadata['bbox'][1].item(),
+            'bbox_xmax': metadata['bbox'][2].item(),
+            'bbox_ymax': metadata['bbox'][3].item(),
+            'mc_samples': mc_samples,
+        }
+
+        # Add per-band statistics (mean prediction + uncertainty metrics)
+        for j in range(mean_pred.shape[0]):
+            band_name = f'band_{j}'
+            band_mean = mean_pred[j]
+            band_std = std_pred[j]
+
+            # Standard prediction statistics (from mean)
+            result[f'{band_name}_mean'] = np.nanmean(band_mean)
+            result[f'{band_name}_std'] = np.nanstd(band_mean)
+            result[f'{band_name}_min'] = np.nanmin(band_mean)
+            result[f'{band_name}_max'] = np.nanmax(band_mean)
+            result[f'{band_name}_center'] = band_mean[2, 2]
+
+            # MC uncertainty metrics
+            result[f'{band_name}_mc_std_mean'] = np.nanmean(band_std)
+            result[f'{band_name}_mc_std_max'] = np.nanmax(band_std)
+
+            # Coefficient of variation (std/mean), avoiding division by zero
+            mean_val = np.nanmean(band_mean)
+            if abs(mean_val) > 1e-6:
+                result[f'{band_name}_mc_cv'] = np.nanmean(band_std) / abs(mean_val)
+            else:
+                result[f'{band_name}_mc_cv'] = np.nan
+
+        results_list.append(result)
+
+    predictions_df = pd.DataFrame(results_list)
+
+    logger.info(f"MC dropout inference complete: {len(mean_dict)} tiles")
+
+    return mean_dict, std_dict, predictions_df
 
 
 @torch.no_grad()
@@ -475,7 +741,8 @@ def inference_worker(
     input_path: str,
     output_dir: str,
     fuel_stats_path: str,
-    batch_size: int
+    batch_size: int,
+    mc_samples: int = 1
 ):
     """
     DDP worker for distributed multi-GPU inference.
@@ -497,6 +764,7 @@ def inference_worker(
         output_dir: Directory to save rank-specific predictions
         fuel_stats_path: Path to fuel metrics normalization stats
         batch_size: Batch size per GPU
+        mc_samples: Number of MC dropout samples (default: 1 = deterministic)
     """
     # Initialize DDP (pattern from raster_training.py:1057-1059)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -555,14 +823,30 @@ def inference_worker(
         if rank == 0:
             logger.warning(f"Fuel stats not found, predictions will be normalized")
 
-    # Run inference (use extracted run_inference_on_dataloader)
-    predictions_dict, predictions_df = run_inference_on_dataloader(
-        model, dataloader, device, fuel_stats, config.target_band_indices
-    )
+    # Run inference (use extracted run_inference_on_dataloader or MC dropout)
+    std_dict = None
+    if mc_samples > 1:
+        # MC dropout inference
+        if rank == 0:
+            logger.info(f"MC dropout mode: {mc_samples} samples")
+        predictions_dict, std_dict, predictions_df = run_mc_dropout_inference(
+            model.module,  # Unwrap DDP module
+            dataloader, device, mc_samples, fuel_stats, config.target_band_indices
+        )
+    else:
+        # Standard deterministic inference
+        predictions_dict, predictions_df = run_inference_on_dataloader(
+            model, dataloader, device, fuel_stats, config.target_band_indices
+        )
 
     # Save rank-specific results
     rank_predictions_path = Path(output_dir) / f'predictions_rank_{rank}.pt'
     torch.save(predictions_dict, rank_predictions_path)
+
+    # Save std predictions if MC dropout was used
+    if std_dict is not None:
+        rank_std_path = Path(output_dir) / f'predictions_std_rank_{rank}.pt'
+        torch.save(std_dict, rank_std_path)
 
     rank_csv_path = Path(output_dir) / f'predictions_rank_{rank}.csv'
     predictions_df.to_csv(rank_csv_path, index=False)
@@ -621,6 +905,8 @@ def run_multi_gpu_inference(args):
 
     # Spawn workers
     logger.info("Spawning worker processes...")
+    if args.mc_samples > 1:
+        logger.info(f"MC dropout mode: {args.mc_samples} samples")
     torch.multiprocessing.spawn(
         inference_worker,
         args=(
@@ -629,7 +915,8 @@ def run_multi_gpu_inference(args):
             args.input,
             str(output_dir),
             args.fuel_stats,
-            args.batch_size
+            args.batch_size,
+            args.mc_samples
         ),
         nprocs=world_size,
         join=True
@@ -638,11 +925,14 @@ def run_multi_gpu_inference(args):
     # Aggregate results from all ranks
     logger.info("Aggregating results from all GPUs...")
     predictions_dict = {}
+    std_predictions_dict = {}  # For MC dropout
     predictions_dfs = []
+    has_std = args.mc_samples > 1
 
     for rank in range(world_size):
         rank_pred_path = output_dir / f'predictions_rank_{rank}.pt'
         rank_csv_path = output_dir / f'predictions_rank_{rank}.csv'
+        rank_std_path = output_dir / f'predictions_std_rank_{rank}.pt'
 
         if not rank_pred_path.exists():
             logger.warning(f"Rank {rank} predictions not found at {rank_pred_path}")
@@ -652,6 +942,12 @@ def run_multi_gpu_inference(args):
         rank_preds = torch.load(rank_pred_path, weights_only=False)
         predictions_dict.update(rank_preds)
         logger.info(f"Loaded {len(rank_preds)} predictions from rank {rank}")
+
+        # Load and merge std predictions if MC dropout was used
+        if has_std and rank_std_path.exists():
+            rank_std_preds = torch.load(rank_std_path, weights_only=False)
+            std_predictions_dict.update(rank_std_preds)
+            rank_std_path.unlink()
 
         # Load and concatenate DataFrames
         rank_df = pd.read_csv(rank_csv_path)
@@ -671,6 +967,12 @@ def run_multi_gpu_inference(args):
     final_path = output_dir / f'forest_plot_predictions_{timestamp}.pt'
     torch.save(predictions_dict, final_path)
     logger.info(f"Saved aggregated predictions to {final_path}")
+
+    # Save std predictions if MC dropout was used
+    if has_std and len(std_predictions_dict) > 0:
+        std_path = output_dir / f'forest_plot_predictions_std_{timestamp}.pt'
+        torch.save(std_predictions_dict, std_path)
+        logger.info(f"Saved aggregated uncertainty (std) predictions to {std_path}")
 
     csv_path = output_dir / f'forest_plot_predictions_{timestamp}.csv'
     predictions_df.to_csv(csv_path, index=False)
@@ -748,6 +1050,12 @@ def main():
         default=None,
         help='Number of GPUs to use for multi-GPU inference (default: all available)'
     )
+    parser.add_argument(
+        '--mc-samples',
+        type=int,
+        default=1,
+        help='Number of MC dropout samples for uncertainty estimation (default: 1 = deterministic)'
+    )
 
     args = parser.parse_args()
 
@@ -786,23 +1094,66 @@ def main():
         else:
             logger.warning(f"Fuel stats not found at {args.fuel_stats}, predictions will be normalized")
 
-        # Run inference
-        predictions_dict, predictions_df = run_inference(
-            model=model,
-            tiles=tiles,
-            batch_size=args.batch_size,
-            device=device,
-            fuel_stats=fuel_stats,
-            target_band_indices=config.target_band_indices
-        )
-
-        # Save results
+        # Generate timestamp early for consistent naming
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Save predictions dict
+        # Load checkpoint data for config summary (need full checkpoint, not just state dict)
+        checkpoint_data = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+
+        # Generate and save config summary for reproducibility
+        config_summary_path = output_dir / f'inference_config_{timestamp}.json'
+        generate_config_summary(
+            checkpoint_path=args.checkpoint,
+            checkpoint_data=checkpoint_data,
+            cli_args=vars(args),
+            band_config_path=getattr(args, 'band_config', None),
+            output_path=config_summary_path
+        )
+
+        # Create dataloader for both deterministic and MC inference
+        dataloader = DataLoader(
+            tiles,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_inference_batch,
+            num_workers=0
+        )
+
+        # Run inference (deterministic or MC dropout)
+        std_dict = None  # Only populated for MC dropout
+
+        if args.mc_samples > 1:
+            # MC dropout inference for uncertainty estimation
+            logger.info(f"MC dropout mode: {args.mc_samples} samples")
+            predictions_dict, std_dict, predictions_df = run_mc_dropout_inference(
+                model=model,
+                dataloader=dataloader,
+                device=device,
+                mc_samples=args.mc_samples,
+                fuel_stats=fuel_stats,
+                target_band_indices=config.target_band_indices
+            )
+        else:
+            # Standard deterministic inference
+            predictions_dict, predictions_df = run_inference_on_dataloader(
+                model=model,
+                dataloader=dataloader,
+                device=device,
+                fuel_stats=fuel_stats,
+                target_band_indices=config.target_band_indices
+            )
+
+        # Save results
+        # Save predictions dict (mean predictions)
         predictions_path = output_dir / f'forest_plot_predictions_{timestamp}.pt'
         torch.save(predictions_dict, predictions_path)
         logger.info(f"Saved predictions to {predictions_path}")
+
+        # Save std dict if MC dropout was used
+        if std_dict is not None:
+            std_path = output_dir / f'forest_plot_predictions_std_{timestamp}.pt'
+            torch.save(std_dict, std_path)
+            logger.info(f"Saved uncertainty (std) predictions to {std_path}")
 
         # Save CSV summary
         csv_path = output_dir / f'forest_plot_predictions_{timestamp}.csv'
