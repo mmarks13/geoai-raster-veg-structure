@@ -171,19 +171,28 @@ def normalize_attributes_zscore(
 
     Handles NaN/Inf by setting to mean before normalization.
 
+    Attribute indices:
+        0: Intensity
+        1: ReturnNumber
+        2: NumberOfReturns
+        3: Planarity
+        4: Sphericity
+        5: Verticality
+
     Args:
-        dep_pnt_attr: [N, 3] raw attributes
-        attr_mean: [3] global means (from TRAINING stats)
-        attr_std: [3] global stds (from TRAINING stats)
+        dep_pnt_attr: [N, num_attrs] raw attributes (3 for legacy, 6 for new)
+        attr_mean: [num_attrs] global means (from TRAINING stats)
+        attr_std: [num_attrs] global stds (from TRAINING stats)
         dtype: Output dtype (default float16 for memory)
 
     Returns:
-        dep_points_attr_norm: [N, 3] normalized attributes
+        dep_points_attr_norm: [N, num_attrs] normalized attributes
     """
     if dep_pnt_attr is None:
         return None
 
     dep_points_attr_norm = dep_pnt_attr.clone()
+    num_attrs = dep_points_attr_norm.shape[1]
 
     # Handle invalid values → set to mean
     invalid_mask = torch.isnan(dep_points_attr_norm) | torch.isinf(dep_points_attr_norm)
@@ -191,7 +200,7 @@ def normalize_attributes_zscore(
     attr_mean_t = torch.tensor(attr_mean, dtype=dep_points_attr_norm.dtype, device=dep_points_attr_norm.device)
     attr_std_t = torch.tensor(attr_std, dtype=dep_points_attr_norm.dtype, device=dep_points_attr_norm.device)
 
-    for attr_idx in range(3):
+    for attr_idx in range(num_attrs):
         if invalid_mask[:, attr_idx].any():
             dep_points_attr_norm[:, attr_idx][invalid_mask[:, attr_idx]] = attr_mean_t[attr_idx]
 
@@ -274,12 +283,19 @@ def compute_forest_plot_statistics(all_tiles: List[Dict]) -> Dict:
     attr_std = None
 
     if len(all_attrs) > 0:
-        all_attrs = torch.cat(all_attrs, dim=0)
-        attr_mean = torch.zeros(3, dtype=torch.float64)
-        attr_std = torch.zeros(3, dtype=torch.float64)
+        all_attrs = torch.cat(all_attrs, dim=0)  # [N_total, num_attrs]
+        num_attrs = all_attrs.shape[1]  # Can be 3 (legacy) or 6 (new)
 
-        for attr_idx in range(3):
-            values = all_attrs[:, attr_idx]
+        # Attribute names for logging
+        attr_names = ['Intensity', 'ReturnNumber', 'NumberOfReturns',
+                      'Planarity', 'Sphericity', 'Verticality']
+
+        attr_mean = torch.zeros(num_attrs, dtype=torch.float64)
+        attr_std = torch.zeros(num_attrs, dtype=torch.float64)
+
+        for attr_idx in range(num_attrs):
+            values = all_attrs[:, attr_idx].clone()
+
             valid_mask = ~(torch.isnan(values) | torch.isinf(values))
             valid_values = values[valid_mask]
 
@@ -293,10 +309,10 @@ def compute_forest_plot_statistics(all_tiles: List[Dict]) -> Dict:
         attr_mean = attr_mean.numpy()
         attr_std = attr_std.numpy()
 
-        logger.info(f"  Forest plot attribute stats:")
-        logger.info(f"    Intensity: mean={attr_mean[0]:.4f}, std={attr_std[0]:.4f}")
-        logger.info(f"    ReturnNumber: mean={attr_mean[1]:.4f}, std={attr_std[1]:.4f}")
-        logger.info(f"    NumberOfReturns: mean={attr_mean[2]:.4f}, std={attr_std[2]:.4f}")
+        logger.info(f"  Forest plot attribute stats ({num_attrs} attributes):")
+        for idx in range(num_attrs):
+            name = attr_names[idx] if idx < len(attr_names) else f'Attr{idx}'
+            logger.info(f"    {name}: mean={attr_mean[idx]:.4f}, std={attr_std[idx]:.4f}")
 
     return {
         'coord_mean': torch.from_numpy(coord_mean).float(),
@@ -340,8 +356,12 @@ def report_distribution_shift(train_stats: Dict, forest_stats: Dict) -> Dict:
 
     # Attribute shift (if available)
     attr_shift = []
+    attr_names = ['Intensity', 'ReturnNumber', 'NumberOfReturns',
+                  'Planarity', 'Sphericity', 'Verticality']
     if train_stats.get('attr_mean') is not None and forest_stats.get('attr_mean') is not None:
-        for dim, name in enumerate(['Intensity', 'ReturnNumber', 'NumberOfReturns']):
+        num_attrs = min(len(train_stats['attr_mean']), len(forest_stats['attr_mean']))
+        for dim in range(num_attrs):
+            name = attr_names[dim] if dim < len(attr_names) else f'Attr{dim}'
             mean_diff = abs(forest_stats['attr_mean'][dim].item() - train_stats['attr_mean'][dim])
             shift_in_std = mean_diff / train_stats['attr_std'][dim]
             attr_shift.append(shift_in_std)

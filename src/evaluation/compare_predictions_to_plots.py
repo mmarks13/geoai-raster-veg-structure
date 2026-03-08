@@ -542,6 +542,198 @@ def plot_by_site(
     logger.info(f"Saved per-site comparison to {output_path}")
 
 
+def plot_by_site_with_uncertainty(
+    df: pd.DataFrame,
+    band_config: BandConfig,
+    output_path: Path,
+    coverage_threshold: float = 0.99
+) -> None:
+    """
+    Generate per-site comparison scatter plots with MC dropout uncertainty error bars.
+
+    Same layout as plot_by_site(), but uses ax.errorbar() with uncertainty
+    from band_X_mc_std_mean columns.
+
+    Args:
+        df: DataFrame with predictions, field measurements, and MC uncertainty columns
+        band_config: Band configuration
+        output_path: Path to save figure
+        coverage_threshold: Minimum coverage fraction
+    """
+    from scipy.stats import spearmanr
+
+    sites = sorted(df['site_name'].unique())
+    n_sites = len(sites)
+
+    if n_sites == 0:
+        logger.warning("No sites to plot")
+        return
+
+    bands_with_mapping = band_config.get_bands_with_field_mapping()
+    n_bands = len(bands_with_mapping)
+
+    if n_bands == 0:
+        logger.warning("No bands with field mapping for plotting")
+        return
+
+    # Check if uncertainty columns exist
+    first_band = bands_with_mapping[0].name
+    if f'{first_band}_mc_std_mean' not in df.columns:
+        logger.warning("No MC uncertainty columns found, skipping uncertainty plot")
+        return
+
+    # Create figure
+    fig, axes = plt.subplots(n_bands, n_sites, figsize=(4 * n_sites, 4 * n_bands))
+    if n_bands == 1 and n_sites == 1:
+        axes = np.array([[axes]])
+    elif n_bands == 1:
+        axes = axes.reshape(1, -1)
+    elif n_sites == 1:
+        axes = axes.reshape(-1, 1)
+
+    for band_idx, band in enumerate(bands_with_mapping):
+        band_name = band.name
+        field_col = f'{band_name}_field'
+        pred_col = f'{band_name}_pred'
+        coverage_col = f'{band_name}_coverage_fraction'
+        mc_std_col = f'{band_name}_mc_std_mean'
+
+        for site_idx, site in enumerate(sites):
+            ax = axes[band_idx, site_idx]
+            site_df = df[df['site_name'] == site]
+
+            # Filter valid data
+            valid_mask = (
+                site_df[field_col].notna() &
+                site_df[pred_col].notna() &
+                (site_df[coverage_col] >= coverage_threshold)
+            )
+
+            if valid_mask.sum() >= 2:
+                field_vals = pd.to_numeric(site_df.loc[valid_mask, field_col], errors='coerce')
+                pred_vals = site_df.loc[valid_mask, pred_col]
+                mc_std_vals = site_df.loc[valid_mask, mc_std_col]
+
+                # Error bars using MC uncertainty
+                ax.errorbar(
+                    field_vals, pred_vals,
+                    yerr=mc_std_vals,
+                    fmt='o', alpha=0.6, markersize=6,
+                    capsize=2, capthick=1, elinewidth=1,
+                    color='forestgreen', ecolor='gray'
+                )
+
+                # 1:1 line
+                val_min = min(field_vals.min(), pred_vals.min())
+                val_max = max(field_vals.max(), pred_vals.max())
+                ax.plot([val_min, val_max], [val_min, val_max], 'k--', alpha=0.5)
+
+                # Statistics if n >= 3
+                if len(field_vals) >= 3:
+                    r_val = scipy_stats.pearsonr(field_vals, pred_vals)[0]
+                    rho_val = spearmanr(field_vals, pred_vals)[0]
+                    mean_unc = mc_std_vals.mean()
+                    ax.set_title(
+                        f'{site}\nR²={r_val**2:.3f}, ρ={rho_val:.3f}\n'
+                        f'(n={len(field_vals)}, unc={mean_unc:.2f})',
+                        fontsize=9
+                    )
+                else:
+                    ax.set_title(f'{site}\n(n={len(field_vals)}, insufficient)', fontsize=9)
+            else:
+                ax.set_title(f'{site}\n(no data)', fontsize=9)
+
+            ax.set_xlabel(f'Field {band.display_name} ({band.display_units})', fontsize=8)
+            ax.set_ylabel(f'Pred. {band.display_name} ({band.display_units})', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved per-site comparison with uncertainty to {output_path}")
+
+
+def plot_uncertainty_distribution(
+    df: pd.DataFrame,
+    band_config: BandConfig,
+    output_path: Path
+) -> None:
+    """
+    Generate histograms of MC dropout uncertainty per band.
+
+    Shows the distribution of prediction uncertainty across all tiles,
+    optionally split by site to identify high-uncertainty regions.
+
+    Args:
+        df: DataFrame with MC uncertainty columns
+        band_config: Band configuration
+        output_path: Path to save figure
+    """
+    bands_with_mapping = band_config.get_bands_with_field_mapping()
+    n_bands = len(bands_with_mapping)
+
+    if n_bands == 0:
+        logger.warning("No bands with field mapping for plotting")
+        return
+
+    # Check if uncertainty columns exist
+    first_band = bands_with_mapping[0].name
+    if f'{first_band}_mc_std_mean' not in df.columns:
+        logger.warning("No MC uncertainty columns found, skipping uncertainty distribution plot")
+        return
+
+    sites = sorted(df['site_name'].unique())
+    n_sites = len(sites)
+
+    # Create figure: one row per band, columns for overall + per-site
+    fig, axes = plt.subplots(n_bands, 1 + n_sites, figsize=(4 * (1 + n_sites), 4 * n_bands))
+    if n_bands == 1:
+        axes = axes.reshape(1, -1)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, n_sites))
+
+    for band_idx, band in enumerate(bands_with_mapping):
+        band_name = band.name
+        mc_std_col = f'{band_name}_mc_std_mean'
+        mc_cv_col = f'{band_name}_mc_cv'
+
+        # Column 0: Overall distribution
+        ax = axes[band_idx, 0]
+        all_unc = df[mc_std_col].dropna()
+        if len(all_unc) > 0:
+            ax.hist(all_unc, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
+            ax.axvline(all_unc.mean(), color='red', linestyle='--', label=f'Mean: {all_unc.mean():.3f}')
+            ax.axvline(all_unc.median(), color='orange', linestyle=':', label=f'Median: {all_unc.median():.3f}')
+            ax.set_title(f'{band.display_name}\nAll Sites (n={len(all_unc)})', fontsize=10)
+            ax.set_xlabel(f'MC Std ({band.display_units})', fontsize=9)
+            ax.set_ylabel('Count', fontsize=9)
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        # Columns 1+: Per-site distributions
+        for site_idx, site in enumerate(sites):
+            ax = axes[band_idx, 1 + site_idx]
+            site_df = df[df['site_name'] == site]
+            site_unc = site_df[mc_std_col].dropna()
+
+            if len(site_unc) > 0:
+                ax.hist(site_unc, bins=20, alpha=0.7, color=colors[site_idx], edgecolor='black')
+                ax.axvline(site_unc.mean(), color='red', linestyle='--')
+                ax.set_title(f'{site}\n(n={len(site_unc)}, mean={site_unc.mean():.3f})', fontsize=9)
+            else:
+                ax.set_title(f'{site}\n(no data)', fontsize=9)
+
+            ax.set_xlabel(f'MC Std ({band.display_units})', fontsize=8)
+            if site_idx == 0:
+                ax.set_ylabel('Count', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved uncertainty distribution plot to {output_path}")
+
+
 def plot_rank_scatter(
     df: pd.DataFrame,
     band_config: BandConfig,
@@ -697,6 +889,345 @@ def plot_rank_by_site(
     logger.info(f"Saved per-site rank plot to {output_path}")
 
 
+def load_uncertainty_rasters(rasters_dir: Path) -> Dict[str, str]:
+    """
+    Load paths to uncertainty (std) raster files.
+
+    Returns:
+        Dict mapping site_name to uncertainty raster file path
+    """
+    logger.info(f"Loading uncertainty rasters from {rasters_dir}")
+
+    raster_files = list(rasters_dir.glob('*_predictions_std_raster.tif'))
+
+    if not raster_files:
+        return {}  # No uncertainty rasters is not an error
+
+    unc_rasters = {}
+    for raster_path in raster_files:
+        # Extract site name from filename (e.g., "BluffMesa_predictions_std_raster.tif" -> "BluffMesa")
+        site_name = raster_path.stem.replace('_predictions_std_raster', '')
+        unc_rasters[site_name] = str(raster_path)
+
+    logger.info(f"Found {len(unc_rasters)} uncertainty rasters")
+    for site_name in sorted(unc_rasters.keys()):
+        logger.info(f"  - {site_name}")
+
+    return unc_rasters
+
+
+def extract_uncertainty_values(
+    field_gdf: gpd.GeoDataFrame,
+    unc_rasters: Dict[str, str],
+    band_config: BandConfig,
+    coverage_threshold: float = 0.99
+) -> pd.DataFrame:
+    """
+    Extract uncertainty raster values at plot footprints.
+
+    Returns DataFrame with columns: plot_id, site_name, {band}_mc_std_mean
+    """
+    logger.info(f"Extracting uncertainty values for {len(field_gdf)} plots")
+
+    results = []
+    for idx, row in field_gdf.iterrows():
+        plot_id = row.get('PlotID', row.get('plot_id', idx))
+        site_name = row.get('Site', row.get('site_name', 'unknown'))
+        footprint = row.geometry
+
+        if site_name not in unc_rasters:
+            continue
+
+        raster_path = unc_rasters[site_name]
+        result = {'plot_id': plot_id, 'site_name': site_name}
+
+        for band in band_config.bands:
+            band_name = band.name
+            try:
+                extraction = extract_raster_values_at_footprint(
+                    raster_path, footprint, band.output_index, 'mean'  # Always use mean for std
+                )
+                unc_value = extraction['weighted_mean']
+                if not np.isnan(unc_value):
+                    # Apply same unit conversion as for predictions
+                    unc_display = band.convert_to_display_units(unc_value)
+                    result[f'{band_name}_mc_std_mean'] = unc_display
+                else:
+                    result[f'{band_name}_mc_std_mean'] = np.nan
+            except Exception:
+                result[f'{band_name}_mc_std_mean'] = np.nan
+
+        results.append(result)
+
+    return pd.DataFrame(results)
+
+
+def load_baseline_rasters(rasters_dir: Path) -> Dict[str, str]:
+    """
+    Load paths to baseline raster files.
+
+    Baseline rasters are stored as {site}/veg_structure_2m.tif
+
+    Returns:
+        Dict mapping site_name to raster file path
+    """
+    logger.info(f"Loading baseline rasters from {rasters_dir}")
+
+    # Look for pattern: {site}/veg_structure_2m.tif
+    raster_files = list(rasters_dir.glob('*/veg_structure_2m.tif'))
+
+    if not raster_files:
+        raise FileNotFoundError(
+            f"No baseline raster files found in {rasters_dir}. "
+            "Expected pattern: {site}/veg_structure_2m.tif"
+        )
+
+    site_rasters = {}
+    for raster_path in raster_files:
+        site_name = raster_path.parent.name
+        site_rasters[site_name] = str(raster_path)
+
+    logger.info(f"Found {len(site_rasters)} baseline rasters")
+    for site_name in sorted(site_rasters.keys()):
+        logger.info(f"  - {site_name}")
+
+    return site_rasters
+
+
+def extract_baseline_values(
+    field_gdf: gpd.GeoDataFrame,
+    baseline_rasters: Dict[str, str],
+    band_config: BandConfig,
+    coverage_threshold: float = 0.99
+) -> pd.DataFrame:
+    """
+    Extract baseline raster values at plot footprints.
+
+    Returns DataFrame with columns: plot_id, site_name, {band}_baseline, {band}_baseline_coverage
+    """
+    logger.info(f"Extracting baseline values for {len(field_gdf)} plots")
+
+    results = []
+    for idx, row in field_gdf.iterrows():
+        plot_id = row.get('PlotID', row.get('plot_id', idx))
+        site_name = row.get('Site', row.get('site_name', 'unknown'))
+        footprint = row.geometry
+
+        if site_name not in baseline_rasters:
+            continue
+
+        raster_path = baseline_rasters[site_name]
+        result = {'plot_id': plot_id, 'site_name': site_name}
+
+        for band in band_config.bands:
+            band_name = band.name
+            try:
+                extraction = extract_raster_values_at_footprint(
+                    raster_path, footprint, band.output_index, band.aggregation_method
+                )
+                baseline_value = extraction['weighted_mean']
+                if not np.isnan(baseline_value):
+                    baseline_display = band.convert_to_display_units(baseline_value)
+                    result[f'{band_name}_baseline'] = baseline_display
+                else:
+                    result[f'{band_name}_baseline'] = np.nan
+                result[f'{band_name}_baseline_coverage'] = extraction['coverage_fraction']
+            except Exception:
+                result[f'{band_name}_baseline'] = np.nan
+                result[f'{band_name}_baseline_coverage'] = 0.0
+
+        results.append(result)
+
+    return pd.DataFrame(results)
+
+
+def compute_3way_statistics(
+    df: pd.DataFrame,
+    band_config: BandConfig,
+    coverage_threshold: float = 0.99
+) -> Dict:
+    """
+    Compute 3-way comparison statistics: model vs field, baseline vs field, model vs baseline.
+
+    Returns dict with {band}_model_vs_field, {band}_baseline_vs_field, {band}_model_vs_baseline
+    """
+    logger.info("\n" + "=" * 60)
+    logger.info("COMPUTING 3-WAY COMPARISON STATISTICS")
+    logger.info("=" * 60)
+
+    stats_dict = {}
+
+    for band in band_config.get_bands_with_field_mapping():
+        band_name = band.name
+        field_col = f'{band_name}_field'
+        pred_col = f'{band_name}_pred'
+        baseline_col = f'{band_name}_baseline'
+        coverage_col = f'{band_name}_coverage_fraction'
+        baseline_coverage_col = f'{band_name}_baseline_coverage'
+
+        # Skip if columns missing
+        required_cols = [field_col, pred_col, baseline_col, coverage_col, baseline_coverage_col]
+        if not all(col in df.columns for col in required_cols):
+            logger.warning(f"Skipping {band_name}: missing required columns")
+            continue
+
+        # Filter valid data for all three comparisons
+        valid_all = (
+            df[field_col].notna() &
+            df[pred_col].notna() &
+            df[baseline_col].notna() &
+            (df[coverage_col] >= coverage_threshold) &
+            (df[baseline_coverage_col] >= coverage_threshold)
+        )
+
+        n_valid = valid_all.sum()
+        logger.info(f"\n{band.display_name}: {n_valid} plots with all three values")
+
+        if n_valid < 3:
+            continue
+
+        field_vals = pd.to_numeric(df.loc[valid_all, field_col], errors='coerce').values
+        pred_vals = df.loc[valid_all, pred_col].values
+        baseline_vals = df.loc[valid_all, baseline_col].values
+
+        # Model vs Field
+        r_mf, p_mf = scipy_stats.pearsonr(field_vals, pred_vals)
+        rho_mf, _ = spearmanr(field_vals, pred_vals)
+        rmse_mf = np.sqrt(np.mean((pred_vals - field_vals) ** 2))
+        mae_mf = np.mean(np.abs(pred_vals - field_vals))
+        bias_mf = np.mean(pred_vals - field_vals)
+
+        # Baseline vs Field
+        r_bf, p_bf = scipy_stats.pearsonr(field_vals, baseline_vals)
+        rho_bf, _ = spearmanr(field_vals, baseline_vals)
+        rmse_bf = np.sqrt(np.mean((baseline_vals - field_vals) ** 2))
+        mae_bf = np.mean(np.abs(baseline_vals - field_vals))
+        bias_bf = np.mean(baseline_vals - field_vals)
+
+        # Model vs Baseline
+        r_mb, p_mb = scipy_stats.pearsonr(baseline_vals, pred_vals)
+        rho_mb, _ = spearmanr(baseline_vals, pred_vals)
+        rmse_mb = np.sqrt(np.mean((pred_vals - baseline_vals) ** 2))
+
+        stats_dict[band_name] = {
+            'n': int(n_valid),
+            'units': band.display_units,
+            'display_name': band.display_name,
+            'model_vs_field': {
+                'r_squared': float(r_mf ** 2),
+                'pearson_r': float(r_mf),
+                'spearman_rho': float(rho_mf),
+                'rmse': float(rmse_mf),
+                'mae': float(mae_mf),
+                'bias': float(bias_mf),
+            },
+            'baseline_vs_field': {
+                'r_squared': float(r_bf ** 2),
+                'pearson_r': float(r_bf),
+                'spearman_rho': float(rho_bf),
+                'rmse': float(rmse_bf),
+                'mae': float(mae_bf),
+                'bias': float(bias_bf),
+            },
+            'model_vs_baseline': {
+                'r_squared': float(r_mb ** 2),
+                'pearson_r': float(r_mb),
+                'spearman_rho': float(rho_mb),
+                'rmse': float(rmse_mb),
+            },
+            'improvement': {
+                'rmse_reduction': float(rmse_bf - rmse_mf),
+                'r2_improvement': float(r_mf ** 2 - r_bf ** 2),
+            }
+        }
+
+        logger.info(f"  Model vs Field:    R²={r_mf**2:.3f}, RMSE={rmse_mf:.2f}")
+        logger.info(f"  Baseline vs Field: R²={r_bf**2:.3f}, RMSE={rmse_bf:.2f}")
+        logger.info(f"  Improvement:       ΔR²={r_mf**2 - r_bf**2:+.3f}, ΔRMSE={rmse_bf - rmse_mf:+.2f}")
+
+    return stats_dict
+
+
+def plot_3way_comparison(
+    df: pd.DataFrame,
+    band_config: BandConfig,
+    stats_dict: Dict,
+    output_path: Path,
+    coverage_threshold: float = 0.99
+) -> None:
+    """Generate 3-column scatter plot: Baseline vs Field, Model vs Field, Model vs Baseline."""
+    bands_with_stats = [b for b in band_config.get_bands_with_field_mapping() if b.name in stats_dict]
+    n_bands = len(bands_with_stats)
+
+    if n_bands == 0:
+        logger.warning("No bands with 3-way statistics for plotting")
+        return
+
+    fig, axes = plt.subplots(n_bands, 3, figsize=(15, 4 * n_bands))
+    if n_bands == 1:
+        axes = axes.reshape(1, -1)
+
+    for band_idx, band in enumerate(bands_with_stats):
+        band_name = band.name
+        field_col = f'{band_name}_field'
+        pred_col = f'{band_name}_pred'
+        baseline_col = f'{band_name}_baseline'
+        coverage_col = f'{band_name}_coverage_fraction'
+        baseline_coverage_col = f'{band_name}_baseline_coverage'
+
+        valid_mask = (
+            df[field_col].notna() &
+            df[pred_col].notna() &
+            df[baseline_col].notna() &
+            (df[coverage_col] >= coverage_threshold) &
+            (df[baseline_coverage_col] >= coverage_threshold)
+        )
+
+        if valid_mask.sum() < 3:
+            continue
+
+        field_vals = pd.to_numeric(df.loc[valid_mask, field_col], errors='coerce')
+        pred_vals = df.loc[valid_mask, pred_col]
+        baseline_vals = df.loc[valid_mask, baseline_col]
+
+        stats = stats_dict[band_name]
+
+        # Column 1: Baseline vs Field
+        ax = axes[band_idx, 0]
+        ax.scatter(field_vals, baseline_vals, alpha=0.6, s=50, c='orange', label='Baseline')
+        max_val = max(field_vals.max(), baseline_vals.max())
+        ax.plot([0, max_val], [0, max_val], 'k--', linewidth=1.5)
+        ax.set_xlabel(f'Field ({band.display_units})')
+        ax.set_ylabel(f'Baseline ({band.display_units})')
+        ax.set_title(f'{band.display_name}\nBaseline vs Field\nR²={stats["baseline_vs_field"]["r_squared"]:.3f}')
+        ax.grid(True, alpha=0.3)
+
+        # Column 2: Model vs Field
+        ax = axes[band_idx, 1]
+        ax.scatter(field_vals, pred_vals, alpha=0.6, s=50, c='forestgreen', label='Model')
+        max_val = max(field_vals.max(), pred_vals.max())
+        ax.plot([0, max_val], [0, max_val], 'k--', linewidth=1.5)
+        ax.set_xlabel(f'Field ({band.display_units})')
+        ax.set_ylabel(f'Model ({band.display_units})')
+        ax.set_title(f'{band.display_name}\nModel vs Field\nR²={stats["model_vs_field"]["r_squared"]:.3f}')
+        ax.grid(True, alpha=0.3)
+
+        # Column 3: Model vs Baseline
+        ax = axes[band_idx, 2]
+        ax.scatter(baseline_vals, pred_vals, alpha=0.6, s=50, c='steelblue', label='Comparison')
+        max_val = max(baseline_vals.max(), pred_vals.max())
+        ax.plot([0, max_val], [0, max_val], 'k--', linewidth=1.5)
+        ax.set_xlabel(f'Baseline ({band.display_units})')
+        ax.set_ylabel(f'Model ({band.display_units})')
+        ax.set_title(f'{band.display_name}\nModel vs Baseline\nR²={stats["model_vs_baseline"]["r_squared"]:.3f}')
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Saved 3-way comparison plot to {output_path}")
+
+
 def plot_comparisons(
     df: pd.DataFrame,
     band_config: BandConfig,
@@ -826,7 +1357,13 @@ def main():
         default='EPSG:32611',
         help='Coordinate reference system (default: EPSG:32611)'
     )
-    
+    parser.add_argument(
+        '--baseline-rasters-dir',
+        type=str,
+        default=None,
+        help='Optional: Directory containing baseline raster GeoTIFFs for 3-way comparison (pattern: {site}/veg_structure_2m.tif)'
+    )
+
     args = parser.parse_args()
     
     # Setup
@@ -841,7 +1378,13 @@ def main():
     # Load site rasters
     rasters_dir = Path(args.site_rasters_dir)
     site_rasters = load_site_rasters(rasters_dir)
-    
+
+    # Check for uncertainty rasters (from MC dropout)
+    unc_rasters = load_uncertainty_rasters(rasters_dir)
+    has_uncertainty = len(unc_rasters) > 0
+    if has_uncertainty:
+        logger.info(f"Found {len(unc_rasters)} uncertainty rasters - will extract for visualization")
+
     # Load field data
     logger.info(f"Loading field data from {args.field_data}")
     field_gdf = gpd.read_file(args.field_data)
@@ -862,7 +1405,24 @@ def main():
         band_config,
         coverage_threshold=args.coverage_threshold
     )
-    
+
+    # Merge uncertainty values if available (from MC dropout)
+    if has_uncertainty:
+        logger.info("Extracting uncertainty values from std rasters")
+        unc_df = extract_uncertainty_values(
+            field_footprints,
+            unc_rasters,
+            band_config,
+            coverage_threshold=args.coverage_threshold
+        )
+        if len(unc_df) > 0:
+            comparison_df = comparison_df.merge(
+                unc_df,
+                on=['plot_id', 'site_name'],
+                how='left'
+            )
+            logger.info(f"Merged uncertainty values for {len(unc_df)} plots")
+
     # Save comparison results
     results_path = output_dir / 'comparison_results.csv'
     comparison_df.to_csv(results_path, index=False)
@@ -922,6 +1482,97 @@ def main():
         output_dir / 'comparison_rank_by_site.png',
         coverage_threshold=args.coverage_threshold
     )
+
+    # MC dropout uncertainty visualizations (if uncertainty columns exist)
+    # Check for mc_samples column to determine if MC dropout was used
+    if 'mc_samples' in comparison_df.columns or any(
+        col.endswith('_mc_std_mean') for col in comparison_df.columns
+    ):
+        logger.info("Generating MC dropout uncertainty figures")
+
+        plot_by_site_with_uncertainty(
+            comparison_df,
+            band_config,
+            output_dir / 'comparison_by_site_uncertainty.png',
+            coverage_threshold=args.coverage_threshold
+        )
+
+        plot_uncertainty_distribution(
+            comparison_df,
+            band_config,
+            output_dir / 'uncertainty_distribution.png'
+        )
+
+    # 3-way comparison (if baseline provided)
+    if args.baseline_rasters_dir:
+        logger.info("\n" + "=" * 60)
+        logger.info("3-WAY COMPARISON MODE")
+        logger.info("=" * 60)
+
+        baseline_rasters_dir = Path(args.baseline_rasters_dir)
+        baseline_rasters = load_baseline_rasters(baseline_rasters_dir)
+
+        # Extract baseline values
+        baseline_df = extract_baseline_values(
+            field_footprints,
+            baseline_rasters,
+            band_config,
+            coverage_threshold=args.coverage_threshold
+        )
+
+        # Merge baseline with predictions
+        comparison_df = comparison_df.merge(
+            baseline_df,
+            on=['plot_id', 'site_name'],
+            how='left'
+        )
+
+        # Save updated comparison results
+        results_3way_path = output_dir / '3way_comparison_results.csv'
+        comparison_df.to_csv(results_3way_path, index=False)
+        logger.info(f"Saved 3-way comparison results to {results_3way_path}")
+
+        # Compute 3-way statistics
+        stats_3way = compute_3way_statistics(
+            comparison_df,
+            band_config,
+            coverage_threshold=args.coverage_threshold
+        )
+
+        # Save 3-way statistics
+        stats_3way_path = output_dir / '3way_comparison_stats.json'
+        with open(stats_3way_path, 'w') as f:
+            json.dump(stats_3way, f, indent=2)
+        logger.info(f"Saved 3-way statistics to {stats_3way_path}")
+
+        # Generate 3-way comparison plot
+        plot_3way_comparison(
+            comparison_df,
+            band_config,
+            stats_3way,
+            output_dir / '3way_comparison_scatter.png',
+            coverage_threshold=args.coverage_threshold
+        )
+
+        # Generate improvement summary CSV
+        improvement_rows = []
+        for band_name, stats in stats_3way.items():
+            improvement_rows.append({
+                'band': band_name,
+                'display_name': stats['display_name'],
+                'units': stats['units'],
+                'n': stats['n'],
+                'baseline_r2': stats['baseline_vs_field']['r_squared'],
+                'model_r2': stats['model_vs_field']['r_squared'],
+                'baseline_rmse': stats['baseline_vs_field']['rmse'],
+                'model_rmse': stats['model_vs_field']['rmse'],
+                'r2_improvement': stats['improvement']['r2_improvement'],
+                'rmse_reduction': stats['improvement']['rmse_reduction'],
+            })
+        improvement_df = pd.DataFrame(improvement_rows)
+        improvement_path = output_dir / '3way_improvement_summary.csv'
+        improvement_df.to_csv(improvement_path, index=False)
+        logger.info(f"Saved improvement summary to {improvement_path}")
 
     logger.info("\n" + "=" * 60)
     logger.info("COMPARISON COMPLETE")

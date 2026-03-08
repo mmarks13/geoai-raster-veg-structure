@@ -222,6 +222,14 @@ def compute_global_coordinate_and_attribute_statistics(all_tiles):
     CRITICAL: This computes stats on coordinates AFTER normalize_point_clouds_with_bbox(),
     not on raw coordinates. This maintains spatial structure while standardizing distribution.
 
+    Attribute handling (6 features):
+        Index 0: Intensity
+        Index 1: ReturnNumber
+        Index 2: NumberOfReturns
+        Index 3: Planarity [0,1]
+        Index 4: Sphericity [0,1]
+        Index 5: Verticality [0,1]
+
     Args:
         all_tiles: List of tile dicts with 'dep_points' and 'dep_pnt_attr'
 
@@ -229,8 +237,8 @@ def compute_global_coordinate_and_attribute_statistics(all_tiles):
         dict with keys:
             'coord_mean': [x_mean, y_mean, z_mean] (of bbox-normalized coords)
             'coord_std': [x_std, y_std, z_std] (of bbox-normalized coords)
-            'attr_mean': [intensity_mean, return_num_mean, num_returns_mean]
-            'attr_std': [intensity_std, return_num_std, num_returns_std]
+            'attr_mean': [6] means
+            'attr_std': [6] stds
             'total_points': int
             'total_tiles': int
     """
@@ -292,13 +300,19 @@ def compute_global_coordinate_and_attribute_statistics(all_tiles):
     attr_std = None
 
     if len(all_attrs) > 0:
-        all_attrs = torch.cat(all_attrs, dim=0)  # [N_total, 3]
+        all_attrs = torch.cat(all_attrs, dim=0)  # [N_total, num_attrs]
+        num_attrs = all_attrs.shape[1]  # Can be 3 (legacy) or 6 (new)
 
-        attr_mean = torch.zeros(3, dtype=torch.float64)
-        attr_std = torch.zeros(3, dtype=torch.float64)
+        # Attribute names for logging
+        attr_names = ['Intensity', 'ReturnNumber', 'NumberOfReturns',
+                      'Planarity', 'Sphericity', 'Verticality']
 
-        for attr_idx in range(3):
-            values = all_attrs[:, attr_idx]
+        attr_mean = torch.zeros(num_attrs, dtype=torch.float64)
+        attr_std = torch.zeros(num_attrs, dtype=torch.float64)
+
+        for attr_idx in range(num_attrs):
+            values = all_attrs[:, attr_idx].clone()
+
             # Handle NaN/Inf
             valid_mask = ~(torch.isnan(values) | torch.isinf(values))
             valid_values = values[valid_mask]
@@ -313,17 +327,17 @@ def compute_global_coordinate_and_attribute_statistics(all_tiles):
         attr_mean = attr_mean.numpy()
         attr_std = attr_std.numpy()
 
-        logger.info(f"  Attribute stats:")
-        logger.info(f"    Intensity: mean={attr_mean[0]:.4f}, std={attr_std[0]:.4f}")
-        logger.info(f"    ReturnNumber: mean={attr_mean[1]:.4f}, std={attr_std[1]:.4f}")
-        logger.info(f"    NumberOfReturns: mean={attr_mean[2]:.4f}, std={attr_std[2]:.4f}")
+        logger.info(f"  Attribute stats ({num_attrs} attributes):")
+        for idx in range(num_attrs):
+            name = attr_names[idx] if idx < len(attr_names) else f'Attr{idx}'
+            logger.info(f"    {name}: mean={attr_mean[idx]:.4f}, std={attr_std[idx]:.4f}")
 
     # Convert to tensors (not lists) for weights_only=True compatibility
     return {
         'coord_mean': torch.from_numpy(coord_mean).float(),  # Tensor[3]
         'coord_std': torch.from_numpy(coord_std).float(),    # Tensor[3]
-        'attr_mean': torch.from_numpy(attr_mean).float() if attr_mean is not None else None,  # Tensor[3]
-        'attr_std': torch.from_numpy(attr_std).float() if attr_std is not None else None,     # Tensor[3]
+        'attr_mean': torch.from_numpy(attr_mean).float() if attr_mean is not None else None,  # Tensor[num_attrs]
+        'attr_std': torch.from_numpy(attr_std).float() if attr_std is not None else None,     # Tensor[num_attrs]
         'total_points': int(total_points),
         'total_tiles': len([t for t in all_tiles if 'dep_points' in t])
     }
@@ -424,19 +438,28 @@ def normalize_attributes_zscore(dep_pnt_attr, attr_mean, attr_std, dtype=torch.f
 
     Handles NaN/Inf by setting to mean before normalization.
 
+    Attribute indices:
+        0: Intensity
+        1: ReturnNumber
+        2: NumberOfReturns
+        3: Planarity
+        4: Sphericity
+        5: Verticality
+
     Args:
-        dep_pnt_attr: [N, 3] raw attributes
-        attr_mean: [3] global means
-        attr_std: [3] global stds
+        dep_pnt_attr: [N, num_attrs] raw attributes (3 for legacy, 6 for new)
+        attr_mean: [num_attrs] global means
+        attr_std: [num_attrs] global stds
         dtype: Output dtype (default float16 for memory)
 
     Returns:
-        dep_points_attr_norm: [N, 3] normalized attributes
+        dep_points_attr_norm: [N, num_attrs] normalized attributes
     """
     if dep_pnt_attr is None:
         return None
 
     dep_points_attr_norm = dep_pnt_attr.clone()
+    num_attrs = dep_points_attr_norm.shape[1]
 
     # Handle invalid values → set to mean
     invalid_mask = torch.isnan(dep_points_attr_norm) | torch.isinf(dep_points_attr_norm)
@@ -444,7 +467,7 @@ def normalize_attributes_zscore(dep_pnt_attr, attr_mean, attr_std, dtype=torch.f
     attr_mean_t = torch.tensor(attr_mean, dtype=dep_points_attr_norm.dtype, device=dep_points_attr_norm.device)
     attr_std_t = torch.tensor(attr_std, dtype=dep_points_attr_norm.dtype, device=dep_points_attr_norm.device)
 
-    for attr_idx in range(3):
+    for attr_idx in range(num_attrs):
         if invalid_mask[:, attr_idx].any():
             dep_points_attr_norm[:, attr_idx][invalid_mask[:, attr_idx]] = attr_mean_t[attr_idx]
 
@@ -1324,8 +1347,8 @@ def main():
                 tile['norm_params'] = {
                     'coord_mean': norm_stats_train['coord_mean'],  # Tensor[3] float32
                     'coord_std': norm_stats_train['coord_std'],    # Tensor[3] float32
-                    'attr_mean': norm_stats_train['attr_mean'],    # Tensor[3] float32
-                    'attr_std': norm_stats_train['attr_std']       # Tensor[3] float32
+                    'attr_mean': norm_stats_train['attr_mean'],    # Tensor[num_attrs] float32
+                    'attr_std': norm_stats_train['attr_std']       # Tensor[num_attrs] float32
                 }
             else:
                 logger.warning(f"No bbox found for tile {tile.get('tile_id', 'unknown')}, skipping normalization")
@@ -1404,8 +1427,8 @@ def main():
                 tile['norm_params'] = {
                     'coord_mean': norm_stats_train['coord_mean'],  # Tensor[3] float32
                     'coord_std': norm_stats_train['coord_std'],    # Tensor[3] float32
-                    'attr_mean': norm_stats_train['attr_mean'],    # Tensor[3] float32
-                    'attr_std': norm_stats_train['attr_std']       # Tensor[3] float32
+                    'attr_mean': norm_stats_train['attr_mean'],    # Tensor[num_attrs] float32
+                    'attr_std': norm_stats_train['attr_std']       # Tensor[num_attrs] float32
                 }
             else:
                 logger.warning(f"No bbox found for tile {tile.get('tile_id', 'unknown')}, skipping normalization")

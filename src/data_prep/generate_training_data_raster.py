@@ -44,7 +44,7 @@ import xarray as xr
 import dask.array as da
 from dask import delayed
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 import multiprocessing as mp
 import rasterio
@@ -850,9 +850,18 @@ def process_fuel_metrics_data(bbox, fuel_metrics_raster_path, bbox_crs="EPSG:326
 
 def bounding_box_to_geojson(bbox):
     """
-    Converts a bounding box to a GeoJSON polygon.
+    Converts a bounding box to a GeoJSON polygon string.
     """
     return json.dumps(mapping(box(bbox[0], bbox[1], bbox[2], bbox[3])))
+
+
+def bounding_box_to_wkt(bbox):
+    """
+    Converts a bounding box to a WKT polygon string.
+
+    Use this for PDAL operations (readers.copc, filters.crop) which expect WKT format.
+    """
+    return box(bbox[0], bbox[1], bbox[2], bbox[3]).wkt
 
 
 def calculate_geoid_undulation(x, y, input_crs="EPSG:32611"):
@@ -963,7 +972,7 @@ def create_pointcloud_stack(bbox, start_date, end_date, stac_source, threads=8,
                         "type": "readers.copc",
                         "filename": pc_file,
                         "threads": threads,
-                        "polygon": bounding_box_to_geojson(bbox),
+                        "polygon": bounding_box_to_wkt(bbox),
                         "nosrs": True #not ideal but necessary to move forward with both Sedgwick and Volcan on 32611
                     }
                 ]
@@ -1118,10 +1127,12 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
         if stac_source:
             # Use local STAC catalog
             tile_geom = box(*tile_bbox)
+
             catalog = get_catalog(stac_source)
-            
+            all_items = list(catalog.get_all_items())
+
             # Filter items by date and spatial intersection
-            for item in catalog.get_all_items():
+            for item in all_items:
                 # Check the date (handle both datetime and start_datetime/end_datetime)
                 # Per STAC spec: when datetime is null, start_datetime and end_datetime are required
                 if item.datetime is not None:
@@ -1137,7 +1148,7 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
 
                 if not (start_date <= str(item_date) <= end_date):
                     continue
-                
+
                 # Check horizontal bounding box intersection
                 if item.bbox:
                     # Handle both 4-value and 6-value bboxes
@@ -1145,13 +1156,12 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
                         item_bbox_2d = [item.bbox[0], item.bbox[1], item.bbox[3], item.bbox[4]]
                     else:
                         item_bbox_2d = item.bbox[:4]
-                    
+
                     item_box = box(*item_bbox_2d)
                     if not tile_geom.intersects(item_box):
                         continue
-                
+
                 items.append(item)
-            
             if not items:
                 raise ValueError("No items found in local catalog for the specified parameters.")
         else:
@@ -1178,7 +1188,7 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
             if not items:
                 raise ValueError("No items found for the specified parameters.")
         
-        polygon = bounding_box_to_geojson(tile_bbox)
+        polygon = bounding_box_to_wkt(tile_bbox)
 
 
         for tile in items:
@@ -1186,26 +1196,55 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
             try:
                 if "data" not in tile.assets:
                     continue
-                
+
                 # Get the URL - sign it if using Planetary Computer, use directly if local
                 if stac_source:
                     # Local file - use href directly
                     url = tile.assets["data"].href
-                else:
-                    # Planetary Computer - sign the URL
-                    url = planetary_computer.sign(tile.assets["data"].href)
-                
-                pipeline_dict = {
-                    "pipeline": [
-                        {
-                            "type": "readers.copc",
-                            "filename": url,
-                            "polygon": polygon,
-                            "requests": 8,
-                            "keep_alive": 100
+                    # For local LAZ files (HAG-processed), use readers.las with bounds filter
+                    # For local COPC files, use readers.copc
+                    is_laz = (url.lower().endswith('.laz') or url.lower().endswith('.las')) and not url.lower().endswith('.copc.las') and not url.lower().endswith('.copc.laz')
+                    if is_laz:
+                        # Use readers.las with crop filter for LAZ files
+                        pipeline_dict = {
+                            "pipeline": [
+                                {
+                                    "type": "readers.las",
+                                    "filename": url
+                                },
+                                {
+                                    "type": "filters.crop",
+                                    "polygon": polygon
+                                }
+                            ]
                         }
-                    ]
-                }
+                    else:
+                        # Use readers.copc for COPC files
+                        pipeline_dict = {
+                            "pipeline": [
+                                {
+                                    "type": "readers.copc",
+                                    "filename": url,
+                                    "polygon": polygon,
+                                    "requests": 8,
+                                    "keep_alive": 100
+                                }
+                            ]
+                        }
+                else:
+                    # Planetary Computer - sign the URL and use COPC reader
+                    url = planetary_computer.sign(tile.assets["data"].href)
+                    pipeline_dict = {
+                        "pipeline": [
+                            {
+                                "type": "readers.copc",
+                                "filename": url,
+                                "polygon": polygon,
+                                "requests": 8,
+                                "keep_alive": 100
+                            }
+                        ]
+                    }
                 
                 if target_crs:
                     pipeline_dict["pipeline"].append({
@@ -1215,7 +1254,7 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
                 
                 pipeline = pdal.Pipeline(json.dumps(pipeline_dict))
                 pipeline.execute()
-                
+
                 arrays = pipeline.arrays
                 if len(arrays) > 0 and arrays[0].size > 0:
                     point_clouds.append(arrays[0].copy())  # Make a copy to ensure proper memory management
@@ -1224,10 +1263,19 @@ def create_3dep_stack(tile_bbox, start_date, end_date, area_bbox, threads=8, tar
                     meta = {
                         'href': tile.assets["data"].href,
                     }
-                    
-                    # Add USGS ID if available
+
+                    # Add datetime info - check multiple sources for compatibility
+                    # Planetary Computer items use start_datetime/end_datetime
+                    # Local STAC items may use item.datetime or datetime property
                     if 'start_datetime' in tile.properties:
                         meta['start_datetime'] = tile.properties['start_datetime']
+                    elif tile.datetime is not None:
+                        # Use item.datetime (pystac attribute) as fallback
+                        meta['start_datetime'] = tile.datetime.isoformat()
+                    elif 'datetime' in tile.properties:
+                        # Use datetime property as final fallback
+                        meta['start_datetime'] = tile.properties['datetime']
+
                     if 'end_datetime' in tile.properties:
                         meta['end_datetime'] = tile.properties['end_datetime']
                     if '3dep:usgs_id' in tile.properties:
@@ -1746,16 +1794,21 @@ def process_bbox(args):
         dep_meta = None
         attempt = 0
 
-        area_bbox = choose_area_bbox(bbox_wgs84, tile_properties)   
+        area_bbox = choose_area_bbox(bbox_wgs84, tile_properties)
+
+        # Determine which bbox to use for create_3dep_stack:
+        # - Local STAC: items have UTM (EPSG:32611) bboxes, so use original bbox
+        # - Planetary Computer: items have WGS84 bboxes, so use bbox_wgs84
+        dep_tile_bbox = bbox if dep_stac_source else bbox_wgs84
 
         while attempt < max_retries and dep_pc is None:
             try:
                 if attempt > 0 and verbose:
                     print(f"3DEP data retrieval retry attempt {attempt}/{max_retries} for tile {tile_id}")
 
-                 
+
                 dep_pc, dep_meta = create_3dep_stack(
-                    tile_bbox=bbox_wgs84,         # the tile’s bbox in EPSG:4326
+                    tile_bbox=dep_tile_bbox,      # UTM for local STAC, WGS84 for PC API
                     start_date=start_date,
                     end_date=end_date,
                     area_bbox=area_bbox,          # the cached-area bbox
@@ -1783,16 +1836,53 @@ def process_bbox(args):
             return None
         
         # For the 3DEP data, we concatenate the returned arrays
-        xyz_dep = np.vstack([np.column_stack((p['X'], p['Y'], p['Z'])) for p in dep_pc]).astype(np.float64)
-        
+        # Use HeightAboveGround (HAG) if available, otherwise fall back to Z
+        def _get_z_coordinate(p):
+            """Get Z coordinate: use HAG if available, otherwise raw Z."""
+            if 'HeightAboveGround' in p.dtype.names:
+                return p['HeightAboveGround']
+            else:
+                return p['Z']
+
+        xyz_dep = np.vstack([np.column_stack((p['X'], p['Y'], _get_z_coordinate(p))) for p in dep_pc]).astype(np.float64)
+
+        # Helper function for extracting attributes with neutral fallback values
+        def _extract_with_neutral_fallback(arr, dim_name, neutral_val):
+            """Extract dimension with neutral value fallback for NaN/missing."""
+            if dim_name in arr.dtype.names:
+                data = arr[dim_name].astype(np.float32)
+                return np.where(np.isnan(data), neutral_val, data)
+            else:
+                # Return array of neutral values if dimension is missing
+                return np.full(len(arr), neutral_val, dtype=np.float32)
+
         # Combine point attributes for 3DEP data
-        dep_pnt_attr = np.vstack([
-            np.column_stack((
-                p['Intensity'],
-                p['ReturnNumber'],
-                p['NumberOfReturns']
-            )) for p in dep_pc
-        ]).astype(np.float32)
+        # 6 attributes: Intensity, ReturnNumber, NumberOfReturns,
+        #               Planarity, Sphericity, Verticality
+        # If new HAG features not available, use neutral values
+        dep_pnt_attr_list = []
+        for p in dep_pc:
+            # Original 3 attributes (always present)
+            intensity = p['Intensity'].astype(np.float32)
+            return_number = p['ReturnNumber'].astype(np.float32)
+            num_returns = p['NumberOfReturns'].astype(np.float32)
+
+            # Eigenvalue features (neutral values if missing)
+            # Neutral values: planar=0 (not planar), spherical=1 (neutral sphere), vertical=0.5 (neutral)
+            planarity = _extract_with_neutral_fallback(p, 'Planarity', 0.0)
+            sphericity = _extract_with_neutral_fallback(p, 'Sphericity', 1.0)
+            verticality = _extract_with_neutral_fallback(p, 'Verticality', 0.5)
+
+            dep_pnt_attr_list.append(np.column_stack((
+                intensity,
+                return_number,
+                num_returns,
+                planarity,
+                sphericity,
+                verticality
+            )))
+
+        dep_pnt_attr = np.vstack(dep_pnt_attr_list).astype(np.float32)
         
         # Clean up 3DEP point cloud data after extraction
         for pc in dep_pc:
@@ -2701,7 +2791,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--end_date",
         type=str,
-        default="2025-02-27",
+        default=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
         help="End date for data filtering (YYYY-MM-DD)"
     )
     

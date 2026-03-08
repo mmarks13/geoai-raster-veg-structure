@@ -9,22 +9,32 @@
 #   4. Generate QGIS export (footprints + VRT)
 #
 # Usage:
-#   # Single model
+#   # Single model (single GPU)
 #   bash scripts/evaluate_forest_plots.sh \
 #       --model data/output/raster_model_naip_20251213_173144/checkpoints/best_model.pth \
 #       --band-config src/evaluation/configs/raster/cover_only.json
 #
-#   # Multiple models
+#   # Single model (multi-GPU)
+#   bash scripts/evaluate_forest_plots.sh \
+#       --model data/output/raster_model_naip_20251213_173144/checkpoints/best_model.pth \
+#       --band-config src/evaluation/configs/raster/cover_only.json \
+#       --multi-gpu
+#
+#   # Multiple models with specific GPU count
 #   bash scripts/evaluate_forest_plots.sh \
 #       --model path1/best_model.pth \
 #       --model path2/best_model.pth \
-#       --band-config src/evaluation/configs/raster/cover_only.json
+#       --band-config src/evaluation/configs/raster/cover_only.json \
+#       --multi-gpu --num-gpus 2
 #
 # Options:
 #   --model PATH           Model checkpoint path (required, can be specified multiple times)
 #   --band-config PATH     Band configuration JSON (required)
 #   --batch-size N         Batch size for inference (default: 64)
-#   --device DEVICE        Device to use (default: cuda)
+#   --device DEVICE        Device to use for single-GPU mode (default: cuda)
+#   --multi-gpu            Enable multi-GPU inference using DDP
+#   --num-gpus N           Number of GPUs to use (default: all available)
+#   --mc-samples N         Number of MC dropout samples for uncertainty (default: 1 = deterministic)
 #   --skip-inference       Skip inference step (reuse existing predictions)
 #   --help                 Show this help message
 
@@ -33,8 +43,11 @@ set -e  # Exit on error
 # Default values
 BATCH_SIZE=64
 DEVICE="cuda"
+MULTI_GPU=false
+NUM_GPUS=""
 SKIP_INFERENCE=false
 BAND_CONFIG=""
+MC_SAMPLES=1
 MODELS=()
 
 # Parse arguments
@@ -52,9 +65,21 @@ while [[ $# -gt 0 ]]; do
             DEVICE="$2"
             shift 2
             ;;
+        --multi-gpu)
+            MULTI_GPU=true
+            shift
+            ;;
+        --num-gpus)
+            NUM_GPUS="$2"
+            shift 2
+            ;;
         --skip-inference)
             SKIP_INFERENCE=true
             shift
+            ;;
+        --mc-samples)
+            MC_SAMPLES="$2"
+            shift 2
             ;;
         --band-config)
             BAND_CONFIG="$2"
@@ -124,7 +149,20 @@ echo "FOREST PLOT EVALUATION PIPELINE"
 echo "========================================"
 echo "Models to evaluate: ${#MODELS[@]}"
 echo "Batch size: $BATCH_SIZE"
-echo "Device: $DEVICE"
+if [ "$MULTI_GPU" = true ]; then
+    if [ -n "$NUM_GPUS" ]; then
+        echo "Mode: Multi-GPU ($NUM_GPUS GPUs)"
+    else
+        echo "Mode: Multi-GPU (all available)"
+    fi
+else
+    echo "Device: $DEVICE (single-GPU)"
+fi
+if [ "$MC_SAMPLES" -gt 1 ]; then
+    echo "MC Dropout: $MC_SAMPLES samples (uncertainty enabled)"
+else
+    echo "MC Dropout: disabled (deterministic)"
+fi
 echo ""
 
 for MODEL_PATH in "${MODELS[@]}"; do
@@ -145,6 +183,11 @@ for MODEL_PATH in "${MODELS[@]}"; do
     MODEL_DIR=$(dirname "$MODEL_PATH")
     MODEL_DIR=$(dirname "$MODEL_DIR")  # Go up two levels
     MODEL_NAME=$(basename "$MODEL_DIR")
+
+    # Add MC suffix if MC dropout is enabled
+    if [ "$MC_SAMPLES" -gt 1 ]; then
+        MODEL_NAME="${MODEL_NAME}_mc${MC_SAMPLES}"
+    fi
 
     echo "Model name: $MODEL_NAME"
 
@@ -180,7 +223,17 @@ for MODEL_PATH in "${MODELS[@]}"; do
             --output $PREDICTIONS_DIR \
             --fuel-stats $FUEL_STATS \
             --batch-size $BATCH_SIZE \
-            --device $DEVICE"
+            --mc-samples $MC_SAMPLES"
+
+        # Add multi-GPU or single-GPU device args
+        if [ "$MULTI_GPU" = true ]; then
+            INFERENCE_CMD="$INFERENCE_CMD --multi-gpu"
+            if [ -n "$NUM_GPUS" ]; then
+                INFERENCE_CMD="$INFERENCE_CMD --num-gpus $NUM_GPUS"
+            fi
+        else
+            INFERENCE_CMD="$INFERENCE_CMD --device $DEVICE"
+        fi
 
         # Add config if available
         if [ -f "$CONFIG_PATH" ]; then
@@ -199,7 +252,7 @@ for MODEL_PATH in "${MODELS[@]}"; do
     fi
 
     # Find most recent prediction files
-    LATEST_PT=$(ls -t "$PREDICTIONS_DIR"/forest_plot_predictions_*.pt 2>/dev/null | head -1)
+    LATEST_PT=$(ls -t "$PREDICTIONS_DIR"/forest_plot_predictions_*.pt 2>/dev/null | grep -v '_std_' | head -1)
     LATEST_CSV=$(ls -t "$PREDICTIONS_DIR"/forest_plot_predictions_*.csv 2>/dev/null | head -1)
 
     if [ -z "$LATEST_PT" ] || [ -z "$LATEST_CSV" ]; then
@@ -207,19 +260,32 @@ for MODEL_PATH in "${MODELS[@]}"; do
         continue
     fi
 
+    # Find std predictions file if it exists (from MC dropout)
+    LATEST_STD_PT=$(ls -t "$PREDICTIONS_DIR"/forest_plot_predictions_std_*.pt 2>/dev/null | head -1)
+
     echo "Using predictions:"
     echo "  PT:  $LATEST_PT"
     echo "  CSV: $LATEST_CSV"
+    if [ -n "$LATEST_STD_PT" ]; then
+        echo "  STD: $LATEST_STD_PT (uncertainty)"
+    fi
 
     # Step 2: Build site rasters
     echo ""
     echo "Step 2: Building site rasters from predictions..."
 
-    python src/evaluation/build_prediction_rasters.py \
-        --predictions-pt "$LATEST_PT" \
-        --predictions-csv "$LATEST_CSV" \
-        --output-dir "$RASTERS_DIR" \
-        --field-plots "$FIELD_DATA"
+    RASTER_CMD="python src/evaluation/build_prediction_rasters.py \
+        --predictions-pt \"$LATEST_PT\" \
+        --predictions-csv \"$LATEST_CSV\" \
+        --output-dir \"$RASTERS_DIR\" \
+        --field-plots \"$FIELD_DATA\""
+
+    # Add std predictions if available
+    if [ -n "$LATEST_STD_PT" ]; then
+        RASTER_CMD="$RASTER_CMD --predictions-std-pt \"$LATEST_STD_PT\""
+    fi
+
+    eval $RASTER_CMD
 
     if [ $? -ne 0 ]; then
         echo "Error: Raster building failed for $MODEL_NAME"

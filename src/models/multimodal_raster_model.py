@@ -60,8 +60,10 @@ class MultimodalRasterConfig:
     # When True, uses PosAwareGlobalFlashAttentionV2 instead of V1
     use_v2_attention: bool = True  # Default True for raster model
 
-    # Attribute dimension (intensity, return number, number of returns)
-    attr_dim: int = 3
+    # Attribute dimension:
+    # [0] Intensity, [1] ReturnNumber, [2] NumberOfReturns,
+    # [3] Planarity, [4] Sphericity, [5] Verticality
+    attr_dim: int = 6
 
     # Modality flags
     use_naip: bool = False
@@ -456,11 +458,11 @@ class MultimodalRasterPredictor(nn.Module):
             # Global-only mode: four consecutive global attention blocks (no local KNN)
             # This enables online point removal since global attention computes positions dynamically
             self.feature_extractor_1 = LocalGlobalPointAttentionBlock(
-                in_channels=6,  # 3 attributes + 3 coordinates
-                out_channels=config.feature_dim,
+                in_channels=9,  # 6 attributes + 3 coordinates
+                out_channels=config.feature_dim // 8,
                 num_lcl_heads=0,  # Global-only: no local attention
                 num_glbl_heads=config.extractor_glbl_heads,
-                pos_encoding_dim=config.position_encoding_dim,
+                pos_encoding_dim=config.position_encoding_dim // 8,
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
@@ -469,11 +471,11 @@ class MultimodalRasterPredictor(nn.Module):
                 stochastic_pos_dropout_prob=0
             )
             self.feature_extractor_2 = LocalGlobalPointAttentionBlock(
-                in_channels=config.feature_dim,  # Takes output of first block
-                out_channels=config.feature_dim,
+                in_channels=config.feature_dim // 8,  # Takes output of last block
+                out_channels=config.feature_dim // 4,
                 num_lcl_heads=0,  # Global-only: no local attention
                 num_glbl_heads=config.extractor_glbl_heads,
-                pos_encoding_dim=config.position_encoding_dim,
+                pos_encoding_dim=config.position_encoding_dim // 4,
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
@@ -482,11 +484,11 @@ class MultimodalRasterPredictor(nn.Module):
                 stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
             self.feature_extractor_3 = LocalGlobalPointAttentionBlock(
-                in_channels=config.feature_dim,  # Takes output of first block
-                out_channels=config.feature_dim,
+                in_channels=config.feature_dim // 4,  # Takes output of last block
+                out_channels=config.feature_dim // 2,
                 num_lcl_heads=0,  # Global-only: no local attention
                 num_glbl_heads=config.extractor_glbl_heads,
-                pos_encoding_dim=config.position_encoding_dim,
+                pos_encoding_dim=config.position_encoding_dim // 2,
                 dropout=extractor_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path/2,
@@ -495,7 +497,7 @@ class MultimodalRasterPredictor(nn.Module):
                 stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
             )
             self.feature_extractor_4 = LocalGlobalPointAttentionBlock(
-                in_channels=config.feature_dim,  # Takes output of first block
+                in_channels=config.feature_dim // 2,  # Takes output of last block
                 out_channels=config.feature_dim,
                 num_lcl_heads=0,  # Global-only: no local attention
                 num_glbl_heads=config.extractor_glbl_heads,
@@ -510,7 +512,7 @@ class MultimodalRasterPredictor(nn.Module):
         else:
             # Standard mode: Single block with local+global attention
             self.feature_extractor = LocalGlobalPointAttentionBlock(
-                in_channels=6,  # 3 attributes + 3 coordinates
+                in_channels=9,  # 6 attributes + 3 coordinates
                 out_channels=config.feature_dim,
                 num_lcl_heads=config.extractor_lcl_heads,
                 num_glbl_heads=config.extractor_glbl_heads,
@@ -696,7 +698,7 @@ class MultimodalRasterPredictor(nn.Module):
             dep_points, dep_attr = self.training_aug.augment_points(dep_points, dep_attr)
 
         # Concatenate attributes and positions
-        dep_points_and_attr = torch.cat([dep_attr, dep_points], dim=1)  # [N_total, 6]
+        dep_points_and_attr = torch.cat([dep_attr, dep_points], dim=1)  # [N_total, 9]
 
         # ====== 1) Point Cloud Feature Extraction ======
         if self.use_global_only:

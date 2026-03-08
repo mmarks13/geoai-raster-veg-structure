@@ -118,10 +118,11 @@ python src/data_prep/generate_training_data_raster.py \
     --outdir "$OUTPUT_DIR" \
     --naip_stac_source data/stac/naip/catalog.json \
     --uavsar_stac_source data/stac/uavsar/catalog.json \
+    --dep_stac_source data/stac/3dep_hag/catalog.json \
     --start_date 2014-01-01 \
-    --end_date 2025-12-31 \
-    --chunk_size 100 \
-    --threads 14 \
+    --end_date 2030-12-31 \
+    --chunk_size 50 \
+    --threads 8 \
     --skip-uav-lidar
 
 # --------------------------------------------------
@@ -146,15 +147,15 @@ python src/data_prep/train_test_split_and_precompute_raster.py \
     --output-dir "$MODEL_DATA_DIR" \
     --precision 32
 
-# --------------------------------------------------
-# Step 6: Data augmentation
-# --------------------------------------------------
-echo "Step 6: Data augmentation..."
+# # --------------------------------------------------
+# # Step 6: Data augmentation
+# # --------------------------------------------------
+# echo "Step 6: Data augmentation..."
 
-python src/data_prep/data_augmentation_raster.py \
-    --training_tiles "${MODEL_DATA_DIR}/precomputed_training_tiles_raster_32bit.pt" \
-    --output_path "${MODEL_DATA_DIR}/augmented_tiles_raster_32bit.pt" \
-    --n_augmentations 2
+# python src/data_prep/data_augmentation_raster.py \
+#     --training_tiles "${MODEL_DATA_DIR}/precomputed_training_tiles_raster_32bit.pt" \
+#     --output_path "${MODEL_DATA_DIR}/augmented_tiles_raster_32bit.pt" \
+#     --n_augmentations 2
 
-echo ""
-echo "Pipeline complete! Training data ready in ${MODEL_DATA_DIR}/"
+# echo ""
+# echo "Pipeline complete! Training data ready in ${MODEL_DATA_DIR}/"

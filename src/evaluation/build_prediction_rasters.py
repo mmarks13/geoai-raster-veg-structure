@@ -45,13 +45,18 @@ def build_site_rasters(
     field_plots_path: Optional[str] = None,
     site_column: str = 'site_name',
     crs: str = 'EPSG:32611',
-    output_dir: Optional[Path] = None
+    output_dir: Optional[Path] = None,
+    std_predictions_dict: Optional[Dict[str, np.ndarray]] = None,
+    raster_suffix: str = '_predictions_raster'
 ) -> Dict[str, Tuple[np.ndarray, Affine, CRS]]:
     """
     Build separate raster for each site from tile predictions.
 
     Sites are hundreds of miles apart, so unified raster would be massive.
     This builds one raster per site to avoid 99.9% NaN values.
+
+    When std_predictions_dict is provided, also builds uncertainty rasters
+    alongside the mean prediction rasters.
 
     Args:
         predictions_dict: Dict mapping tile_id to prediction array [n_bands, 5, 5]
@@ -60,6 +65,8 @@ def build_site_rasters(
         site_column: Column name containing site names (default: 'site_name')
         crs: Coordinate reference system (default EPSG:32611)
         output_dir: If provided, save rasters per site as GeoTIFF
+        std_predictions_dict: Optional dict mapping tile_id to std prediction array [n_bands, 5, 5]
+        raster_suffix: Suffix for output raster files (default: '_predictions_raster')
 
     Returns:
         Dict mapping site_name to (raster_array, transform, crs) tuple
@@ -148,6 +155,11 @@ def build_site_rasters(
         raster_sum = np.zeros((n_bands, height, width), dtype=np.float64)
         raster_count = np.zeros((height, width), dtype=np.int32)
 
+        # Accumulator for std predictions (if provided)
+        has_std = std_predictions_dict is not None
+        if has_std:
+            std_raster_sum = np.zeros((n_bands, height, width), dtype=np.float64)
+
         # Create Affine transform: upper-left corner origin
         transform = Affine.translation(xmin_site, ymax_site) * Affine.scale(cell_size, -cell_size)
 
@@ -161,6 +173,7 @@ def build_site_rasters(
                 continue
 
             pred = predictions_dict[tile_id]  # [n_bands, 5, 5]
+            std_pred = std_predictions_dict.get(tile_id) if has_std else None
 
             # Tile center in CRS coordinates
             tile_center_x = (row['bbox_xmin'] + row['bbox_xmax']) / 2
@@ -188,12 +201,23 @@ def build_site_rasters(
                         raster_count[row_idx, col] += 1
                         n_placed += 1
 
+                        # Accumulate std prediction if available
+                        if std_pred is not None:
+                            std_raster_sum[:, row_idx, col] += std_pred[:, i, j]
+
         # Compute final raster as average of overlapping predictions
         # Where count > 0, divide sum by count; otherwise leave as NaN
         raster_array = np.full((n_bands, height, width), np.nan, dtype=np.float32)
         valid_mask = raster_count > 0
         for b in range(n_bands):
             raster_array[b, valid_mask] = (raster_sum[b, valid_mask] / raster_count[valid_mask]).astype(np.float32)
+
+        # Compute std raster (if provided)
+        std_raster_array = None
+        if has_std:
+            std_raster_array = np.full((n_bands, height, width), np.nan, dtype=np.float32)
+            for b in range(n_bands):
+                std_raster_array[b, valid_mask] = (std_raster_sum[b, valid_mask] / raster_count[valid_mask]).astype(np.float32)
 
         logger.info(f"  Placed {n_placed} pixels from {len(site_df)} tiles")
         if n_overlaps > 0:
@@ -208,7 +232,7 @@ def build_site_rasters(
         if output_dir is not None:
             import rasterio
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / f"{site_name}_predictions_raster.tif"
+            output_path = output_dir / f"{site_name}{raster_suffix}.tif"
 
             with rasterio.open(
                 output_path,
@@ -227,6 +251,28 @@ def build_site_rasters(
                 dst.write(raster_array)
 
             logger.info(f"  Saved to {output_path}")
+
+            # Save std raster if available
+            if std_raster_array is not None:
+                std_output_path = output_dir / f"{site_name}_predictions_std_raster.tif"
+
+                with rasterio.open(
+                    std_output_path,
+                    'w',
+                    driver='GTiff',
+                    height=height,
+                    width=width,
+                    count=n_bands,
+                    dtype=std_raster_array.dtype,
+                    crs=crs_obj,
+                    transform=transform,
+                    nodata=np.nan,
+                    compress='LZW',
+                    tiled=True
+                ) as dst:
+                    dst.write(std_raster_array)
+
+                logger.info(f"  Saved uncertainty raster to {std_output_path}")
 
         site_rasters[site_name] = (raster_array, transform, crs_obj)
 
@@ -249,6 +295,12 @@ def main():
         type=str,
         required=True,
         help='Path to predictions CSV with tile metadata (from raster_inference.py)'
+    )
+    parser.add_argument(
+        '--predictions-std-pt',
+        type=str,
+        default=None,
+        help='Optional path to std predictions .pt file for uncertainty rasters (from MC dropout)'
     )
     parser.add_argument(
         '--output-dir',
@@ -286,6 +338,16 @@ def main():
     predictions_dict = torch.load(args.predictions_pt, weights_only=False)
     logger.info(f"Loaded {len(predictions_dict)} tile predictions")
 
+    # Load std predictions if provided (for MC dropout uncertainty)
+    std_predictions_dict = None
+    if args.predictions_std_pt:
+        if Path(args.predictions_std_pt).exists():
+            logger.info(f"Loading std predictions from {args.predictions_std_pt}")
+            std_predictions_dict = torch.load(args.predictions_std_pt, weights_only=False)
+            logger.info(f"Loaded {len(std_predictions_dict)} tile std predictions")
+        else:
+            logger.warning(f"Std predictions file not found: {args.predictions_std_pt}")
+
     # Build rasters
     site_rasters = build_site_rasters(
         predictions_dict,
@@ -293,7 +355,8 @@ def main():
         field_plots_path=args.field_plots,
         site_column=args.site_column,
         crs=args.crs,
-        output_dir=output_dir
+        output_dir=output_dir,
+        std_predictions_dict=std_predictions_dict
     )
 
     logger.info("\n" + "=" * 60)

@@ -45,7 +45,7 @@ class BandConfig:
     """Complete band configuration."""
     name: str
     description: str
-    stats_file: str
+    stats_file: Optional[str]  # None for baseline configs (no normalization)
     bands: List[BandInfo]
 
     def get_band_by_index(self, index: int) -> Optional[BandInfo]:
@@ -96,10 +96,11 @@ class BandConfig:
                 f"Missing: {missing}, Extra: {extra}"
             )
 
-        # Check that stats file exists
-        stats_path = Path(self.stats_file)
-        if not stats_path.exists():
-            raise FileNotFoundError(f"Stats file not found: {self.stats_file}")
+        # Check that stats file exists (if provided)
+        if self.stats_file is not None:
+            stats_path = Path(self.stats_file)
+            if not stats_path.exists():
+                raise FileNotFoundError(f"Stats file not found: {self.stats_file}")
 
         # Check that aggregation methods are valid
         valid_methods = {'mean', 'max'}

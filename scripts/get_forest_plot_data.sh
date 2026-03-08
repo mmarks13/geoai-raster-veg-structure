@@ -53,12 +53,12 @@ python src/data_prep/make_local_uavsar_stac.py \
   --start $START_DATE --end 2024-12-31 \
   --output $UAVSAR_OUT --temp $UAVSAR_TEMP
 
-echo ""
-echo ">>> Downloading 3DEP LiDAR..."
-python src/data_prep/make_local_3dep_stac.py \
-  --bbox -116.959147 34.215288 -116.951819 34.222152 \
-  --start $START_DATE --end $END_DATE \
-  --output $THREEDEP_OUT
+# echo ""
+# echo ">>> Downloading 3DEP LiDAR..."
+# python src/data_prep/make_local_3dep_stac.py \
+#   --bbox -116.959147 34.215288 -116.951819 34.222152 \
+#   --start $START_DATE --end $END_DATE \
+#   --output $THREEDEP_OUT
 
 echo ""
 echo "✓ BluffMesa complete"
@@ -87,12 +87,12 @@ python src/data_prep/make_local_uavsar_stac.py \
   --start $START_DATE --end 2024-12-31 \
   --output $UAVSAR_OUT --temp $UAVSAR_TEMP
 
-echo ""
-echo ">>> Downloading 3DEP LiDAR..."
-python src/data_prep/make_local_3dep_stac.py \
-  --bbox -116.438054 32.844520 -116.424266 32.862186 \
-  --start $START_DATE --end $END_DATE \
-  --output $THREEDEP_OUT
+# echo ""
+# echo ">>> Downloading 3DEP LiDAR..."
+# python src/data_prep/make_local_3dep_stac.py \
+#   --bbox -116.438054 32.844520 -116.424266 32.862186 \
+#   --start $START_DATE --end $END_DATE \
+#   --output $THREEDEP_OUT
 
 echo ""
 echo "✓ Laguna complete"
@@ -121,12 +121,12 @@ python src/data_prep/make_local_uavsar_stac.py \
   --start $START_DATE --end 2024-12-31 \
   --output $UAVSAR_OUT --temp $UAVSAR_TEMP
 
-echo ""
-echo ">>> Downloading 3DEP LiDAR..."
-python src/data_prep/make_local_3dep_stac.py \
-  --bbox -116.937281 34.287655 -116.918104 34.304225 \
-  --start $START_DATE --end $END_DATE \
-  --output $THREEDEP_OUT
+# echo ""
+# echo ">>> Downloading 3DEP LiDAR..."
+# python src/data_prep/make_local_3dep_stac.py \
+#   --bbox -116.937281 34.287655 -116.918104 34.304225 \
+#   --start $START_DATE --end $END_DATE \
+#   --output $THREEDEP_OUT
 
 echo ""
 echo "✓ NorthBigBear complete"
@@ -155,12 +155,12 @@ python src/data_prep/make_local_uavsar_stac.py \
   --start $START_DATE --end 2024-12-31 \
   --output $UAVSAR_OUT --temp $UAVSAR_TEMP
 
-echo ""
-echo ">>> Downloading 3DEP LiDAR..."
-python src/data_prep/make_local_3dep_stac.py \
-  --bbox -119.341359 34.632541 -119.282359 34.643225 \
-  --start $START_DATE --end $END_DATE \
-  --output $THREEDEP_OUT
+# echo ""
+# echo ">>> Downloading 3DEP LiDAR..."
+# python src/data_prep/make_local_3dep_stac.py \
+#   --bbox -119.341359 34.632541 -119.282359 34.643225 \
+#   --start $START_DATE --end $END_DATE \
+#   --output $THREEDEP_OUT
 
 echo ""
 echo "✓ ReyesPeak complete"
@@ -189,12 +189,12 @@ python src/data_prep/make_local_uavsar_stac.py \
   --start $START_DATE --end 2024-12-31 \
   --output $UAVSAR_OUT --temp $UAVSAR_TEMP
 
-echo ""
-echo ">>> Downloading 3DEP LiDAR..."
-python src/data_prep/make_local_3dep_stac.py \
-  --bbox -119.025374 34.840597 -118.967664 34.848034 \
-  --start $START_DATE --end $END_DATE \
-  --output $THREEDEP_OUT
+# echo ""
+# echo ">>> Downloading 3DEP LiDAR..."
+# python src/data_prep/make_local_3dep_stac.py \
+#   --bbox -119.025374 34.840597 -118.967664 34.848034 \
+#   --start $START_DATE --end $END_DATE \
+#   --output $THREEDEP_OUT
 
 echo ""
 echo "✓ TecuyaRidge complete"

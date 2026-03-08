@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -77,6 +78,88 @@ def bbox_to_geojson_polygon(bbox: List[float]) -> dict:
     }
 
 
+def deduplicate_3dep_items(
+    items: List,
+    logger: logging.Logger
+) -> List:
+    """
+    Deduplicate 3DEP STAC items that cover the same spatial grid cell.
+
+    Some USGS projects (e.g., CA_SanDiego_2015) have multiple versions of the same
+    tiles in Planetary Computer (C17, C17_1, LAS_2018) with identical point data.
+    This function keeps only one version per grid cell, preferring LAS_2018 > C17_1 > C17.
+
+    Args:
+        items: List of STAC items from Planetary Computer
+        logger: Logger instance
+
+    Returns:
+        Deduplicated list of STAC items
+    """
+    if not items:
+        return items
+
+    # Extract grid ID from item ID
+    # Examples:
+    #   USGS_LPC_CA_SanDiego_2015_C17_505890 -> 505890
+    #   USGS_LPC_CA_SanDiego_2015_C17_1_505890 -> 505890
+    #   USGS_LPC_CA_SanDiego_2015_505890_LAS_2018 -> 505890
+    #   USGS_LPC_CA_SoCal_Wildfires_B1_2018_w1898n1457_LAS_2019 -> w1898n1457
+    def extract_grid_id(item_id: str) -> str:
+        # Try to find numeric grid ID (6 digits)
+        match = re.search(r'_(\d{6})(?:_|$)', item_id)
+        if match:
+            return match.group(1)
+        # Try to find alphanumeric grid ID (e.g., w1898n1457)
+        match = re.search(r'_(w\d+n\d+)(?:_|$)', item_id)
+        if match:
+            return match.group(1)
+        # Fallback: use full item ID
+        return item_id
+
+    # Version priority (higher = preferred)
+    def version_priority(item_id: str) -> int:
+        if 'LAS_2018' in item_id or 'LAS_2019' in item_id:
+            return 3
+        elif '_C17_1_' in item_id:
+            return 2
+        elif '_C17_' in item_id:
+            return 1
+        return 0
+
+    # Group items by grid ID
+    grid_items: Dict[str, List] = {}
+    for item in items:
+        grid_id = extract_grid_id(item.id)
+        if grid_id not in grid_items:
+            grid_items[grid_id] = []
+        grid_items[grid_id].append(item)
+
+    # Select best version per grid
+    deduplicated = []
+    duplicates_removed = 0
+
+    for grid_id, grid_item_list in grid_items.items():
+        if len(grid_item_list) > 1:
+            # Sort by version priority (descending) and pick first
+            grid_item_list.sort(key=lambda x: version_priority(x.id), reverse=True)
+            selected = grid_item_list[0]
+            removed = grid_item_list[1:]
+            duplicates_removed += len(removed)
+
+            logger.debug(f"Grid {grid_id}: keeping {selected.id}, removing {[r.id for r in removed]}")
+        else:
+            selected = grid_item_list[0]
+
+        deduplicated.append(selected)
+
+    if duplicates_removed > 0:
+        logger.info(f"Deduplicated {duplicates_removed} duplicate tile versions "
+                   f"({len(items)} -> {len(deduplicated)} tiles)")
+
+    return deduplicated
+
+
 def search_3dep_copc(
     catalog_client,
     bbox: List[float],
@@ -113,8 +196,12 @@ def search_3dep_copc(
 
         if not valid_items:
             logger.warning("No 3DEP COPC tiles found for this bbox")
+            return valid_items
 
-        return valid_items
+        # Deduplicate tile versions (e.g., C17, C17_1, LAS_2018 for same grid cell)
+        deduplicated_items = deduplicate_3dep_items(valid_items, logger)
+
+        return deduplicated_items
 
     except Exception as e:
         logger.error(f"Error searching Planetary Computer: {e}")

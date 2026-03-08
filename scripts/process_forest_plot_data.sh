@@ -62,10 +62,11 @@ python src/data_prep/generate_training_data_raster.py \
   --skip-uav-lidar \
   --uavsar_stac_source data/stac/uavsar/catalog.json \
   --naip_stac_source data/stac/naip/catalog.json \
+  --dep_stac_source data/stac/3dep_hag/catalog.json \
   --start_date 2016-01-01 \
   --end_date 2025-12-31 \
   --chunk_size 100 \
-  --threads 8 \
+  --threads 12 \
   --max-api-retries 20 \
   $RESUME_FLAG
 
