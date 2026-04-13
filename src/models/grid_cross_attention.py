@@ -1,4 +1,8 @@
 """
+DEPRECATED — see src/models/raster_heads/ for active code.
+Retained for checkpoint migration and `image_encoder_pretrain_model.py`'s
+import of `PatchPositionEncoding`.
+
 Grid Cross-Attention Fusion for unified multimodal aggregation.
 
 This module implements a single-step fusion where learnable grid queries

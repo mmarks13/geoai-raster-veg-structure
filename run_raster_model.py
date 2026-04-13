@@ -28,11 +28,15 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-def main():
-    """Main training function."""
+def build_config(raster_architecture: str = "grid_cross_attn") -> MultimodalRasterConfig:
+    """Build the canonical raster model config used for training + ablation.
 
-    # ====== Configuration ======
-    config = MultimodalRasterConfig(
+    All of the raster experiments share the same hyperparameters except for
+    `raster_architecture` (and the heads it drives). Keeping this as a helper
+    lets `run_raster_ablation.py` import and reuse the same config rather than
+    drifting over time.
+    """
+    return MultimodalRasterConfig(
         # Model architecture
         k=15,
         feature_dim=256,
@@ -53,10 +57,15 @@ def main():
         uavsar_dropout=0.01,
         temporal_encoder="gru",
 
-        # Fusion parameters
-        fusion_type="cross_attention",
+        # Architecture selector — choose one of:
+        #   "cross_attn_grid_mlp"    (Path A) cross-attn fusion → grid aggregator → PreLN FFN → MLP decoder
+        #   "cross_attn_soft_pillar" (Path B) cross-attn fusion → bilinear soft-pillar splat → ConvNeXt decoder
+        #   "grid_cross_attn"        (Path C) 25 learnable grid queries → stacked (cross-attn → self-attn → FFN) blocks → MLP decoder
+        raster_architecture=raster_architecture,
+
+        # Fusion parameters (used by Path A and Path B)
         fusion_num_heads=8,
-        fusion_dropout=0.10,
+        fusion_dropout=0.03,
         max_dist_ratio=8.0,  # Distance ratio in meters for cross-attention masking
 
         # Position Encoders
@@ -84,35 +93,31 @@ def main():
         #   Band 12: 90th percentile height (m)
         # Density Proportions (Bands 13-22):
         #   Band 13-22: Proportion of returns in each 2.5m vertical layer (0-25m range)
-        n_bands=8,
-        target_band_indices=[0, 1, 2, 3, 4, 5, 6, 7],
+        n_bands=3,
+        # target_band_indices=[0, 1, 2, 3, 4, 5, 6, 7],
+        target_band_indices=[3, 4, 5],
+
         grid_size=5,
         tile_extent=10.0,
-        raster_num_heads=4,
+        raster_num_heads=8,
         # MULTI-SCALE ATTENTION: Per-head sigma values
         # 2 heads @ σ=0.5m (very local), 4 heads @ σ=2.0m (medium), 2 heads @ σ=5.0m (wide)
-        # raster_distance_sigma=[0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0],
-        raster_distance_sigma=[0.5, 2.0, 2.0, 5.0],
-        # SoftPillarConvDecoder config mapping (when raster_use_wide_decoder=True):
-        # - raster_hidden_dim → decoder_dim (ConvNeXt refinement dimension)
-        # - raster_decoder_layers → num_blocks (number of refinement blocks)
-        # - raster_decoder_dropout → dropout (refinement block dropout)
-        # Note: When use_wide_decoder=True, the decoder performs its own
-        # point-to-grid aggregation via bilinear soft-splatting, bypassing
-        # the attention-based PointToGridAggregator and pre-aggregation blocks.
+        raster_distance_sigma=[0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0],
+        # raster_distance_sigma=[0.5, 2.0, 2.0, 5.0],
+        # Decoder dims (interpreted per-architecture):
+        #   Path A: only `raster_decoder_dropout` matters (FFN + small MLP).
+        #   Path B: raster_hidden_dim → decoder_dim, raster_decoder_layers → num_blocks.
+        #   Path C: see grid_cross_attn_* fields below.
         raster_hidden_dim=128,
         raster_decoder_layers=3,
-        raster_attention_dropout=0.01,  # Ignored when use_wide_decoder=True
-        raster_decoder_dropout=0.10,
-        raster_use_wide_decoder=True,
+        raster_attention_dropout=0.01,  # Ignored by Path A/B/C
+        raster_decoder_dropout=0.01,
 
-
-        # Pre-aggregation LG-PAB refinement parameters
-        num_pre_agg_blocks=0,  # Number of pre-aggregation LG-PAB blocks (0-5 configurable)
-        pre_agg_lcl_heads=0,  # Local attention heads for pre-aggregation
-        pre_agg_glbl_heads=8,  # Global attention heads for pre-aggregation
-        pre_agg_dropout=0.1,  # Dropout for pre-aggregation blocks
-        pre_agg_k_neighbors=15,  # KNN neighbors for pre-aggregation
+        # Path C (grid_cross_attn) tunables — ignored by Path A/B.
+        # num_heads / distance_sigma / dropout are inherited from raster_num_heads /
+        # raster_distance_sigma / raster_attention_dropout above.
+        grid_cross_attn_depth=2,           # Stacked transformer blocks (1..4)
+        grid_cross_attn_ffn_ratio=2,
 
         # Optional: Transfer learning (only loads weights, not optimizer state)
         # Multi-checkpoint loading with key remapping for pretrained encoders
@@ -152,7 +157,7 @@ def main():
 
         # Transfer learning rate multiplier (for fine-tuning pretrained layers)
         # Transferred layers get lr * transfer_lr_multiplier
-        transfer_lr_multiplier=0.6,
+        transfer_lr_multiplier=0.5,
 
         # Heteroscedastic (Gaussian NLL) loss - outputs mean + variance per pixel
         # When enabled, model predicts uncertainty alongside values
@@ -188,7 +193,7 @@ def main():
 
         # Bird simulation: adds extreme z-offset to 1 random point
         # Physical effect: simulates bird/drone flyover returns in LiDAR
-        aug_bird_outlier_prob=0.000,           # Probability per tile
+        aug_bird_outlier_prob=0.001,           # Probability per tile
         aug_bird_z_offset_range=(5.0, 30.0),  # Z-score offset (≈25-75m physical)
 
 
@@ -319,9 +324,16 @@ def main():
         ood_val_enabled=True,
         ood_val_tiles_path="data/processed/forest_plot_data/ood_validation/ood_validation_tiles.pt",
         ood_val_metadata_path="data/processed/forest_plot_data/ood_validation/ood_validation_metadata.json",
-        ood_val_every_n_epochs=5,
-        ood_val_band_config_path="src/evaluation/configs/raster/veg_structure_8band.json",
+        ood_val_every_n_epochs=1,
+        ood_val_band_config_path="src/evaluation/configs/raster/veg_structure_3band.json",
     )
+
+
+def main():
+    """Main training function."""
+
+    # ====== Configuration ======
+    config = build_config()
 
     # ====== Data Paths ======
     train_data_path = "data/processed/model_data_veg_structure/precomputed_training_tiles_raster_32bit.pt"
@@ -342,10 +354,10 @@ def main():
     output_dir = f"data/output/raster_model_{modality_str}_{timestamp}"
 
     # ====== Training Hyperparameters ======
-    num_epochs = 300
+    num_epochs = 8
     batch_size = 10  # Batch size per GPU
-    learning_rate = 3e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
-    weight_decay = 0.05  # Weight regularization
+    learning_rate = 2e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
+    weight_decay = 0.01  # Weight regularization
     beta1 = 0.95  # AdamW momentum (exponential moving average of gradients)
     beta2 = 0.999  # AdamW momentum (exponential moving average of squared gradients)
     gradient_accumulation_steps = 6  # Gradient accumulation for effective larger batches
@@ -407,7 +419,7 @@ def main():
     print(f"  Grid size: {config.grid_size}×{config.grid_size}")
     print(f"  Distance sigma: {config.raster_distance_sigma}m (Gaussian weighting)")
     print(f"\nRaster head configuration:")
-    print(f"  Wide decoder: {config.raster_use_wide_decoder}")
+    print(f"  Architecture: {config.raster_architecture}")
     print(f"  Decoder layers: {config.raster_decoder_layers}")
     print(f"  Attention dropout: {config.raster_attention_dropout:.1%}")
     print(f"  Decoder dropout: {config.raster_decoder_dropout:.1%}")

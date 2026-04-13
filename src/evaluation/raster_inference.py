@@ -84,12 +84,16 @@ def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
 
     # Custom classes that use F.dropout with training=self.training
     custom_dropout_class_names = (
+        # Legacy raster head classes (still loadable for old checkpoints)
         'DistanceMaskedAttention',
+        'GridCrossAttentionLayer',
+        # Shared / point cloud attention classes
         'CrossAttentionFusion',
         'PositionEnhancedCrossAttention',
-        'GridCrossAttentionLayer',
         'PointTransformerConv',  # Uses dropout in attention
         'LocalGlobalPointAttentionBlock',  # Contains dropout layers
+        # New raster head primitive (src/models/raster_heads/_primitives.py)
+        'GaussianDistanceBiasedCrossAttention',
     )
 
     for name, module in model.named_modules():

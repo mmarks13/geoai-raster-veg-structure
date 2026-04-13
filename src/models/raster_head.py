@@ -1,4 +1,7 @@
 """
+DEPRECATED — see src/models/raster_heads/ for active code.
+Retained for checkpoint migration and legacy class construction.
+
 Raster prediction head for fuel metrics prediction.
 
 This module implements query-based aggregation to convert point cloud features
