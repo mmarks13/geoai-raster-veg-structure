@@ -119,6 +119,10 @@ fi
 TILES_FILE="data/processed/forest_plot_data/inference_ready/precomputed_forest_plot_tiles_32bit.pt"
 FIELD_DATA="data/processed/forest_plot_data/forest_plots_processed.gpkg"
 
+# Optional: plots held out for in-training OOD validation. When present, these
+# plots are excluded from §7 final evaluation to prevent double-counting.
+OOD_EXCLUDE_FILE="data/processed/forest_plot_data/ood_validation/ood_validation_plot_ids.txt"
+
 # Read stats file path from band config
 FUEL_STATS=$(python -c "import json; print(json.load(open('$BAND_CONFIG'))['stats_file'])")
 if [ -z "$FUEL_STATS" ]; then
@@ -296,11 +300,18 @@ for MODEL_PATH in "${MODELS[@]}"; do
     echo ""
     echo "Step 3: Comparing predictions to field measurements..."
 
+    EXCLUDE_ARG=""
+    if [ -f "$OOD_EXCLUDE_FILE" ]; then
+        EXCLUDE_ARG="--exclude-plots-file $OOD_EXCLUDE_FILE"
+        echo "  → Excluding OOD-training plots listed in $OOD_EXCLUDE_FILE"
+    fi
+
     python src/evaluation/compare_predictions_to_plots.py \
         --site-rasters-dir "$RASTERS_DIR" \
         --field-data "$FIELD_DATA" \
         --band-config "$BAND_CONFIG" \
-        --output "$COMPARISON_DIR"
+        --output "$COMPARISON_DIR" \
+        $EXCLUDE_ARG
 
     if [ $? -ne 0 ]; then
         echo "Error: Comparison failed for $MODEL_NAME"

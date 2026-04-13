@@ -64,7 +64,7 @@ python src/data_prep/generate_training_data_raster.py \
   --naip_stac_source data/stac/naip/catalog.json \
   --dep_stac_source data/stac/3dep_hag/catalog.json \
   --start_date 2016-01-01 \
-  --end_date 2025-12-31 \
+  --end_date 2030-12-31 \
   --chunk_size 100 \
   --threads 12 \
   --max-api-retries 20 \
@@ -94,7 +94,7 @@ mkdir -p data/processed/forest_plot_data/inference_ready
 
 python src/data_prep/preprocess_forest_plots_for_inference.py \
   --pt-file data/processed/forest_plot_data/combined_forest_plots.pt \
-  --training-stats-dir data/processed/model_data_raster \
+  --training-stats-dir data/processed/model_data_veg_structure \
   --output-dir data/processed/forest_plot_data/inference_ready \
   --min-dep-points 50 \
   --precision 32

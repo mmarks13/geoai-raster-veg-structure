@@ -1473,8 +1473,17 @@ def train_raster_worker(
         checkpoint_dir.mkdir(exist_ok=True)
 
     # Validate early stopping metric
-    if early_stopping_metric not in ['loss', 'mae', 'mse']:
-        raise ValueError(f"early_stopping_metric must be 'loss', 'mae', or 'mse', got '{early_stopping_metric}'")
+    _builtin_es_metrics = {'loss', 'mae', 'mse'}
+    _is_ood_es_metric = early_stopping_metric.startswith('ood_')
+    if early_stopping_metric not in _builtin_es_metrics and not _is_ood_es_metric:
+        raise ValueError(
+            f"early_stopping_metric must be one of {sorted(_builtin_es_metrics)} or start "
+            f"with 'ood_', got '{early_stopping_metric}'"
+        )
+    if _is_ood_es_metric and not config.ood_val_enabled:
+        raise ValueError(
+            f"early_stopping_metric='{early_stopping_metric}' requires config.ood_val_enabled=True"
+        )
 
     # Setup logging (rank 0 only)
     logger = None
@@ -1498,6 +1507,39 @@ def train_raster_worker(
         print(f"TensorBoard logs will be saved to: {log_dir}")
         if logger:
             logger.info(f"TensorBoard logs will be saved to: {log_dir}")
+
+    # OOD forest-plot validation setup (rank 0 only)
+    # The OOD metric is a post-hoc eval — it runs every N epochs and optionally
+    # drives early stopping via early_stopping_metric='ood_<band>_mae'.
+    ood_set = None
+    ood_band_config = None
+    ood_fuel_stats = None
+    if rank == 0 and config.ood_val_enabled:
+        from src.training.ood_validation import OODValidationSet, evaluate_ood
+        from src.evaluation.band_config import load_band_config
+
+        if config.ood_val_tiles_path is None or config.ood_val_metadata_path is None:
+            raise ValueError(
+                "config.ood_val_enabled=True requires ood_val_tiles_path and "
+                "ood_val_metadata_path to be set"
+            )
+        ood_set = OODValidationSet(
+            tiles_path=config.ood_val_tiles_path,
+            metadata_path=config.ood_val_metadata_path,
+        )
+        ood_band_config = load_band_config(config.ood_val_band_config_path)
+        with open(ood_band_config.stats_file) as _f:
+            ood_fuel_stats = json.load(_f)
+        if logger:
+            logger.info(
+                f"OOD validation enabled: {len(ood_set.plots)} plots, "
+                f"{len(ood_set.tile_by_id)} tiles, {len(ood_set.site_to_tile_ids)} sites, "
+                f"every_n_epochs={config.ood_val_every_n_epochs}"
+            )
+            for _site in sorted(ood_set.site_to_tile_ids.keys()):
+                _np = sum(1 for p in ood_set.plots if p['site'] == _site)
+                _nt = len(ood_set.site_to_tile_ids[_site])
+                logger.info(f"  {_site}: {_np} plots, {_nt} tiles")
 
     # Compute this GPU's shard paths
     train_shard_path = os.path.join(train_shard_dir, f"{train_shard_prefix}_shard_{rank}.pt")
@@ -1805,6 +1847,43 @@ def train_raster_worker(
             writer=writer, epoch=epoch, rank=rank, logger=logger
         )
 
+        # OOD forest-plot validation (rank 0 only, every N epochs).
+        # Skips epoch 0 (first_eval_epoch_reached guard) so we never evaluate
+        # on a freshly-initialized model. Runs while model is already in eval mode.
+        did_ood_eval_this_epoch = False
+        if rank == 0 and config.ood_val_enabled and ood_set is not None:
+            first_eval_epoch_reached = (epoch + 1) >= config.ood_val_every_n_epochs
+            if first_eval_epoch_reached and ((epoch + 1) % config.ood_val_every_n_epochs == 0):
+                import time as _time
+                from src.training.ood_validation import evaluate_ood
+                _ood_t0 = _time.perf_counter()
+                ood_metrics = evaluate_ood(
+                    model=model.module,
+                    ood_set=ood_set,
+                    device=device,
+                    config=config,
+                    band_config=ood_band_config,
+                    fuel_stats=ood_fuel_stats,
+                )
+                _ood_elapsed = _time.perf_counter() - _ood_t0
+                val_metrics.update(ood_metrics)
+                if writer is not None:
+                    for _k, _v in ood_metrics.items():
+                        _tag = _k if '/' in _k else f'OOD/{_k}'
+                        writer.add_scalar(_tag, _v, epoch)
+                    writer.add_scalar('OOD/eval_time_seconds', _ood_elapsed, epoch)
+                did_ood_eval_this_epoch = True
+                if logger:
+                    _main_mae = ood_metrics.get('ood_canopy_cover_mae', float('nan'))
+                    _overall = ood_metrics.get('ood_overall_mae', float('nan'))
+                    logger.info(
+                        f"OOD eval epoch {epoch+1}: canopy_cover_mae={_main_mae:.4f} "
+                        f"overall_mae={_overall:.4f}  [{_ood_elapsed:.1f}s]"
+                    )
+        # Keep DDP ranks in lockstep — rank 0 did extra work above.
+        if world_size > 1:
+            dist.barrier()
+
         # Update SWA model if enabled and past start epoch
         if swa_model is not None and epoch >= config.swa_start_epoch:
             if (epoch - config.swa_start_epoch) % config.swa_update_freq == 0:
@@ -1846,29 +1925,35 @@ def train_raster_worker(
                 training_history['val_mae'].append(val_metrics['mae'])
             training_history['learning_rates'].append(current_lr)
 
-            # Early stopping logic
-            current_metric_value = val_metrics[early_stopping_metric]
-            if current_metric_value < best_early_stop_metric:
-                best_early_stop_metric = current_metric_value
-                epochs_without_improvement = 0
-                checkpoint_path = Path(output_dir) / 'checkpoints' / 'best_model.pth'
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.module.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': val_metrics['loss'],
-                    'val_mae': val_metrics.get('mae', None),
-                    'val_mse': val_metrics.get('mse', None),
-                    'config': config
-                }, checkpoint_path)
-                msg = f"✓ Saved best model ({early_stopping_metric}: {current_metric_value:.6f})"
-                print(f"  → {msg}")
-                if logger:
-                    logger.info(msg)
-            else:
-                epochs_without_improvement += 1
-                if logger:
-                    logger.info(f"No improvement in {early_stopping_metric} for {epochs_without_improvement} epochs")
+            # Early stopping logic.
+            # If the early-stopping metric is an OOD metric, only evaluate the
+            # patience counter on epochs where the OOD eval actually ran —
+            # otherwise the metric simply isn't present in val_metrics.
+            _is_ood_es = early_stopping_metric.startswith('ood_')
+            should_check_es = (not _is_ood_es) or did_ood_eval_this_epoch
+            if should_check_es:
+                current_metric_value = val_metrics[early_stopping_metric]
+                if current_metric_value < best_early_stop_metric:
+                    best_early_stop_metric = current_metric_value
+                    epochs_without_improvement = 0
+                    checkpoint_path = Path(output_dir) / 'checkpoints' / 'best_model.pth'
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_loss': val_metrics['loss'],
+                        'val_mae': val_metrics.get('mae', None),
+                        'val_mse': val_metrics.get('mse', None),
+                        'config': config
+                    }, checkpoint_path)
+                    msg = f"✓ Saved best model ({early_stopping_metric}: {current_metric_value:.6f})"
+                    print(f"  → {msg}")
+                    if logger:
+                        logger.info(msg)
+                else:
+                    epochs_without_improvement += 1
+                    if logger:
+                        logger.info(f"No improvement in {early_stopping_metric} for {epochs_without_improvement} OOD-eval epoch(s)")
 
             # Check early stopping
             if epochs_without_improvement >= early_stopping_patience:

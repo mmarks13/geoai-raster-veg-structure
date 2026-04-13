@@ -260,6 +260,16 @@ class MultimodalRasterConfig:
     aug_point_max_removal_ratio: float = 0.7
     aug_point_min_points: int = 20
 
+    # ===== OOD Forest-Plot Validation =====
+    # When enabled, runs a small set of forest plot tiles every N epochs and
+    # logs ood_<band>_mae / r2 / ... metrics. Can be used as the early-stopping
+    # metric (e.g. early_stopping_metric="ood_canopy_cover_mae").
+    ood_val_enabled: bool = False
+    ood_val_tiles_path: Optional[str] = None       # .pt file from build_ood_validation_set.py
+    ood_val_metadata_path: Optional[str] = None    # .json file from build_ood_validation_set.py
+    ood_val_every_n_epochs: int = 5
+    ood_val_band_config_path: str = "src/evaluation/configs/raster/veg_structure_8band.json"
+
     def __post_init__(self):
         """Set default target_band_indices if not provided."""
         if self.target_band_indices is None:
@@ -409,6 +419,12 @@ class MultimodalRasterConfig:
                 self.aug_point_min_removal_ratio,
                 self.aug_point_max_removal_ratio,
                 self.aug_point_min_points,
+                # OOD forest-plot validation
+                self.ood_val_enabled,
+                self.ood_val_tiles_path,
+                self.ood_val_metadata_path,
+                self.ood_val_every_n_epochs,
+                self.ood_val_band_config_path,
             )
         )
 

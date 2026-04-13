@@ -310,6 +310,17 @@ def main():
         swa_enabled=False,         # Set to True to enable
         swa_start_epoch=200,       # Start averaging at this epoch (w/checkpoint this ignores the restart epoch. indexes at 0 again)
         swa_update_freq=1,         # Update every epoch
+
+        # --- In-training OOD forest-plot validation ---
+        # Runs a tiny forward pass on a fixed subset of forest plots every N
+        # epochs, reusing the §7 stitching/extraction/stats helpers. Can be
+        # wired into early stopping via early_stopping_metric='ood_<band>_mae'
+        # so the loop tracks OOD generalization rather than in-distribution val.
+        ood_val_enabled=True,
+        ood_val_tiles_path="data/processed/forest_plot_data/ood_validation/ood_validation_tiles.pt",
+        ood_val_metadata_path="data/processed/forest_plot_data/ood_validation/ood_validation_metadata.json",
+        ood_val_every_n_epochs=5,
+        ood_val_band_config_path="src/evaluation/configs/raster/veg_structure_8band.json",
     )
 
     # ====== Data Paths ======
@@ -331,9 +342,9 @@ def main():
     output_dir = f"data/output/raster_model_{modality_str}_{timestamp}"
 
     # ====== Training Hyperparameters ======
-    num_epochs = 200  
+    num_epochs = 300
     batch_size = 10  # Batch size per GPU
-    learning_rate = 3e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)    
+    learning_rate = 3e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
     weight_decay = 0.05  # Weight regularization
     beta1 = 0.95  # AdamW momentum (exponential moving average of gradients)
     beta2 = 0.999  # AdamW momentum (exponential moving average of squared gradients)
@@ -341,8 +352,11 @@ def main():
     max_grad_norm = 5  # prevent large gradient updates
     save_every_n_epochs = 5  # Save checkpoint every N epochs
     use_amp = True  # Automatic mixed precision (bfloat16)
-    early_stopping_patience = 5  # Epochs without improvement before stopping
-    early_stopping_metric = "mae"  # Metric to monitor for early stopping
+    # Patience is counted in OOD-eval units when the metric is an ood_* metric:
+    # e.g., patience=20 with ood_val_every_n_epochs=5 == 100 actual epochs of
+    # no OOD improvement before stopping.
+    early_stopping_patience = 20
+    early_stopping_metric = "ood_canopy_cover_mae"
     warmup_steps_percentage = 0.05
     seed = 42
     num_gpus = None  # None = use all available GPUs
@@ -373,8 +387,14 @@ def main():
     print(f"  Warmup steps: {warmup_steps_percentage*100:.1f}% of total")
     print(f"  Max grad norm: {max_grad_norm}")
     print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
-    print(f"  Early stopping patience: {early_stopping_patience}")
+    print(f"  Early stopping patience: {early_stopping_patience}"
+          + (f" (× ood_val_every_n_epochs={config.ood_val_every_n_epochs} "
+             f"= {early_stopping_patience * config.ood_val_every_n_epochs} epochs)"
+             if early_stopping_metric.startswith('ood_') else ""))
     print(f"  Early stopping metric: {early_stopping_metric}")
+    if config.ood_val_enabled:
+        print(f"  OOD validation: every {config.ood_val_every_n_epochs} epochs on "
+              f"{config.ood_val_tiles_path}")
     print(f"  Use AMP: {use_amp}")
     print(f"  Save every N epochs: {save_every_n_epochs}")
     print(f"  Seed: {seed}")
