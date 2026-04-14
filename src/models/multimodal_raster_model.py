@@ -358,8 +358,9 @@ class MultimodalRasterConfig:
 
     # ===== OOD Forest-Plot Validation =====
     # When enabled, runs a small set of forest plot tiles every N epochs and
-    # logs ood_<band>_mae / r2 / ... metrics. Can be used as the early-stopping
-    # metric (e.g. early_stopping_metric="ood_canopy_cover_mae").
+    # logs ood_<band>_medae / tsmae / spearman_rho / ... metrics. Can be used
+    # as the early-stopping metric (e.g.
+    # early_stopping_metric="ood_overall_mean_tsmae").
     ood_val_enabled: bool = False
     ood_val_tiles_path: Optional[str] = None       # .pt file from build_ood_validation_set.py
     ood_val_metadata_path: Optional[str] = None    # .json file from build_ood_validation_set.py

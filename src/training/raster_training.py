@@ -1510,7 +1510,7 @@ def train_raster_worker(
 
     # OOD forest-plot validation setup (rank 0 only)
     # The OOD metric is a post-hoc eval — it runs every N epochs and optionally
-    # drives early stopping via early_stopping_metric='ood_<band>_mae'.
+    # drives early stopping via early_stopping_metric='ood_overall_mean_tsmae'.
     ood_set = None
     ood_band_config = None
     ood_fuel_stats = None
@@ -1864,6 +1864,8 @@ def train_raster_worker(
                     config=config,
                     band_config=ood_band_config,
                     fuel_stats=ood_fuel_stats,
+                    writer=writer,
+                    epoch=epoch,
                 )
                 _ood_elapsed = _time.perf_counter() - _ood_t0
                 val_metrics.update(ood_metrics)
@@ -1874,11 +1876,11 @@ def train_raster_worker(
                     writer.add_scalar('OOD/eval_time_seconds', _ood_elapsed, epoch)
                 did_ood_eval_this_epoch = True
                 if logger:
-                    _main_mae = ood_metrics.get('ood_canopy_cover_mae', float('nan'))
-                    _overall = ood_metrics.get('ood_overall_mae', float('nan'))
+                    _main_medae = ood_metrics.get('ood_canopy_density_medae', float('nan'))
+                    _overall = ood_metrics.get('ood_overall_mean_tsmae', float('nan'))
                     logger.info(
-                        f"OOD eval epoch {epoch+1}: canopy_cover_mae={_main_mae:.4f} "
-                        f"overall_mae={_overall:.4f}  [{_ood_elapsed:.1f}s]"
+                        f"OOD eval epoch {epoch+1}: canopy_density_medae={_main_medae:.4f} "
+                        f"overall_mean_tsmae={_overall:.4f}  [{_ood_elapsed:.1f}s]"
                     )
         # Keep DDP ranks in lockstep — rank 0 did extra work above.
         if world_size > 1:

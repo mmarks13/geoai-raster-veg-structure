@@ -145,6 +145,14 @@ class ImageEncoderPretrainConfig:
     aug_point_max_removal_ratio: float = 0.0
     aug_point_min_points: int = 20
 
+    # OOD validation — disabled for pretraining. The training loop reads
+    # these unconditionally (even when OOD is off), so they must exist.
+    ood_val_enabled: bool = False
+    ood_val_tiles_path: Optional[str] = None
+    ood_val_metadata_path: Optional[str] = None
+    ood_val_every_n_epochs: int = 5
+    ood_val_band_config_path: Optional[str] = None
+
     def __post_init__(self):
         """Set modality flags based on encoder_type."""
         if self.encoder_type == "naip":

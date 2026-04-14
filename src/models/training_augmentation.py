@@ -1454,9 +1454,11 @@ class TrainingAugmentation(nn.Module):
 
         batch_size = len(naip_embeddings)
 
-        # Generate per-sample dropout decisions (single GPU→CPU sync for batch)
-        naip_keep = torch.rand(batch_size, device=device) >= self.modality_dropout.naip_dropout_prob
-        uavsar_keep = torch.rand(batch_size, device=device) >= self.modality_dropout.uavsar_dropout_prob
+        # Generate per-sample dropout decisions on GPU, then materialize to host
+        # once via .tolist(). Reading the resulting Python bools in the loop avoids
+        # the per-element __bool__ sync that would otherwise fire 2*batch_size times.
+        naip_keep = (torch.rand(batch_size, device=device) >= self.modality_dropout.naip_dropout_prob).tolist()
+        uavsar_keep = (torch.rand(batch_size, device=device) >= self.modality_dropout.uavsar_dropout_prob).tolist()
 
         # Zero out dropped embeddings (preserves gradients via * 0.0)
         for b in range(batch_size):
