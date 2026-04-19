@@ -71,7 +71,9 @@ class ImageEncoderPretrainConfig:
     aug_naip_erasing_prob: float = 0.0
     aug_naip_sharpness_range: tuple = (0.5, 1.5)
     aug_naip_sharpness_prob: float = 0.1
-    aug_naip_equalize_prob: float = 0.1
+    aug_naip_radiometric_prob: float = 0.0   # Master probability for z-score gain/bias augmentation
+    aug_naip_radiometric_strength: float = 1.0  # 1.0 = base ranges; <1 shrinks them, >1 widens them
+    aug_naip_post_clip_range: tuple = (-4.0, 4.0)  # Final z-score clamp after the radiometric step
 
     # UAVSAR augmentation
     aug_uavsar_noise_sigma: float = 0.05
