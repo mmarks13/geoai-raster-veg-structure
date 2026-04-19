@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.ops import StochasticDepth
 from tqdm import tqdm
 
 # Add project root to path for src imports (avoids PYTHONPATH requirement)
@@ -65,6 +66,9 @@ def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
 
     Switches dropout modules to training mode so they apply dropout
     during inference. BatchNorm layers are NOT affected (remain in eval mode).
+    StochasticDepth (DropPath) layers are explicitly forced back to eval mode
+    because parent .train() calls recurse into children — we only want to
+    vary weight/activation dropout, not drop entire residual branches.
 
     Args:
         model: Model in eval mode
@@ -107,6 +111,15 @@ def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
             if not module.training:
                 module.train()
                 modified.append(module)
+
+    # Force all StochasticDepth (DropPath) layers to eval mode. Parent modules
+    # toggled above would otherwise recursively put these children in train
+    # mode, which changes network topology per sample rather than approximating
+    # Bayesian weight uncertainty. MC dropout should only vary weight/activation
+    # dropout, not residual-branch drops.
+    for module in model.modules():
+        if isinstance(module, StochasticDepth) and module.training:
+            module.eval()
 
     return modified
 
