@@ -508,7 +508,6 @@ class DistanceMaskedAttention(nn.Module):
         num_heads: int = 8,
         distance_sigma: float | List[float] = 2.0,
         dropout: float = 0.1,
-        use_spectral_norm: bool = False
     ):
         super().__init__()
         assert feature_dim % num_heads == 0, "feature_dim must be divisible by num_heads"
@@ -534,10 +533,6 @@ class DistanceMaskedAttention(nn.Module):
         self.k_proj = nn.Linear(feature_dim, feature_dim)
         self.v_proj = nn.Linear(feature_dim, feature_dim)
         self.out_proj = nn.Linear(feature_dim, feature_dim)
-
-        # Apply spectral normalization to out_proj only
-        if use_spectral_norm:
-            self.out_proj = nn.utils.spectral_norm(self.out_proj)
 
     def forward(
         self,
@@ -777,7 +772,6 @@ class PointToGridAggregator(nn.Module):
         grid_size: int = 5,
         tile_extent: float = 10.0,
         dropout: float = 0.1,
-        use_spectral_norm: bool = False
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -796,7 +790,6 @@ class PointToGridAggregator(nn.Module):
             num_heads=num_heads,
             distance_sigma=distance_sigma,
             dropout=dropout,
-            use_spectral_norm=use_spectral_norm
         )
 
     def forward(
@@ -901,7 +894,8 @@ class RasterDecoder(nn.Module):
         n_bands: int = 3,
         hidden_dim: int = 128,
         num_layers: int = 3,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -923,8 +917,9 @@ class RasterDecoder(nn.Module):
             ])
             in_dim = out_dim
 
-        # Final layer to n_bands
-        layers.append(nn.Linear(in_dim, n_bands))
+        # Final layer to n_bands. Spectral norm bounds Lipschitz of the final readout for OOD.
+        sn = nn.utils.parametrizations.spectral_norm if use_spectral_norm else (lambda m: m)
+        layers.append(sn(nn.Linear(in_dim, n_bands)))
 
         self.mlp = nn.Sequential(*layers)
 
@@ -995,12 +990,14 @@ class WideRasterDecoder(nn.Module):
         self.blocks = nn.ModuleList()
         for i in range(num_layers):
             self.blocks.append(
-                PreLNResidualBlock(feature_dim, dropout, drop_path=drop_path_rates[i], use_spectral_norm=use_spectral_norm)
+                PreLNResidualBlock(feature_dim, dropout, drop_path=drop_path_rates[i])
             )
 
-        # Final projection: output n_bands (mean only) or 2*n_bands (mean + log_variance)
+        # Final projection: output n_bands (mean only) or 2*n_bands (mean + log_variance).
+        # Spectral norm bounds the Lipschitz constant of the final readout for OOD robustness.
+        sn = nn.utils.parametrizations.spectral_norm if use_spectral_norm else (lambda m: m)
         output_dim = n_bands * 2 if output_variance else n_bands
-        self.final_proj = nn.Linear(feature_dim, output_dim)
+        self.final_proj = sn(nn.Linear(feature_dim, output_dim))
 
     def forward(self, grid_features: torch.Tensor):
         """
@@ -1052,24 +1049,15 @@ class PreLNResidualBlock(nn.Module):
         drop_path: Stochastic depth probability (0.0 = disabled)
     """
 
-    def __init__(self, feature_dim: int, dropout: float = 0.10, drop_path: float = 0.0, use_spectral_norm: bool = False):
+    def __init__(self, feature_dim: int, dropout: float = 0.10, drop_path: float = 0.0):
         super().__init__()
-        self.norm = nn.LayerNorm(feature_dim)
-
-        # Build linear layers - optionally apply spectral normalization to BOTH
         # Note: Final projection to n_bands is in WideRasterDecoder, not here
-        linear1 = nn.Linear(feature_dim, feature_dim*2)
-        linear2 = nn.Linear(feature_dim*2, feature_dim)
-
-        if use_spectral_norm:
-            linear1 = nn.utils.spectral_norm(linear1)
-            linear2 = nn.utils.spectral_norm(linear2)
-
+        self.norm = nn.LayerNorm(feature_dim)
         self.mlp = nn.Sequential(
-            linear1,
+            nn.Linear(feature_dim, feature_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            linear2
+            nn.Linear(feature_dim * 2, feature_dim),
         )
         # Stochastic depth - drops entire residual branch with probability drop_path
         self.drop_path = StochasticDepth(drop_path, mode="row") if drop_path > 0.0 else nn.Identity()
@@ -1201,7 +1189,6 @@ class RasterPredictionHead(nn.Module):
                 grid_size=grid_size,
                 tile_extent=tile_extent,
                 dropout=attention_dropout,  # Split dropout: attention
-                use_spectral_norm=use_spectral_norm
             )
 
             # Original narrow decoder with dimension halving
@@ -1211,7 +1198,8 @@ class RasterPredictionHead(nn.Module):
                 n_bands=n_bands,
                 hidden_dim=hidden_dim,
                 num_layers=num_decoder_layers,
-                dropout=decoder_dropout  # Split dropout: decoder
+                dropout=decoder_dropout,  # Split dropout: decoder
+                use_spectral_norm=use_spectral_norm,
             )
 
     def forward(
