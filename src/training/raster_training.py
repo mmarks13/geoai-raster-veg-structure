@@ -481,6 +481,129 @@ def gaussian_nll_loss(
     return loss
 
 
+def _init_uncertainty_running_stats(
+    device: torch.device,
+    min_var: float,
+    hist_max: float = 4.0,
+    n_hist_bins: int = 512
+) -> Dict[str, torch.Tensor]:
+    """Initialize GPU-side running statistics for heteroscedastic logging."""
+    hist_min = math.log(min_var)
+    return {
+        'sum_log_var': torch.zeros(1, device=device),
+        'sum_pred_var': torch.zeros(1, device=device),
+        'sum_sq_err': torch.zeros(1, device=device),
+        'sum_pred_var_sq': torch.zeros(1, device=device),
+        'sum_pred_var_sq_err': torch.zeros(1, device=device),
+        'count_lt_0': torch.zeros(1, device=device, dtype=torch.long),
+        'count_lt_m1': torch.zeros(1, device=device, dtype=torch.long),
+        'n_elements': torch.zeros(1, device=device, dtype=torch.long),
+        # Approximate quantiles from a DDP-safe histogram.
+        'log_var_hist': torch.zeros(n_hist_bins, device=device),
+        'hist_min': torch.tensor(hist_min, device=device),
+        'hist_max': torch.tensor(hist_max, device=device),
+    }
+
+
+def _update_uncertainty_running_stats(
+    stats: Dict[str, torch.Tensor],
+    log_var: torch.Tensor,
+    sq_err: torch.Tensor
+) -> None:
+    """Update heteroscedastic running statistics in-place on GPU."""
+    log_var_flat = log_var.detach().float().flatten()
+    sq_err_flat = sq_err.detach().float().flatten()
+    pred_var_flat = torch.exp(log_var_flat)
+
+    stats['sum_log_var'] += log_var_flat.sum()
+    stats['sum_pred_var'] += pred_var_flat.sum()
+    stats['sum_sq_err'] += sq_err_flat.sum()
+    stats['sum_pred_var_sq'] += (pred_var_flat ** 2).sum()
+    stats['sum_pred_var_sq_err'] += (pred_var_flat * sq_err_flat).sum()
+    stats['count_lt_0'] += (log_var_flat < 0).sum()
+    stats['count_lt_m1'] += (log_var_flat < -1).sum()
+    stats['n_elements'] += log_var_flat.numel()
+
+    hist_min = stats['hist_min'].item()
+    hist_max = stats['hist_max'].item()
+    log_var_clamped = torch.clamp(log_var_flat, min=hist_min, max=hist_max)
+    stats['log_var_hist'] += torch.histc(
+        log_var_clamped,
+        bins=stats['log_var_hist'].numel(),
+        min=hist_min,
+        max=hist_max
+    )
+
+
+def _approximate_quantile_from_histogram(
+    histogram: torch.Tensor,
+    hist_min: float,
+    hist_max: float,
+    quantile: float
+) -> float:
+    """Approximate a quantile from a histogram CDF."""
+    total = histogram.sum().item()
+    if total <= 0:
+        return float('nan')
+
+    target = quantile * total
+    cdf = torch.cumsum(histogram, dim=0)
+    target_tensor = torch.tensor(target, device=histogram.device)
+    bin_idx = int(torch.searchsorted(cdf, target_tensor).item())
+    bin_idx = max(0, min(bin_idx, histogram.numel() - 1))
+    bin_width = (hist_max - hist_min) / histogram.numel()
+    return hist_min + (bin_idx + 0.5) * bin_width
+
+
+def _finalize_uncertainty_running_stats(
+    stats: Dict[str, torch.Tensor]
+) -> Dict[str, float]:
+    """Convert aggregated heteroscedastic running statistics to Python floats."""
+    n_elements = stats['n_elements'].item()
+    if n_elements <= 0:
+        return {
+            'log_var_mean': float('nan'),
+            'log_var_p05': float('nan'),
+            'log_var_p50': float('nan'),
+            'log_var_p95': float('nan'),
+            'frac_log_var_lt_0': float('nan'),
+            'frac_log_var_lt_m1': float('nan'),
+            'pred_var_mean': float('nan'),
+            'corr_pred_var_sq_error': float('nan'),
+        }
+
+    n = float(n_elements)
+    mean_log_var = stats['sum_log_var'].item() / n
+    mean_pred_var = stats['sum_pred_var'].item() / n
+    mean_sq_err = stats['sum_sq_err'].item() / n
+
+    pred_var_var = (stats['sum_pred_var_sq'].item() / n) - (mean_pred_var ** 2)
+    sq_err_var = max(mean_sq_err, 0.0)
+    cov_pred_var_sq_err = (stats['sum_pred_var_sq_err'].item() / n) - (mean_pred_var * mean_sq_err)
+
+    pred_var_std = math.sqrt(max(pred_var_var, 0.0))
+    sq_err_std = math.sqrt(sq_err_var)
+    corr_pred_var_sq_error = (
+        cov_pred_var_sq_err / (pred_var_std * sq_err_std + 1e-8)
+        if pred_var_std > 1e-8 and sq_err_std > 1e-8 else 0.0
+    )
+
+    hist_min = stats['hist_min'].item()
+    hist_max = stats['hist_max'].item()
+    histogram = stats['log_var_hist']
+
+    return {
+        'log_var_mean': mean_log_var,
+        'log_var_p05': _approximate_quantile_from_histogram(histogram, hist_min, hist_max, 0.05),
+        'log_var_p50': _approximate_quantile_from_histogram(histogram, hist_min, hist_max, 0.50),
+        'log_var_p95': _approximate_quantile_from_histogram(histogram, hist_min, hist_max, 0.95),
+        'frac_log_var_lt_0': stats['count_lt_0'].item() / n,
+        'frac_log_var_lt_m1': stats['count_lt_m1'].item() / n,
+        'pred_var_mean': mean_pred_var,
+        'corr_pred_var_sq_error': corr_pred_var_sq_error,
+    }
+
+
 def get_gpu_stats_native(device_id: int = 0) -> dict:
     """Get GPU memory stats using PyTorch native functions (no subprocess).
 
@@ -694,6 +817,8 @@ def process_raster_batch(
         'all_bad': False,
         'bad_tiles': []
     }
+    if use_heteroscedastic_loss and log_var is not None:
+        diagnostics['log_var'] = log_var.detach()
 
     # If loss is NaN, diagnose which tiles are bad (tile-by-tile only on failure)
     if torch.isnan(loss) or torch.isinf(loss):
@@ -842,6 +967,13 @@ def train_one_epoch_ddp(
     running_sum_cross = torch.zeros(1, device=device)
     running_mae = torch.zeros(1, device=device)
     n_samples = 0
+    use_heteroscedastic_loss = getattr(config, 'use_heteroscedastic_loss', False)
+    uncertainty_stats = None
+    if use_heteroscedastic_loss:
+        uncertainty_stats = _init_uncertainty_running_stats(
+            device=device,
+            min_var=getattr(config, 'heteroscedastic_min_var', 1e-6)
+        )
 
     # Pre-allocate tensors for epoch-end all_reduce (avoids repeated allocations)
     batch_count_tensor = torch.zeros(1, device=device, dtype=torch.long)
@@ -914,6 +1046,13 @@ def train_one_epoch_ddp(
             running_sum_cross += (pred_flat * targ_flat).sum()
             running_mae += (pred_flat - targ_flat).abs().sum()
             n_samples += pred_flat.numel()
+            if use_heteroscedastic_loss and uncertainty_stats is not None and 'log_var' in diagnostics:
+                sq_err = (predictions.detach() - targets.detach()).pow(2)
+                _update_uncertainty_running_stats(
+                    uncertainty_stats,
+                    diagnostics['log_var'],
+                    sq_err
+                )
 
         # Backward pass timing
         backward_start = time.time()
@@ -1019,6 +1158,16 @@ def train_one_epoch_ddp(
     dist.all_reduce(running_mae, op=dist.ReduceOp.SUM)
     dist.all_reduce(running_max_grad_norm, op=dist.ReduceOp.MAX)
     dist.all_reduce(running_sum_grad_norm, op=dist.ReduceOp.SUM)
+    if use_heteroscedastic_loss and uncertainty_stats is not None:
+        dist.all_reduce(uncertainty_stats['sum_log_var'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_pred_var'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_sq_err'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_pred_var_sq'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_pred_var_sq_err'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['count_lt_0'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['count_lt_m1'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['n_elements'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['log_var_hist'], op=dist.ReduceOp.SUM)
 
     # Reduce batch_count and n_samples across GPUs (reuse pre-allocated tensors)
     batch_count_tensor.fill_(batch_count)
@@ -1084,6 +1233,10 @@ def train_one_epoch_ddp(
         max_grad_norm_epoch = 0.0
         mean_grad_norm_epoch = 0.0
 
+    uncertainty_metrics = None
+    if use_heteroscedastic_loss and uncertainty_stats is not None:
+        uncertainty_metrics = _finalize_uncertainty_running_stats(uncertainty_stats)
+
     # Log epoch-level metrics and timing (rank 0 only)
     if rank == 0 and writer is not None:
         # Loss metrics
@@ -1113,6 +1266,15 @@ def train_one_epoch_ddp(
         writer.add_scalar('Variance/train_overall_target_std', overall_targ_std, epoch)
         writer.add_scalar('Variance/train_overall_ratio', overall_variance_ratio, epoch)
         writer.add_scalar('Correlation/train_overall_pearson_r', overall_correlation, epoch)
+        if uncertainty_metrics is not None:
+            writer.add_scalar('Uncertainty/train_log_var_mean', uncertainty_metrics['log_var_mean'], epoch)
+            writer.add_scalar('Uncertainty/train_log_var_p05', uncertainty_metrics['log_var_p05'], epoch)
+            writer.add_scalar('Uncertainty/train_log_var_p50', uncertainty_metrics['log_var_p50'], epoch)
+            writer.add_scalar('Uncertainty/train_log_var_p95', uncertainty_metrics['log_var_p95'], epoch)
+            writer.add_scalar('Uncertainty/train_frac_log_var_lt_0', uncertainty_metrics['frac_log_var_lt_0'], epoch)
+            writer.add_scalar('Uncertainty/train_frac_log_var_lt_m1', uncertainty_metrics['frac_log_var_lt_m1'], epoch)
+            writer.add_scalar('Uncertainty/train_pred_var_mean', uncertainty_metrics['pred_var_mean'], epoch)
+            writer.add_scalar('Uncertainty/train_corr_pred_var_sq_error', uncertainty_metrics['corr_pred_var_sq_error'], epoch)
 
         # Log timing breakdown (every 5 epochs to reduce overhead)
         if epoch % 5 == 0:
@@ -1191,6 +1353,13 @@ def validate_one_epoch_ddp(
     running_mae = torch.zeros(1, device=device)
     running_ss_res = torch.zeros(1, device=device)  # For R²
     n_samples = 0
+    use_heteroscedastic_loss = getattr(config, 'use_heteroscedastic_loss', False)
+    uncertainty_stats = None
+    if use_heteroscedastic_loss:
+        uncertainty_stats = _init_uncertainty_running_stats(
+            device=device,
+            min_var=getattr(config, 'heteroscedastic_min_var', 1e-6)
+        )
 
     # Pre-allocate tensors for epoch-end all_reduce (avoids repeated allocations)
     batch_count_tensor = torch.zeros(1, device=device, dtype=torch.long)
@@ -1259,6 +1428,12 @@ def validate_one_epoch_ddp(
                 running_mae += diff.abs().sum()
                 running_ss_res += (diff ** 2).sum()
                 n_samples += pred_flat.numel()
+                if use_heteroscedastic_loss and uncertainty_stats is not None and 'log_var' in diagnostics:
+                    _update_uncertainty_running_stats(
+                        uncertainty_stats,
+                        diagnostics['log_var'],
+                        diff.pow(2)
+                    )
 
                 # Per-band extended metrics (every 5 epochs)
                 if do_extended_metrics:
@@ -1293,6 +1468,16 @@ def validate_one_epoch_ddp(
     dist.all_reduce(running_sum_cross, op=dist.ReduceOp.SUM)
     dist.all_reduce(running_mae, op=dist.ReduceOp.SUM)
     dist.all_reduce(running_ss_res, op=dist.ReduceOp.SUM)
+    if use_heteroscedastic_loss and uncertainty_stats is not None:
+        dist.all_reduce(uncertainty_stats['sum_log_var'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_pred_var'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_sq_err'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_pred_var_sq'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['sum_pred_var_sq_err'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['count_lt_0'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['count_lt_m1'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['n_elements'], op=dist.ReduceOp.SUM)
+        dist.all_reduce(uncertainty_stats['log_var_hist'], op=dist.ReduceOp.SUM)
 
     if do_extended_metrics:
         dist.all_reduce(running_mae_per_band, op=dist.ReduceOp.SUM)
@@ -1366,6 +1551,10 @@ def validate_one_epoch_ddp(
         metrics['mae'] = overall_mae
         metrics['r2'] = r2
 
+    uncertainty_metrics = None
+    if use_heteroscedastic_loss and uncertainty_stats is not None:
+        uncertainty_metrics = _finalize_uncertainty_running_stats(uncertainty_stats)
+
     # Log epoch-level metrics
     if rank == 0 and writer is not None:
         writer.add_scalar('Loss/val_epoch', val_loss_avg, epoch)
@@ -1383,6 +1572,15 @@ def validate_one_epoch_ddp(
         writer.add_scalar('Variance/val_overall_target_std', overall_targ_std, epoch)
         writer.add_scalar('Variance/val_overall_ratio', overall_variance_ratio, epoch)
         writer.add_scalar('Correlation/val_overall_pearson_r', overall_correlation, epoch)
+        if uncertainty_metrics is not None:
+            writer.add_scalar('Uncertainty/val_log_var_mean', uncertainty_metrics['log_var_mean'], epoch)
+            writer.add_scalar('Uncertainty/val_log_var_p05', uncertainty_metrics['log_var_p05'], epoch)
+            writer.add_scalar('Uncertainty/val_log_var_p50', uncertainty_metrics['log_var_p50'], epoch)
+            writer.add_scalar('Uncertainty/val_log_var_p95', uncertainty_metrics['log_var_p95'], epoch)
+            writer.add_scalar('Uncertainty/val_frac_log_var_lt_0', uncertainty_metrics['frac_log_var_lt_0'], epoch)
+            writer.add_scalar('Uncertainty/val_frac_log_var_lt_m1', uncertainty_metrics['frac_log_var_lt_m1'], epoch)
+            writer.add_scalar('Uncertainty/val_pred_var_mean', uncertainty_metrics['pred_var_mean'], epoch)
+            writer.add_scalar('Uncertainty/val_corr_pred_var_sq_error', uncertainty_metrics['corr_pred_var_sq_error'], epoch)
 
         # Per-band extended metrics (every 5 epochs) - compute for metrics dict only
         # TensorBoard per-band logging removed for GPU efficiency
