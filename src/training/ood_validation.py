@@ -18,6 +18,7 @@ Public API:
 
 import json
 import logging
+import math
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,13 +30,14 @@ import pandas as pd
 import torch
 from shapely.geometry import Point
 from torch.amp import autocast
+from torch.utils.tensorboard import SummaryWriter
 
 from src.evaluation.band_config import BandConfig, load_band_config
 from src.evaluation.build_prediction_rasters import build_site_rasters
 from src.evaluation.compare_predictions_to_plots import (
     compare_predictions_to_field,
-    compute_statistics,
     create_plot_footprints,
+    extract_raster_values_at_footprint,
     load_site_rasters,
 )
 from src.evaluation.raster_inference import (
@@ -171,13 +173,19 @@ def _run_ood_forward_pass(
     fuel_stats: dict,
     target_band_indices: List[int],
     batch_size: int = 10,
-) -> Dict[str, np.ndarray]:
+) -> tuple[Dict[str, np.ndarray], Optional[Dict[str, np.ndarray]]]:
     """
     Forward-pass all OOD tiles in mixed-modality batches.
 
-    Returns dict mapping tile_id → np.ndarray[n_bands, 5, 5] in physical units.
+    Returns:
+        predictions_dict: tile_id → np.ndarray[n_bands, 5, 5] in physical units.
+        variances_dict:   tile_id → np.ndarray[n_bands, 5, 5] of σ² in z-score
+                          (target-normalized) space, or None if the model does
+                          not emit log-variance.
     """
     predictions_dict: Dict[str, np.ndarray] = {}
+    variances_dict: Dict[str, np.ndarray] = {}
+    has_variance = False
     tiles = ood_set.tiles
 
     # Chunk tiles into batches regardless of site or UAVSAR availability —
@@ -209,24 +217,36 @@ def _run_ood_forward_pass(
                 debug_logging=False,
             )
 
-        # Heteroscedastic models return (mean, log_var) — discard log_var
+        # Heteroscedastic models return (mean, log_var)
         if isinstance(output, tuple):
             predictions = output[0]
+            log_var = output[1]
+            has_variance = True
         else:
             predictions = output
+            log_var = None
 
         # Cast back to float32 for denormalization (denorm reads dtype from preds)
         predictions = predictions.detach().float().cpu()
 
-        # z-score → physical units
+        # z-score → physical units for the mean predictions
         predictions_denorm = denormalize_predictions(
             predictions, fuel_stats, target_band_indices
         )
 
+        # Keep σ² in z-score (target-normalized) space. Calibration ratios are
+        # scale-invariant, so we intentionally avoid denormalizing here — it
+        # sidesteps the log-TFL inverse-transform issue and keeps the downstream
+        # math simple.
+        if log_var is not None:
+            variance_z = torch.exp(log_var.detach().float().cpu())
+
         for i, tile_id in enumerate(batch['tile_ids']):
             predictions_dict[tile_id] = predictions_denorm[i].numpy()
+            if log_var is not None:
+                variances_dict[tile_id] = variance_z[i].numpy()
 
-    return predictions_dict
+    return predictions_dict, (variances_dict if has_variance else None)
 
 
 def _build_tile_metadata_df(
@@ -282,6 +302,309 @@ def _build_field_gdf(ood_set: OODValidationSet, crs: str = 'EPSG:32611') -> gpd.
     return gpd.GeoDataFrame(df, geometry='geometry', crs=crs)
 
 
+def _trimmed_spearman_from_residuals(
+    field_vals: np.ndarray,
+    pred_vals: np.ndarray,
+    n_trim: int = 2,
+) -> float:
+    """Compute Spearman rho after dropping the worst residual outliers."""
+    if len(field_vals) < 3:
+        return float('nan')
+
+    trimmed_field, trimmed_pred = _trim_worst_residuals(
+        field_vals, pred_vals, n_trim=n_trim
+    )
+    if len(trimmed_field) < 3:
+        return float('nan')
+
+    from scipy.stats import spearmanr
+
+    rho_val, _ = spearmanr(trimmed_field, trimmed_pred)
+    return float(rho_val)
+
+
+def _trim_worst_residuals(
+    field_vals: np.ndarray,
+    pred_vals: np.ndarray,
+    n_trim: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop the largest absolute residuals from aligned field/pred arrays."""
+    if len(field_vals) != len(pred_vals):
+        raise ValueError("field_vals and pred_vals must have the same length")
+
+    if n_trim <= 0:
+        return field_vals, pred_vals
+    if len(field_vals) <= n_trim:
+        return np.array([]), np.array([])
+
+    abs_residuals = np.abs(pred_vals - field_vals)
+    keep_indices = np.argsort(abs_residuals)[: len(abs_residuals) - n_trim]
+    return field_vals[keep_indices], pred_vals[keep_indices]
+
+
+def _compute_robust_ood_stats(
+    merged_df: pd.DataFrame,
+    band_config: BandConfig,
+    fuel_stats: dict,
+    target_band_indices: List[int],
+    coverage_threshold: float = 0.99,
+    n_trim: int = 2,
+) -> tuple[Dict[str, Dict[str, float]], pd.DataFrame]:
+    """Compute OOD-only robust metrics from extracted plot predictions."""
+    overall_stats: Dict[str, Dict[str, float]] = {}
+    per_site_rows: List[Dict[str, float]] = []
+    mapped_bands = band_config.get_bands_with_field_mapping()
+
+    for band in mapped_bands:
+        source_band_idx = target_band_indices[band.output_index]
+        train_std_display_units = (
+            float(fuel_stats[f'band_{source_band_idx}_std']) *
+            band.unit_conversion_factor
+        )
+        field_col = f'{band.name}_field'
+        pred_col = f'{band.name}_pred'
+        coverage_col = f'{band.name}_coverage_fraction'
+        valid_mask = (
+            merged_df[field_col].notna() &
+            merged_df[pred_col].notna() &
+            (merged_df[coverage_col] >= coverage_threshold)
+        )
+
+        field_vals = pd.to_numeric(
+            merged_df.loc[valid_mask, field_col], errors='coerce'
+        ).to_numpy()
+        pred_vals = pd.to_numeric(
+            merged_df.loc[valid_mask, pred_col], errors='coerce'
+        ).to_numpy()
+        finite_mask = np.isfinite(field_vals) & np.isfinite(pred_vals)
+        field_vals = field_vals[finite_mask]
+        pred_vals = pred_vals[finite_mask]
+        if len(field_vals) < 3:
+            continue
+
+        residuals = pred_vals - field_vals
+        abs_residuals = np.abs(residuals)
+        trimmed_field_vals, trimmed_pred_vals = _trim_worst_residuals(
+            field_vals, pred_vals, n_trim=n_trim
+        )
+        trimmed_abs_residuals = np.abs(trimmed_pred_vals - trimmed_field_vals)
+        field_std = float(np.std(field_vals))
+        medae = float(np.median(abs_residuals))
+        overall_stats[band.name] = {
+            'n': int(len(field_vals)),
+            'medae': medae,
+            'trimmed_mae': (
+                float(np.mean(trimmed_abs_residuals))
+                if len(trimmed_abs_residuals) > 0 else float('nan')
+            ),
+            'median_bias': float(np.median(residuals)),
+            'field_mean': float(np.mean(field_vals)),
+            'field_std': field_std,
+            'pred_mean': float(np.mean(pred_vals)),
+            'pred_std': float(np.std(pred_vals)),
+            'spearman_rho': _trimmed_spearman_from_residuals(
+                field_vals, pred_vals, n_trim=n_trim
+            ),
+            'normalized_medae': (
+                medae / field_std if field_std > 1e-8 else float('nan')
+            ),
+            'train_std_display_units': train_std_display_units,
+            'trimmed_standardized_mae': (
+                float(np.mean(trimmed_abs_residuals)) / train_std_display_units
+                if len(trimmed_abs_residuals) > 0 and train_std_display_units > 1e-8
+                else float('nan')
+            ),
+            'display_name': band.display_name,
+            'units': band.display_units,
+        }
+
+    for site_name, site_df in merged_df.groupby('site_name'):
+        row: Dict[str, float] = {'site_name': site_name}
+        for band in mapped_bands:
+            field_col = f'{band.name}_field'
+            pred_col = f'{band.name}_pred'
+            coverage_col = f'{band.name}_coverage_fraction'
+            valid_mask = (
+                site_df[field_col].notna() &
+                site_df[pred_col].notna() &
+                (site_df[coverage_col] >= coverage_threshold)
+            )
+            field_vals = pd.to_numeric(
+                site_df.loc[valid_mask, field_col], errors='coerce'
+            ).to_numpy()
+            pred_vals = pd.to_numeric(
+                site_df.loc[valid_mask, pred_col], errors='coerce'
+            ).to_numpy()
+            finite_mask = np.isfinite(field_vals) & np.isfinite(pred_vals)
+            field_vals = field_vals[finite_mask]
+            pred_vals = pred_vals[finite_mask]
+            if len(field_vals) == 0:
+                continue
+            row[f'{band.name}_medae'] = float(np.median(np.abs(pred_vals - field_vals)))
+        per_site_rows.append(row)
+
+    return overall_stats, pd.DataFrame(per_site_rows)
+
+
+def _extract_per_plot_variance_z(
+    variance_site_rasters: Dict[str, str],
+    field_footprints: gpd.GeoDataFrame,
+    band_config: BandConfig,
+    coverage_threshold: float = 0.99,
+) -> pd.DataFrame:
+    """
+    Extract footprint-weighted mean σ² (z-score space) per plot, per band.
+
+    Returns a DataFrame keyed by plot_id (index) with columns
+    '<band>_var_z' and '<band>_var_coverage' for each mapped band.
+    """
+    rows: List[Dict[str, float]] = []
+    for idx, row in field_footprints.iterrows():
+        plot_id = row.get('PlotID', row.get('plot_id', idx))
+        site_name = row.get('Site', row.get('site_name', 'unknown'))
+        footprint = row.geometry
+        if site_name not in variance_site_rasters:
+            continue
+
+        raster_path = variance_site_rasters[site_name]
+        out: Dict[str, float] = {
+            'plot_id': plot_id,
+            'site_name': site_name,
+        }
+        for band in band_config.get_bands_with_field_mapping():
+            extraction = extract_raster_values_at_footprint(
+                raster_path, footprint, band.output_index, 'mean'
+            )
+            var_value = extraction['weighted_mean']
+            coverage = extraction['coverage_fraction']
+            out[f'{band.name}_var_z'] = (
+                float(var_value) if not np.isnan(var_value) else float('nan')
+            )
+            out[f'{band.name}_var_coverage'] = float(coverage)
+        rows.append(out)
+
+    return pd.DataFrame(rows)
+
+
+def _compute_ood_calibration_metrics(
+    merged_df: pd.DataFrame,
+    plot_variances_df: pd.DataFrame,
+    band_config: BandConfig,
+    fuel_stats: dict,
+    target_band_indices: List[int],
+    coverage_threshold: float = 0.99,
+) -> Dict[str, float]:
+    """
+    Compute per-band / per-site / overall calibration ratios on OOD plots.
+
+    ratio = mean_plots((y - μ)² / σ²) equivalent (using mean(sq_err)/mean(σ²)
+    so a few low-σ² plots don't dominate). Everything is computed in z-score
+    (target-normalized) space so ratios are comparable across bands.
+
+    Skips log-transformed bands (e.g. TFL with use_log_tfl=True) — z-score
+    calibration isn't well-defined there without a delta-method correction.
+
+    Returns a flat dict of metrics with keys:
+        ood_<band>_calibration_ratio
+        ood_<band>_mean_sq_err_z
+        ood_<band>_mean_pred_var_z
+        ood_overall_calibration_ratio
+        ood_per_site/<site>/<band>_calibration_ratio
+    """
+    metrics: Dict[str, float] = {}
+    mapped_bands = band_config.get_bands_with_field_mapping()
+
+    use_log_tfl = fuel_stats.get('use_log_tfl', False)
+    tfl_band_index = fuel_stats.get('tfl_band_index', 15)
+
+    joined = merged_df.merge(
+        plot_variances_df, on=['plot_id', 'site_name'], how='inner'
+    )
+
+    per_band_sq_err_all: List[float] = []
+    per_band_var_all: List[float] = []
+
+    for band in mapped_bands:
+        source_band_idx = target_band_indices[band.output_index]
+        if use_log_tfl and source_band_idx == tfl_band_index:
+            continue
+
+        band_mean = float(fuel_stats[f'band_{source_band_idx}_mean'])
+        band_std = float(fuel_stats[f'band_{source_band_idx}_std'])
+        if band_std <= 1e-8:
+            continue
+
+        field_col = f'{band.name}_field'
+        pred_col = f'{band.name}_pred'
+        cov_col = f'{band.name}_coverage_fraction'
+        var_col = f'{band.name}_var_z'
+        var_cov_col = f'{band.name}_var_coverage'
+
+        required_cols = [field_col, pred_col, cov_col, var_col, var_cov_col]
+        if not all(c in joined.columns for c in required_cols):
+            continue
+
+        valid = (
+            joined[field_col].notna()
+            & joined[pred_col].notna()
+            & joined[var_col].notna()
+            & (joined[cov_col] >= coverage_threshold)
+            & (joined[var_cov_col] >= coverage_threshold)
+            & (joined[var_col] > 0)
+        )
+        sub = joined.loc[valid, ['site_name', field_col, pred_col, var_col]]
+        if len(sub) < 3:
+            continue
+
+        factor = band.unit_conversion_factor
+        # display → model units → z-score
+        field_z = (sub[field_col].to_numpy() / factor - band_mean) / band_std
+        pred_z = (sub[pred_col].to_numpy() / factor - band_mean) / band_std
+        var_z = sub[var_col].to_numpy()
+
+        sq_err_z = (field_z - pred_z) ** 2
+        finite = np.isfinite(sq_err_z) & np.isfinite(var_z) & (var_z > 0)
+        if finite.sum() < 3:
+            continue
+
+        mean_sq_err = float(np.mean(sq_err_z[finite]))
+        mean_var = float(np.mean(var_z[finite]))
+        ratio = mean_sq_err / mean_var if mean_var > 1e-12 else float('nan')
+
+        metrics[f'ood_{band.name}_calibration_ratio'] = ratio
+        metrics[f'ood_{band.name}_mean_sq_err_z'] = mean_sq_err
+        metrics[f'ood_{band.name}_mean_pred_var_z'] = mean_var
+        metrics[f'ood_{band.name}_calibration_n_plots'] = float(int(finite.sum()))
+
+        per_band_sq_err_all.append(mean_sq_err)
+        per_band_var_all.append(mean_var)
+
+        # Per-site
+        site_names = sub['site_name'].to_numpy()[finite]
+        sq_err_finite = sq_err_z[finite]
+        var_finite = var_z[finite]
+        for site in np.unique(site_names):
+            site_mask = (site_names == site)
+            if site_mask.sum() < 3:
+                continue
+            site_mean_var = float(np.mean(var_finite[site_mask]))
+            if site_mean_var <= 1e-12:
+                continue
+            metrics[f'ood_per_site/{site}/{band.name}_calibration_ratio'] = (
+                float(np.mean(sq_err_finite[site_mask])) / site_mean_var
+            )
+
+    if per_band_sq_err_all and per_band_var_all:
+        # Overall: mean of per-band ratios (equal weighting across bands)
+        per_band_ratios = [
+            s / v for s, v in zip(per_band_sq_err_all, per_band_var_all) if v > 1e-12
+        ]
+        if per_band_ratios:
+            metrics['ood_overall_calibration_ratio'] = float(np.mean(per_band_ratios))
+
+    return metrics
+
+
 def _flatten_stats_to_metrics(
     overall_stats: Dict, per_site_df: pd.DataFrame, band_config: BandConfig
 ) -> Dict[str, float]:
@@ -290,42 +613,141 @@ def _flatten_stats_to_metrics(
     suitable for TensorBoard / early-stopping consumption.
 
     Output keys:
-      ood_overall_mae                              - mean of mapped-band MAEs
-      ood_<band>_mae / r2 / rmse / bias / n        - per-band overall metrics
-      ood_per_site/<site>/<band>_mae               - per-band per-site metrics
+      ood_overall_mean_tsmae                      - mean of mapped-band trimmed standardized MAEs
+      ood_overall_median_spearman_rho             - median of mapped-band trimmed Spearman rhos
+      ood_<band>_medae / tsmae / spearman_rho / bias
+                                                  - per-band overall metrics
+      ood_per_site/<site>/<band>_medae            - per-band per-site metrics
     """
     metrics: Dict[str, float] = {}
 
     mapped_band_names = [b.name for b in band_config.get_bands_with_field_mapping()]
 
-    band_maes = []
+    band_trimmed_standardized_maes = []
+    band_spearman_rhos = []
     for band_name in mapped_band_names:
         band_stats = overall_stats.get(band_name)
         if band_stats is None:
             continue
-        metrics[f'ood_{band_name}_mae'] = float(band_stats['mae'])
-        metrics[f'ood_{band_name}_rmse'] = float(band_stats['rmse'])
-        metrics[f'ood_{band_name}_r2'] = float(band_stats['r_squared'])
-        metrics[f'ood_{band_name}_bias'] = float(band_stats['bias'])
-        metrics[f'ood_{band_name}_n'] = float(band_stats['n'])
-        band_maes.append(float(band_stats['mae']))
+        metrics[f'ood_{band_name}_medae'] = float(band_stats['medae'])
+        metrics[f'ood_{band_name}_tsmae'] = float(
+            band_stats['trimmed_standardized_mae']
+        )
+        metrics[f'ood_{band_name}_spearman_rho'] = float(band_stats['spearman_rho'])
+        metrics[f'ood_{band_name}_bias'] = float(band_stats['median_bias'])
+        trimmed_standardized_mae = float(band_stats['trimmed_standardized_mae'])
+        if np.isfinite(trimmed_standardized_mae):
+            band_trimmed_standardized_maes.append(trimmed_standardized_mae)
+        spearman_rho = float(band_stats['spearman_rho'])
+        if np.isfinite(spearman_rho):
+            band_spearman_rhos.append(spearman_rho)
 
-    if band_maes:
-        metrics['ood_overall_mae'] = float(np.mean(band_maes))
+    if band_trimmed_standardized_maes:
+        metrics['ood_overall_mean_tsmae'] = float(
+            np.mean(band_trimmed_standardized_maes)
+        )
     else:
-        metrics['ood_overall_mae'] = float('nan')
+        metrics['ood_overall_mean_tsmae'] = float('nan')
+
+    if band_spearman_rhos:
+        metrics['ood_overall_median_spearman_rho'] = float(np.median(band_spearman_rhos))
+    else:
+        metrics['ood_overall_median_spearman_rho'] = float('nan')
 
     # Per-site flattening (skip rows where MAE is NaN due to small-n sites)
     for _, site_row in per_site_df.iterrows():
         site = site_row['site_name']
         for band_name in mapped_band_names:
-            mae_key = f'{band_name}_mae'
-            if mae_key in site_row and pd.notna(site_row[mae_key]):
-                metrics[f'ood_per_site/{site}/{band_name}_mae'] = float(
-                    site_row[mae_key]
+            medae_key = f'{band_name}_medae'
+            if medae_key in site_row and pd.notna(site_row[medae_key]):
+                metrics[f'ood_per_site/{site}/{band_name}_medae'] = float(
+                    site_row[medae_key]
                 )
 
     return metrics
+
+
+def _log_ood_scatterplots(
+    writer: SummaryWriter,
+    epoch: int,
+    merged_df: pd.DataFrame,
+    band_config: BandConfig,
+    coverage_threshold: float = 0.99,
+) -> None:
+    """Log per-band OOD field-vs-prediction scatterplots to TensorBoard."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not available; skipping OOD scatterplot logging")
+        return
+
+    site_names = sorted(merged_df['site_name'].dropna().unique())
+    cmap = plt.get_cmap('tab10')
+    site_colors = {
+        site: cmap(i % cmap.N)
+        for i, site in enumerate(site_names)
+    }
+
+    for band in band_config.get_bands_with_field_mapping():
+        field_col = f'{band.name}_field'
+        pred_col = f'{band.name}_pred'
+        coverage_col = f'{band.name}_coverage_fraction'
+
+        valid_mask = (
+            merged_df[field_col].notna() &
+            merged_df[pred_col].notna() &
+            (merged_df[coverage_col] >= coverage_threshold)
+        )
+        plot_df = merged_df.loc[valid_mask, ['site_name', field_col, pred_col]]
+        if plot_df.empty:
+            continue
+
+        field_vals = pd.to_numeric(plot_df[field_col], errors='coerce').to_numpy()
+        pred_vals = pd.to_numeric(plot_df[pred_col], errors='coerce').to_numpy()
+
+        finite_mask = np.isfinite(field_vals) & np.isfinite(pred_vals)
+        plot_df = plot_df.loc[finite_mask].copy()
+        if plot_df.empty:
+            continue
+
+        field_vals = field_vals[finite_mask]
+        pred_vals = pred_vals[finite_mask]
+        vmin = float(min(np.min(field_vals), np.min(pred_vals)))
+        vmax = float(max(np.max(field_vals), np.max(pred_vals)))
+        if math.isclose(vmin, vmax):
+            pad = 1.0
+            vmin -= pad
+            vmax += pad
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        for site in site_names:
+            site_df = plot_df[plot_df['site_name'] == site]
+            if site_df.empty:
+                continue
+            ax.scatter(
+                site_df[field_col],
+                site_df[pred_col],
+                label=site,
+                s=48,
+                alpha=0.9,
+                color=site_colors[site],
+                edgecolors='white',
+                linewidths=0.5,
+            )
+
+        ax.plot([vmin, vmax], [vmin, vmax], linestyle='--', color='0.4', linewidth=1.0)
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(vmin, vmax)
+        ax.set_xlabel(f'Field {band.display_name} ({band.display_units})')
+        ax.set_ylabel(f'Predicted {band.display_name} ({band.display_units})')
+        ax.set_title(f'OOD {band.display_name}: field vs prediction')
+        ax.grid(alpha=0.2)
+        ax.legend(title='Site', fontsize=8, title_fontsize=9, loc='best')
+        fig.tight_layout()
+        writer.add_figure(f'OOD_Scatter/{band.name}', fig, global_step=epoch)
+        plt.close(fig)
 
 
 @torch.no_grad()
@@ -336,6 +758,8 @@ def evaluate_ood(
     config,
     band_config: BandConfig,
     fuel_stats: Optional[dict] = None,
+    writer: Optional[SummaryWriter] = None,
+    epoch: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Run a single OOD eval pass and return a flat metric dict.
@@ -366,8 +790,8 @@ def evaluate_ood(
     model.eval()
 
     try:
-        # 1. Forward pass on all OOD tiles → predictions_dict
-        predictions_dict = _run_ood_forward_pass(
+        # 1. Forward pass on all OOD tiles → (predictions_dict, variances_dict)
+        predictions_dict, variances_dict = _run_ood_forward_pass(
             model=model,
             ood_set=ood_set,
             device=device,
@@ -415,18 +839,61 @@ def evaluate_ood(
                     band_config,
                     coverage_threshold=0.99,
                 )
-                overall_stats = compute_statistics(
-                    merged_df, band_config, coverage_threshold=0.99
+                overall_stats, per_site_df = _compute_robust_ood_stats(
+                    merged_df=merged_df,
+                    band_config=band_config,
+                    fuel_stats=fuel_stats,
+                    target_band_indices=target_band_indices,
+                    coverage_threshold=0.99,
                 )
 
-                from src.evaluation.compare_predictions_to_plots import (
-                    compute_per_site_summary,
-                )
-                per_site_df = compute_per_site_summary(
-                    merged_df, band_config, coverage_threshold=0.99
+                # Optional: if the model emitted variance, build a parallel
+                # set of σ² rasters (z-score space) and extract plot-level
+                # variance for calibration metrics.
+                calibration_metrics: Dict[str, float] = {}
+                if variances_dict is not None:
+                    variance_dir = tmpdir_path / 'variance'
+                    variance_dir.mkdir(exist_ok=True)
+                    build_site_rasters(
+                        predictions_dict=variances_dict,
+                        tile_metadata_csv=str(tile_meta_csv),
+                        site_column='site_name',
+                        crs='EPSG:32611',
+                        output_dir=variance_dir,
+                        raster_suffix='_variance_raster',
+                    )
+                    variance_site_rasters = {
+                        p.stem.replace('_variance_raster', ''): str(p)
+                        for p in variance_dir.glob('*_variance_raster.tif')
+                    }
+                    if variance_site_rasters:
+                        plot_variances_df = _extract_per_plot_variance_z(
+                            variance_site_rasters,
+                            field_footprints,
+                            band_config,
+                            coverage_threshold=0.99,
+                        )
+                        calibration_metrics = _compute_ood_calibration_metrics(
+                            merged_df=merged_df,
+                            plot_variances_df=plot_variances_df,
+                            band_config=band_config,
+                            fuel_stats=fuel_stats,
+                            target_band_indices=target_band_indices,
+                            coverage_threshold=0.99,
+                        )
+
+            if writer is not None and epoch is not None:
+                _log_ood_scatterplots(
+                    writer=writer,
+                    epoch=epoch,
+                    merged_df=merged_df,
+                    band_config=band_config,
+                    coverage_threshold=0.99,
                 )
 
-        return _flatten_stats_to_metrics(overall_stats, per_site_df, band_config)
+        flat = _flatten_stats_to_metrics(overall_stats, per_site_df, band_config)
+        flat.update(calibration_metrics)
+        return flat
 
     finally:
         if was_training:
