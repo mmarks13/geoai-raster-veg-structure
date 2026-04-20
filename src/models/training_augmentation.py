@@ -370,17 +370,87 @@ class ReturnAttributeAugmentation(nn.Module):
 
         return attrs
 
+class NAIPRadiometricAugmentationZScore(nn.Module):
+    """GPU-native radiometric augmentation for z-score-normalized NAIP imagery.
+
+    Applies only simple affine perturbations directly in normalized space:
+    - global gain
+    - per-channel gain (with a slightly wider range for NIR)
+    - per-channel bias
+    - optional post-clip
+
+    Implementation constraint: all randomness and transforms stay on GPU.
+    """
+
+    def __init__(
+        self,
+        probability: float = 0.0,
+        strength: float = 1.0,
+        post_clip_range: Tuple[float, float] = (-4.0, 4.0),
+    ):
+        super().__init__()
+        self.probability = probability
+        self.strength = strength
+        self.post_clip_range = post_clip_range
+
+    @staticmethod
+    def _scale_gain_range(low: float, high: float, strength: float) -> Tuple[float, float]:
+        """Scale deviation from identity while keeping the range centered at 1.0."""
+        delta_low = 1.0 - low
+        delta_high = high - 1.0
+        return 1.0 - delta_low * strength, 1.0 + delta_high * strength
+
+    @staticmethod
+    def _scale_bias_range(low: float, high: float, strength: float) -> Tuple[float, float]:
+        """Scale additive bias range linearly around zero."""
+        return low * strength, high * strength
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.probability <= 0.0:
+            return images
+
+        # Expect [B, C, H, W] from NAIPAugmentation after flattening.
+        if images.ndim != 4:
+            raise ValueError(f"Expected [B, C, H, W] input, got {tuple(images.shape)}")
+        if images.shape[1] != 4:
+            raise ValueError(f"Expected 4-channel NAIP imagery (RGBN), got {images.shape[1]} channels")
+
+        batch_size, channels, _, _ = images.shape
+        device = images.device
+        dtype = images.dtype
+        strength = max(self.strength, 0.0)
+
+        enabled = (torch.rand(batch_size, device=device) < self.probability).to(dtype).view(batch_size, 1, 1, 1)
+
+        global_low, global_high = self._scale_gain_range(0.95, 1.05, strength)
+        global_gain = torch.empty(batch_size, 1, 1, 1, device=device, dtype=dtype).uniform_(global_low, global_high)
+
+        rgb_low, rgb_high = self._scale_gain_range(0.95, 1.08, strength)
+        nir_low, nir_high = self._scale_gain_range(0.95, 1.10, strength)
+        channel_gain = torch.empty(batch_size, channels, 1, 1, device=device, dtype=dtype)
+        channel_gain[:, :3].uniform_(rgb_low, rgb_high)
+        channel_gain[:, 3:].uniform_(nir_low, nir_high)
+
+        bias_low, bias_high = self._scale_bias_range(-0.10, 0.10, strength)
+        channel_bias = torch.empty(batch_size, channels, 1, 1, device=device, dtype=dtype).uniform_(bias_low, bias_high)
+
+        augmented = images * global_gain * channel_gain + channel_bias
+        images = images + enabled * (augmented - images)
+
+        clip_min, clip_max = self.post_clip_range
+        return images.clamp(clip_min, clip_max)
+
 
 class NAIPAugmentation(nn.Module):
     """GPU-native NAIP imagery augmentation using Kornia.
 
     Physically-motivated transforms for optical imagery:
+    - Radiometric gain/bias shifts in z-score space
     - GaussianNoise: Sensor noise simulation
     - GaussianBlur: Atmospheric haze, focus issues
     - RandomMotionBlur: Aircraft motion, wind effects
     - RandomErasing: Cloud shadows, occlusions
     - RandomSharpness: Focus quality variation
-    - RandomEqualize: Exposure, contrast variation
     """
 
     def __init__(
@@ -398,12 +468,19 @@ class NAIPAugmentation(nn.Module):
         erasing_prob: float = 0.1,
         sharpness_range: Tuple[float, float] = (0.5, 1.5),
         sharpness_prob: float = 0.2,
-        equalize_prob: float = 0.1,
+        radiometric_prob: float = 0.0,
+        radiometric_strength: float = 1.0,
+        post_clip_range: Tuple[float, float] = (-4.0, 4.0),
     ):
         super().__init__()
 
+        self.radiometric_aug = NAIPRadiometricAugmentationZScore(
+            probability=radiometric_prob,
+            strength=radiometric_strength,
+            post_clip_range=post_clip_range,
+        )
+
         # Build augmentation pipeline
-        # Note: RandomEqualize removed - requires [0,1] range but our images are z-score normalized
         self.augmentations = nn.ModuleList([
             K.RandomGaussianNoise(mean=0., std=noise_sigma, p=noise_prob),
             K.RandomGaussianBlur(
@@ -443,6 +520,8 @@ class NAIPAugmentation(nn.Module):
             # Flatten all leading dimensions into batch: [..., C, H, W] -> [B, C, H, W]
             C, H, W = orig_shape[-3], orig_shape[-2], orig_shape[-1]
             images = images.reshape(-1, C, H, W)
+
+        images = self.radiometric_aug(images)
 
         for aug in self.augmentations:
             images = aug(images)
@@ -990,7 +1069,9 @@ class TrainingAugmentation(nn.Module):
                 erasing_prob=getattr(config, 'aug_naip_erasing_prob', 0.1),
                 sharpness_range=getattr(config, 'aug_naip_sharpness_range', (0.5, 1.5)),
                 sharpness_prob=getattr(config, 'aug_naip_sharpness_prob', 0.2),
-                equalize_prob=getattr(config, 'aug_naip_equalize_prob', 0.1),
+                radiometric_prob=getattr(config, 'aug_naip_radiometric_prob', 0.0),
+                radiometric_strength=getattr(config, 'aug_naip_radiometric_strength', 1.0),
+                post_clip_range=getattr(config, 'aug_naip_post_clip_range', (-4.0, 4.0)),
             )
 
             # UAVSAR image augmentation (Kornia)
