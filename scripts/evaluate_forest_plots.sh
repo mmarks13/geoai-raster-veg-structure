@@ -23,7 +23,7 @@
 #   # Multiple models with specific GPU count
 #   bash scripts/evaluate_forest_plots.sh \
 #       --model path1/best_model.pth \
-#       --model path2/best_model.pth \
+#       --model path2/best_model.pth \exclude-plots-file
 #       --band-config src/evaluation/configs/raster/cover_only.json \
 #       --multi-gpu --num-gpus 2
 #
@@ -330,6 +330,27 @@ for MODEL_PATH in "${MODELS[@]}"; do
     if [ $? -ne 0 ]; then
         echo "Error: QGIS export failed for $MODEL_NAME"
         continue
+    fi
+
+    # Step 5: Compare to structural baseline
+    echo ""
+    echo "Step 5: Comparing to structural baseline..."
+
+    BASELINE_CSV="data/processed/veg_structure_baseline/comparison/baseline_comparison_results.csv"
+    BASELINE_STATS="data/processed/veg_structure_baseline/comparison/baseline_comparison_stats.json"
+
+    if [ -f "$BASELINE_CSV" ] && [ -f "$BASELINE_STATS" ]; then
+        python src/evaluation/compare_to_baseline.py \
+            --model-csv      "$COMPARISON_DIR/comparison_results.csv" \
+            --baseline-csv   "$BASELINE_CSV" \
+            --model-stats    "$COMPARISON_DIR/comparison_stats.json" \
+            --baseline-stats "$BASELINE_STATS" \
+            --output-dir     "$COMPARISON_DIR/vs_baseline"
+        if [ $? -ne 0 ]; then
+            echo "Warning: Baseline comparison failed for $MODEL_NAME (continuing)"
+        fi
+    else
+        echo "  → Baseline files not found; skipping baseline comparison."
     fi
 
     echo ""
