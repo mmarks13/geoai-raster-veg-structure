@@ -1,8 +1,7 @@
 """
-Shared primitives for the new raster prediction heads.
+Shared primitives for the raster prediction head.
 
-This module provides clean, freshly-authored building blocks used by the three
-production raster architectures in `src/models/raster_heads/`:
+Building blocks used by `src/models/raster_head.py`:
 
     - LearnableGridQueries: 5×5 learnable grid query embeddings + 2D sinusoidal PE
     - PatchPositionEncoding: 2D sinusoidal PE for image patch centers
@@ -289,19 +288,25 @@ class GaussianDistanceBiasedCrossAttention(nn.Module):
 class PreLNFFN(nn.Module):
     """Pre-LN residual FFN: ``x + Linear(Dropout(GELU(Linear(LN(x)))))``.
 
-    Used by Path A as a small capacity bump between the grid aggregator and the
-    decoder. Single block, no attention — deliberately distinct from Path C's
-    transformer block.
+    Small capacity bump between the grid aggregator and the decoder. Single
+    block, no attention.
     """
 
-    def __init__(self, feature_dim: int, ffn_ratio: int = 2, dropout: float = 0.1):
+    def __init__(
+        self,
+        feature_dim: int,
+        ffn_ratio: int = 2,
+        dropout: float = 0.1,
+        use_spectral_norm: bool = False,
+    ):
         super().__init__()
+        sn = nn.utils.parametrizations.spectral_norm if use_spectral_norm else (lambda m: m)
         self.norm = nn.LayerNorm(feature_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * ffn_ratio),
+            sn(nn.Linear(feature_dim, feature_dim * ffn_ratio)),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(feature_dim * ffn_ratio, feature_dim),
+            sn(nn.Linear(feature_dim * ffn_ratio, feature_dim)),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -328,6 +333,7 @@ class SmallMlpDecoder(nn.Module):
         n_bands: int = 8,
         dropout: float = 0.1,
         output_variance: bool = False,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -335,11 +341,12 @@ class SmallMlpDecoder(nn.Module):
         self.output_variance = output_variance
 
         out_channels = n_bands * 2 if output_variance else n_bands
+        sn = nn.utils.parametrizations.spectral_norm if use_spectral_norm else (lambda m: m)
         self.norm = nn.LayerNorm(feature_dim)
-        self.fc1 = nn.Linear(feature_dim, feature_dim)
+        self.fc1 = sn(nn.Linear(feature_dim, feature_dim))
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(feature_dim, out_channels)
+        self.fc2 = sn(nn.Linear(feature_dim, out_channels))
 
     def forward(self, grid_features: torch.Tensor):
         """`grid_features`: [B, H, W, F]."""

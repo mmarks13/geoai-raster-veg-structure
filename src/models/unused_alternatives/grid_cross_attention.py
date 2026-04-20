@@ -1,13 +1,13 @@
 """
-Path C — `grid_cross_attn`.
+Grid cross-attention raster head (reference-only, not used by production).
 
 25 learnable grid queries iteratively refine themselves by attending to a
 concatenated set of keys: [points, NAIP patches, UAVSAR patches]. Each block is
 Pre-LN ``cross-attn → self-attn → FFN`` (the "flipped DETR" ordering, which is
 semantically correct for position-anchored grid queries).
 
-This is the only path that fuses imagery directly inside the head — Paths A and
-B receive features that have already been fused by `CrossAttentionFusion`.
+Unlike the production raster head, this variant fuses imagery directly inside
+the head rather than consuming pre-fused features from `CrossAttentionFusion`.
 
 The per-tile modality presence masks are OR-ed into the cross-attention
 key-padding mask so that zero-filled NAIP/UAVSAR patches for tiles missing those
@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.utils import to_dense_batch
 
-from ._primitives import (
+from src.models.raster_primitives import (
     DEFAULT_PE_EXTENT_M,
     GaussianDistanceBiasedCrossAttention,
     LearnableGridQueries,
@@ -42,7 +42,8 @@ class GridCrossAttnBlock(nn.Module):
         num_heads: int,
         distance_sigma: Union[float, Sequence[float]],
         dropout: float,
-        ffn_ratio: int = 2,
+        use_self_attn: bool = True,
+        ffn_ratio: Optional[int] = 2,
     ):
         super().__init__()
         self.norm_cross = nn.LayerNorm(feature_dim)
@@ -53,21 +54,25 @@ class GridCrossAttnBlock(nn.Module):
             dropout=dropout,
         )
 
-        self.norm_self = nn.LayerNorm(feature_dim)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=feature_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.use_self_attn = use_self_attn
+        if self.use_self_attn:
+            self.norm_self = nn.LayerNorm(feature_dim)
+            self.self_attn = nn.MultiheadAttention(
+                embed_dim=feature_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
 
-        self.norm_ffn = nn.LayerNorm(feature_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * ffn_ratio),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(feature_dim * ffn_ratio, feature_dim),
-        )
+        self.use_ffn = ffn_ratio is not None
+        if self.use_ffn:
+            self.norm_ffn = nn.LayerNorm(feature_dim)
+            self.ffn = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim * ffn_ratio),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(feature_dim * ffn_ratio, feature_dim),
+            )
 
     def forward(
         self,
@@ -89,13 +94,14 @@ class GridCrossAttnBlock(nn.Module):
         )
         queries = queries + attn_out
 
-        # Pre-LN self-attention (queries attend to each other)
-        q_norm = self.norm_self(queries)
-        sa_out, _ = self.self_attn(q_norm, q_norm, q_norm, need_weights=False)
-        queries = queries + sa_out
+        if self.use_self_attn:
+            # Optional query-query mixing across the fixed 5x5 grid.
+            q_norm = self.norm_self(queries)
+            sa_out, _ = self.self_attn(q_norm, q_norm, q_norm, need_weights=False)
+            queries = queries + sa_out
 
-        # Pre-LN FFN
-        queries = queries + self.ffn(self.norm_ffn(queries))
+        if self.use_ffn:
+            queries = queries + self.ffn(self.norm_ffn(queries))
         return queries
 
 
@@ -109,7 +115,8 @@ class GridCrossAttnHead(nn.Module):
         num_heads: int = 8,
         distance_sigma: Union[float, Sequence[float]] = 2.0,
         dropout: float = 0.1,
-        ffn_ratio: int = 2,
+        use_self_attn: bool = True,
+        ffn_ratio: Optional[int] = 2,
         grid_size: int = 5,
         tile_extent_m: float = 10.0,
         n_bands: int = 8,
@@ -120,6 +127,7 @@ class GridCrossAttnHead(nn.Module):
         patch_grid_size: int = 4,
         patch_extent_m: float = 20.0,
         pe_extent_m: float = DEFAULT_PE_EXTENT_M,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
         if not (1 <= depth <= 4):
@@ -162,6 +170,7 @@ class GridCrossAttnHead(nn.Module):
                 num_heads=num_heads,
                 distance_sigma=distance_sigma,
                 dropout=dropout,
+                use_self_attn=use_self_attn,
                 ffn_ratio=ffn_ratio,
             )
             for _ in range(depth)
@@ -172,6 +181,7 @@ class GridCrossAttnHead(nn.Module):
             n_bands=n_bands,
             dropout=dropout,
             output_variance=output_variance,
+            use_spectral_norm=use_spectral_norm,
         )
 
     def forward(

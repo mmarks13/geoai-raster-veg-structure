@@ -1,11 +1,13 @@
 """
-Soft pillar conv decoder for Path B (`cross_attn_soft_pillar`).
+Soft-pillar raster head (reference-only, not used by production).
 
-This module contains a verbatim copy of `SoftPillarConvDecoder` and its helper
-`_GridRefineBlock` from `src/models/raster_head.py`. The legacy file is left
-in place for checkpoint migration; this copy is the version wired into the new
-`raster_heads` package.
+Receives already-fused point features (from `CrossAttentionFusion`) and produces
+a fuel-metrics raster via `SoftPillarConvDecoder`, which performs bilinear
+soft-splatting + ConvNeXt refinement on the grid (bypassing the attention-based
+point-to-grid aggregator used by the production head).
 """
+
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -72,6 +74,7 @@ class SoftPillarConvDecoder(nn.Module):
         z_bin_edges_m: tuple = (2.0, 5.0),
         output_variance: bool = False,
         z_embed_dim: int = 64,
+        use_spectral_norm: bool = False,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -126,7 +129,8 @@ class SoftPillarConvDecoder(nn.Module):
         ])
 
         out_ch = n_bands * 2 if output_variance else n_bands
-        self.head = nn.Conv2d(decoder_dim, out_ch, kernel_size=1)
+        sn = nn.utils.parametrizations.spectral_norm if use_spectral_norm else (lambda m: m)
+        self.head = sn(nn.Conv2d(decoder_dim, out_ch, kernel_size=1))
 
     def _denorm_positions(
         self,
@@ -334,3 +338,46 @@ class SoftPillarConvDecoder(nn.Module):
             return mean, log_var
 
         return out
+
+
+class CrossAttnSoftPillarHead(nn.Module):
+    """Thin wrapper around SoftPillarConvDecoder."""
+
+    def __init__(
+        self,
+        feature_dim: int = 256,
+        grid_size: int = 5,
+        tile_extent_m: float = 10.0,
+        n_bands: int = 8,
+        decoder_dim: int = 128,
+        num_blocks: int = 3,
+        dropout: float = 0.10,
+        output_variance: bool = False,
+        use_spectral_norm: bool = False,
+    ):
+        super().__init__()
+        self.decoder = SoftPillarConvDecoder(
+            feature_dim=feature_dim,
+            grid_size=grid_size,
+            tile_extent=tile_extent_m,
+            n_bands=n_bands,
+            decoder_dim=decoder_dim,
+            num_blocks=num_blocks,
+            dropout=dropout,
+            output_variance=output_variance,
+            use_spectral_norm=use_spectral_norm,
+        )
+
+    def forward(
+        self,
+        point_features: torch.Tensor,
+        point_positions: torch.Tensor,
+        batch_indices: torch.Tensor,
+        norm_params: List[Dict],
+    ):
+        return self.decoder(
+            point_features=point_features,
+            point_positions=point_positions,
+            batch_indices=batch_indices,
+            norm_params=norm_params,
+        )

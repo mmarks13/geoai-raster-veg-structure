@@ -9,7 +9,7 @@ Architecture:
 1. Feature Extraction: LocalGlobalPointAttentionBlock (shared with point cloud model)
 2. Image Encoding: NAIPEncoder + UAVSAREncoder (shared)
 3. Fusion: CrossAttentionFusion (shared, with denormalization support)
-4. Raster Decoder: RasterPredictionHead (new, raster-specific)
+4. Raster Decoder: CrossAttnGridMlpHead (grid aggregation → FFN → small MLP)
 
 Key differences from point cloud model:
 - Uses z-score normalized coordinates (not just bbox-normalized)
@@ -22,8 +22,7 @@ import torch
 import torch.nn as nn
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Union
-import warnings
+from typing import Dict, List, Optional, Union
 
 
 # Field order in the OLD positional `__reduce__` (pre-refactor). Used to remap
@@ -39,7 +38,7 @@ _LEGACY_REDUCE_FIELDS = (
     "pos_encoder_dropout", "stochastic_pos_dropout_prob", "n_bands",
     "target_band_indices", "grid_size", "tile_extent", "raster_num_heads",
     "raster_distance_sigma", "raster_hidden_dim", "raster_decoder_layers",
-    "raster_attention_dropout", "raster_decoder_dropout",
+    "raster_attention_dropout", "raster_decoder_dropout", "raster_ffn_dropout",
     "raster_use_wide_decoder", "num_pre_agg_blocks", "pre_agg_lcl_heads",
     "pre_agg_glbl_heads", "pre_agg_dropout", "pre_agg_k_neighbors",
     "checkpoint_path", "layers_to_load", "layers_to_freeze",
@@ -66,7 +65,8 @@ _LEGACY_REDUCE_FIELDS = (
     "aug_naip_motion_blur_angle", "aug_naip_motion_blur_prob",
     "aug_naip_erasing_scale", "aug_naip_erasing_prob",
     "aug_naip_sharpness_range", "aug_naip_sharpness_prob",
-    "aug_naip_equalize_prob", "aug_uavsar_noise_sigma", "aug_uavsar_noise_prob",
+    "aug_naip_radiometric_prob", "aug_naip_radiometric_strength",
+    "aug_naip_post_clip_range", "aug_uavsar_noise_sigma", "aug_uavsar_noise_prob",
     "aug_uavsar_blur_kernel", "aug_uavsar_blur_sigma", "aug_uavsar_blur_prob",
     "aug_uavsar_motion_blur_kernel", "aug_uavsar_motion_blur_angle",
     "aug_uavsar_motion_blur_prob", "aug_uavsar_erasing_scale",
@@ -98,12 +98,7 @@ def _unpickle_raster_config(state: dict):
 from .encoders import NAIPEncoder, UAVSAREncoder
 from .multimodal_model import LocalGlobalPointAttentionBlock
 from .cross_attn_fusion import CrossAttentionFusion
-from .raster_head import RasterPredictionHead
-from .raster_heads import (
-    CrossAttnGridMlpHead,
-    CrossAttnSoftPillarHead,
-    GridCrossAttnHead,
-)
+from .raster_head import CrossAttnGridMlpHead
 from .training_augmentation import TrainingAugmentation
 
 
@@ -122,6 +117,7 @@ class MultimodalRasterConfig:
 
     # Point Transformer parameters
     pt_attn_dropout: float = 0.05
+    pt_block_dropout: float = 0.0
 
     # Feature extractor attention heads
     extractor_lcl_heads: int = 4
@@ -149,40 +145,12 @@ class MultimodalRasterConfig:
     img_embed_dim: int = 128
     img_num_patches: int = 16
 
-    # ===== Architecture selector =====
-    # Single authoritative selector for the raster prediction head. One of:
-    #   - "cross_attn_grid_mlp"    (Path A, default — CrossAttentionFusion → grid agg → FFN → MLP)
-    #   - "cross_attn_soft_pillar" (Path B          — CrossAttentionFusion → SoftPillarConvDecoder)
-    #   - "grid_cross_attn"        (Path C          — 25 grid queries × stacked Pre-LN cross-attn blocks)
-    raster_architecture: Literal[
-        "cross_attn_grid_mlp",
-        "cross_attn_soft_pillar",
-        "grid_cross_attn",
-    ] = "cross_attn_grid_mlp"
-
     # Fusion parameters
-    # DEPRECATED: use `raster_architecture` instead. Retained so legacy checkpoint
-    # configs and ad-hoc scripts that instantiate legacy classes still construct.
-    fusion_type: str = "cross_attention"
     max_dist_ratio: float = 5.0  # Maximum distance in METERS for cross-attention masking (note: parameter name is misleading)
     fusion_num_heads: int = 4
     fusion_dropout: float = 0.1
     position_encoding_dim: int = 48  # Must be divisible by 6 for 3D positions (2 * D_pos = 2 * 3 = 6)
     use_batched_fusion: bool = True  # Use batched fusion (2x faster) vs original per-tile loop
-
-    # DEPRECATED: legacy GridCrossAttention parameters (folded into `grid_cross_attn_*`).
-    # Retained so legacy `GridCrossAttentionFusion` instances still construct.
-    grid_fusion_num_heads: int = 8  # 8 heads → 32 dim per head (with feature_dim=256)
-    grid_fusion_distance_sigma: Union[float, List[float]] = field(
-        default_factory=lambda: [1.0, 1.5, 2.5, 3.0, 3.5, 4.0, 6.0, 8.0]
-    )  # 2 local (point-dominant), 4 balanced, 2 wide (patch-inclusive)
-    grid_fusion_dropout: float = 0.1
-
-    # ===== Path C (grid_cross_attn) parameters =====
-    # Path C reuses raster_num_heads / raster_distance_sigma / raster_attention_dropout
-    # for its attention configuration. Only the unique fields live here.
-    grid_cross_attn_depth: int = 2  # Stacked transformer blocks (1..4)
-    grid_cross_attn_ffn_ratio: int = 2
 
     # Encoder dropouts
     naip_dropout: float = 0.1
@@ -205,21 +173,12 @@ class MultimodalRasterConfig:
     # Can be a single float (same for all heads) or list of floats (per-head multi-scale)
     # Multi-scale example: [0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0] for 8 heads
     raster_distance_sigma: Union[float, List[float]] = 2.0
-    raster_hidden_dim: int = 128  # Hidden dimension in raster decoder
-    raster_decoder_layers: int = 3  # Number of MLP layers in raster decoder (tunable: 2/3)
-    # Split dropout: separate values for attention (preserve sparse signal) and decoder MLP (regularize)
+    # Split dropout: separate values for attention (preserve sparse signal), FFN
+    # capacity bump, and decoder MLP (regularize final head).
+    # For cross_attn_grid_mlp: attention→aggregator, ffn→PreLNFFN, decoder→SmallMlpDecoder.
     raster_attention_dropout: float = 0.1  # Dropout for grid aggregation attention (keep low)
-    raster_decoder_dropout: float = 0.1  # Dropout for decoder MLP (can be higher)
-    # DEPRECATED: folded into `raster_architecture`. Retained for legacy class construction.
-    raster_use_wide_decoder: bool = False  # Use wide decoder with Pre-LN residuals (256→256→256→n_bands)
-
-    # DEPRECATED: pre-aggregation LG-PAB blocks are not used by any new path.
-    # Retained so legacy `RasterPredictionHead` still constructs.
-    num_pre_agg_blocks: int = 2  # Number of pre-aggregation LG-PAB blocks (0-5 configurable)
-    pre_agg_lcl_heads: int = 4  # Local attention heads for pre-aggregation blocks
-    pre_agg_glbl_heads: int = 4  # Global attention heads for pre-aggregation blocks
-    pre_agg_dropout: float = 0.1  # Dropout for pre-aggregation blocks
-    pre_agg_k_neighbors: int = 15  # KNN neighbors for pre-aggregation blocks
+    raster_ffn_dropout: float = 0.1        # Dropout for post-aggregator PreLN FFN (can be higher)
+    raster_decoder_dropout: float = 0.1    # Dropout for final decoder MLP
 
     # Checkpoint loading parameters
     checkpoint_path: str = None
@@ -249,12 +208,10 @@ class MultimodalRasterConfig:
 
     # Stochastic depth (DropPath) - separate configs for different components
     encoder_drop_path: float = 0.0  # Drop path for image encoder TransformerBlocks (NAIPEncoder/UAVSAREncoder)
-    decoder_drop_path: float = 0.0  # Drop path for WideRasterDecoder residual blocks
     extractor_point_attn_drop_path: float = 0.0  # Drop path for feature extractor's PosAwareGlobalFlashAttention
-    pre_agg_point_attn_drop_path: float = 0.0  # Drop path for pre-aggregation blocks' PosAwareGlobalFlashAttention
 
     # Spectral normalization (Lipschitz constraint for OOD robustness)
-    use_spectral_norm: bool = False  # Apply spectral norm to PreLNResidualBlock and DistanceMaskedAttention.out_proj
+    use_spectral_norm: bool = False  # Apply spectral norm to the final decoder head only (Lipschitz-bounded readout for OOD)
 
     # Stochastic Weight Averaging (SWA) for OOD robustness
     swa_enabled: bool = False  # Enable SWA model averaging
@@ -316,7 +273,9 @@ class MultimodalRasterConfig:
     aug_naip_erasing_prob: float = 0.1
     aug_naip_sharpness_range: tuple = (0.5, 1.5)
     aug_naip_sharpness_prob: float = 0.2
-    aug_naip_equalize_prob: float = 0.1
+    aug_naip_radiometric_prob: float = 0.0   # Master probability for z-score gain/bias augmentation
+    aug_naip_radiometric_strength: float = 1.0  # 1.0 = base ranges; <1 shrinks them, >1 widens them
+    aug_naip_post_clip_range: tuple = (-4.0, 4.0)  # Final z-score clamp after the radiometric step
 
     # UAVSAR augmentation
     aug_uavsar_noise_sigma: float = 0.05
@@ -368,38 +327,9 @@ class MultimodalRasterConfig:
     ood_val_band_config_path: str = "src/evaluation/configs/raster/veg_structure_8band.json"
 
     def __post_init__(self):
-        """Set default target_band_indices and validate architecture selection."""
+        """Set default target_band_indices."""
         if self.target_band_indices is None:
             self.target_band_indices = [2, 7, 14]  # Default: Height, TFL, Total_cover
-
-        valid_archs = {"cross_attn_grid_mlp", "cross_attn_soft_pillar", "grid_cross_attn"}
-        if self.raster_architecture not in valid_archs:
-            raise ValueError(
-                f"raster_architecture must be one of {sorted(valid_archs)}, "
-                f"got {self.raster_architecture!r}"
-            )
-
-        if self.raster_architecture == "grid_cross_attn":
-            if not (1 <= self.grid_cross_attn_depth <= 4):
-                raise ValueError(
-                    f"grid_cross_attn_depth must be in [1, 4], got {self.grid_cross_attn_depth}"
-                )
-
-        # Warn on stale deprecated fields so users know they're being ignored.
-        if self.fusion_type != "cross_attention":
-            warnings.warn(
-                f"`fusion_type={self.fusion_type!r}` is DEPRECATED and ignored when "
-                f"`raster_architecture` is set. Use raster_architecture instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        if self.raster_use_wide_decoder:
-            warnings.warn(
-                "`raster_use_wide_decoder` is DEPRECATED and ignored. "
-                "Use raster_architecture='cross_attn_soft_pillar' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
     def __reduce__(self):
         """Stable kwargs-based pickler.
@@ -468,6 +398,7 @@ class MultimodalRasterPredictor(nn.Module):
 
         # Get extractor dropout
         extractor_dropout = getattr(config, 'extractor_dropout', config.pt_attn_dropout)
+        block_dropout = getattr(config, 'pt_block_dropout', 0.0)
 
         # Get position generation hidden dimension
         pos_gen_hidden_dim = getattr(config, 'pos_gen_hidden_dim', 64)
@@ -490,6 +421,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim // 8,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
                 use_v2_attention=config.use_v2_attention,
@@ -503,6 +435,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim // 4,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
                 use_v2_attention=config.use_v2_attention,
@@ -516,6 +449,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim // 2,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path/2,
                 use_v2_attention=config.use_v2_attention,
@@ -529,6 +463,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path,
                 use_v2_attention=config.use_v2_attention,
@@ -544,6 +479,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,
                 global_drop_path=config.extractor_point_attn_drop_path,
                 use_v2_attention=config.use_v2_attention,
@@ -576,77 +512,35 @@ class MultimodalRasterPredictor(nn.Module):
                 drop_path=config.encoder_drop_path
             )
 
-        # ====== 3) Fusion (Path A & Path B only) ======
-        # Path A and Path B share `CrossAttentionFusion` (also used by the point cloud
-        # model). Path C does its own multi-source fusion inside the head.
-        self.architecture = config.raster_architecture
-        self.uses_cross_attn_fusion = self.architecture in (
-            "cross_attn_grid_mlp",
-            "cross_attn_soft_pillar",
+        # ====== 3) Fusion ======
+        # Shared `CrossAttentionFusion` (also used by the point cloud model).
+        self.fusion = CrossAttentionFusion(
+            point_dim=config.feature_dim,
+            patch_dim=config.img_embed_dim,
+            use_naip=self.use_naip,
+            use_uavsar=self.use_uavsar,
+            num_patches=config.img_num_patches,
+            max_dist_ratio=config.max_dist_ratio,
+            num_heads=config.fusion_num_heads,
+            attention_dropout=config.fusion_dropout,
+            position_encoding_dim=config.position_encoding_dim,
         )
 
-        if self.uses_cross_attn_fusion:
-            self.fusion = CrossAttentionFusion(
-                point_dim=config.feature_dim,
-                patch_dim=config.img_embed_dim,
-                use_naip=self.use_naip,
-                use_uavsar=self.use_uavsar,
-                num_patches=config.img_num_patches,
-                max_dist_ratio=config.max_dist_ratio,
-                num_heads=config.fusion_num_heads,
-                attention_dropout=config.fusion_dropout,
-                position_encoding_dim=config.position_encoding_dim,
-            )
-        else:
-            self.fusion = None
-
         # ====== 4) Raster Head ======
-        if self.architecture == "cross_attn_grid_mlp":
-            self.head = CrossAttnGridMlpHead(
-                feature_dim=config.feature_dim,
-                num_heads=config.raster_num_heads,
-                distance_sigma=config.raster_distance_sigma,
-                dropout=config.raster_decoder_dropout,
-                ffn_ratio=2,
-                grid_size=config.grid_size,
-                tile_extent_m=config.tile_extent,
-                n_bands=config.n_bands,
-                output_variance=config.use_heteroscedastic_loss,
-            )
-        elif self.architecture == "cross_attn_soft_pillar":
-            self.head = CrossAttnSoftPillarHead(
-                feature_dim=config.feature_dim,
-                grid_size=config.grid_size,
-                tile_extent_m=config.tile_extent,
-                n_bands=config.n_bands,
-                decoder_dim=config.raster_hidden_dim,
-                num_blocks=config.raster_decoder_layers,
-                dropout=config.raster_decoder_dropout,
-                output_variance=config.use_heteroscedastic_loss,
-            )
-        elif self.architecture == "grid_cross_attn":
-            self.head = GridCrossAttnHead(
-                feature_dim=config.feature_dim,
-                depth=config.grid_cross_attn_depth,
-                num_heads=config.raster_num_heads,
-                distance_sigma=config.raster_distance_sigma,
-                dropout=config.raster_attention_dropout,
-                ffn_ratio=config.grid_cross_attn_ffn_ratio,
-                grid_size=config.grid_size,
-                tile_extent_m=config.tile_extent,
-                n_bands=config.n_bands,
-                output_variance=config.use_heteroscedastic_loss,
-                use_naip=self.use_naip,
-                use_uavsar=self.use_uavsar,
-                patch_dim=config.img_embed_dim,
-            )
-        else:  # pragma: no cover — validated in __post_init__
-            raise ValueError(f"Unknown raster_architecture: {self.architecture}")
-
-        # Legacy attribute aliases, set to None so old code paths checking these don't break.
-        self.raster_head = None
-        self.grid_fusion = None
-        self.raster_decoder = None
+        self.head = CrossAttnGridMlpHead(
+            feature_dim=config.feature_dim,
+            num_heads=config.raster_num_heads,
+            distance_sigma=config.raster_distance_sigma,
+            attn_dropout=config.raster_attention_dropout,
+            ffn_dropout=config.raster_ffn_dropout,
+            decoder_dropout=config.raster_decoder_dropout,
+            ffn_ratio=2,
+            grid_size=config.grid_size,
+            tile_extent_m=config.tile_extent,
+            n_bands=config.n_bands,
+            output_variance=config.use_heteroscedastic_loss,
+            use_spectral_norm=config.use_spectral_norm,
+        )
 
         # ====== 5) GPU Training Augmentation (raster model only) ======
         self.training_aug = TrainingAugmentation(config)
@@ -909,54 +803,41 @@ class MultimodalRasterPredictor(nn.Module):
                     uavsar_stacked[b] = emb
                     uavsar_present_mask[b] = True
 
-        # ====== 4) Optional CrossAttentionFusion (Path A & Path B) ======
-        if self.uses_cross_attn_fusion:
-            modality_mask = {}
-            if naip_present_mask is not None:
-                modality_mask['naip'] = naip_present_mask
-            if uavsar_present_mask is not None:
-                modality_mask['uavsar'] = uavsar_present_mask
+        # ====== 4) CrossAttentionFusion ======
+        modality_mask = {}
+        if naip_present_mask is not None:
+            modality_mask['naip'] = naip_present_mask
+        if uavsar_present_mask is not None:
+            modality_mask['uavsar'] = uavsar_present_mask
 
-            x_feat = self.fusion.forward_batched(
-                point_features=x_feat,
-                point_positions=dep_points,
-                batch_indices=batch_indices,
-                norm_params=norm_params,
-                naip_embeddings=naip_stacked,
-                uavsar_embeddings=uavsar_stacked,
-                modality_mask=modality_mask if modality_mask else None,
-            )  # [N_total, feature_dim]
+        x_feat = self.fusion.forward_batched(
+            point_features=x_feat,
+            point_positions=dep_points,
+            batch_indices=batch_indices,
+            norm_params=norm_params,
+            naip_embeddings=naip_stacked,
+            uavsar_embeddings=uavsar_stacked,
+            modality_mask=modality_mask if modality_mask else None,
+        )  # [N_total, feature_dim]
 
-            if debug_logging:
-                has_nan = torch.isnan(x_feat).any().item()
-                print(f"  [DEBUG] After cross-attn fusion: NaN={has_nan}")
-                if has_nan:
-                    print(f"    NaN count: {torch.isnan(x_feat).sum().item()}/{x_feat.numel()}")
+        if debug_logging:
+            has_nan = torch.isnan(x_feat).any().item()
+            print(f"  [DEBUG] After cross-attn fusion: NaN={has_nan}")
+            if has_nan:
+                print(f"    NaN count: {torch.isnan(x_feat).sum().item()}/{x_feat.numel()}")
 
         # ====== 5) Raster head ======
-        if self.architecture == "grid_cross_attn":
-            pred_raster = self.head(
-                point_features=x_feat,
-                point_positions=dep_points,
-                batch_indices=batch_indices,
-                norm_params=norm_params,
-                naip_stacked=naip_stacked,
-                uavsar_stacked=uavsar_stacked,
-                naip_present_mask=naip_present_mask,
-                uavsar_present_mask=uavsar_present_mask,
-            )
-        else:
-            pred_raster = self.head(
-                point_features=x_feat,
-                point_positions=dep_points,
-                batch_indices=batch_indices,
-                norm_params=norm_params,
-            )
+        pred_raster = self.head(
+            point_features=x_feat,
+            point_positions=dep_points,
+            batch_indices=batch_indices,
+            norm_params=norm_params,
+        )
 
         if debug_logging:
             debug_tensor = pred_raster[0] if isinstance(pred_raster, tuple) else pred_raster
             has_nan = torch.isnan(debug_tensor).any().item()
-            print(f"  [DEBUG] After raster head ({self.architecture}): NaN={has_nan}")
+            print(f"  [DEBUG] After raster head: NaN={has_nan}")
             if has_nan:
                 print(f"    NaN count: {torch.isnan(debug_tensor).sum().item()}/{debug_tensor.numel()}")
 

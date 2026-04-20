@@ -5,10 +5,9 @@ Usage:
     python run_raster_optuna_sweep.py
 
 This script runs Bayesian hyperparameter optimization using Optuna to search over:
-- Memory-safe model configs: Bundles (feature_dim, img_embed_dim, raster_hidden_dim,
+- Memory-safe model configs: Bundles (feature_dim, img_embed_dim,
   batch_size, grad_accum) to ensure GPU memory safety and fair comparison (constant
   effective batch size ≈ 60-80)
-- Architecture: decoder_layers, raster_use_wide_decoder
 - Regularization: raster_attention_dropout, raster_decoder_dropout
 - Training: learning_rate, weight_decay, correlation_loss_weight
 
@@ -41,49 +40,39 @@ def objective(trial):
 
     # Memory-safe model configurations (model_size, batch_size, grad_accum)
     # All configs target effective batch size ≈ 60 samples
-    # Format: (feature_dim, img_embed_dim, raster_hidden_dim, batch_size, grad_accum_steps)
+    # Format: (feature_dim, img_embed_dim, batch_size, grad_accum_steps)
     model_config = trial.suggest_categorical("model_config", [
         # # Medium-Large model
-        # (512, 256, 512, 15, 4),   # Effective: 60
+        # (512, 256, 15, 4),   # Effective: 60
 
         # Large model
-        # (768, 384, 768, 10, 6),   # Effective: 60
-        (768, 384, 768, 6, 10),   # Effective: 60
+        # (768, 384, 10, 6),   # Effective: 60
+        (768, 384, 6, 10),   # Effective: 60
 
         # # Extra-Large model
-        # (1024, 512, 1024, 6, 10)  # Effective: 60
+        # (1024, 512, 6, 10)  # Effective: 60
     ])
 
     # Unpack configuration
-    feature_dim, img_embed_dim, raster_hidden_dim, batch_size, gradient_accumulation_steps = model_config
+    feature_dim, img_embed_dim, batch_size, gradient_accumulation_steps = model_config
 
     # Architecture - Attention Heads
     extractor_lcl_heads = trial.suggest_categorical("extractor_lcl_heads", [4, 8, 12])
     extractor_glbl_heads = trial.suggest_categorical("extractor_glbl_heads", [4, 8, 12])
     fusion_num_heads = 4
-    pre_agg_lcl_heads = 4
-    pre_agg_glbl_heads = 4
 
     # Raster Head - Multi-scale attention
     raster_num_heads = 8  # Fixed: multi-scale requires 8 heads
 
-    # Raster Decoder
-    decoder_layers = 3
-    raster_use_wide_decoder = True
-
     # Raster Dropout (separate for attention and decoder)
     raster_attention_dropout = 0.05
     raster_decoder_dropout = trial.suggest_categorical("raster_decoder_dropout", [0.2, 0.3, 0.4])
-
-    # Architecture - Pre-Aggregation
-    num_pre_agg_blocks = 0  # Disabled based on current best config
 
     # FIXED Feature Extractor Regularization
     pt_attn_dropout = 0.01
     naip_dropout = 0.01
     uavsar_dropout = 0.01
     fusion_dropout = 0.01
-    pre_agg_dropout = 0.4
 
     # Training Hyperparameters to Search
     learning_rate = 0.002 #trial.suggest_categorical("learning_rate", [0.002, 0.003, 0.004])
@@ -100,16 +89,10 @@ def objective(trial):
         # SAMPLED architecture
         feature_dim=feature_dim,
         img_embed_dim=img_embed_dim,
-        raster_hidden_dim=raster_hidden_dim,
         extractor_lcl_heads=extractor_lcl_heads,
         extractor_glbl_heads=extractor_glbl_heads,
         raster_num_heads=raster_num_heads,
         fusion_num_heads=fusion_num_heads,
-        pre_agg_lcl_heads=pre_agg_lcl_heads,
-        pre_agg_glbl_heads=pre_agg_glbl_heads,
-        num_pre_agg_blocks=num_pre_agg_blocks,
-        raster_decoder_layers=decoder_layers,
-        raster_use_wide_decoder=raster_use_wide_decoder,
 
         # SAMPLED regularization
         pt_attn_dropout=pt_attn_dropout,
@@ -118,7 +101,6 @@ def objective(trial):
         fusion_dropout=fusion_dropout,
         raster_attention_dropout=raster_attention_dropout,
         raster_decoder_dropout=raster_decoder_dropout,
-        pre_agg_dropout=pre_agg_dropout,
 
         # SAMPLED loss configuration
         correlation_loss_weight=correlation_loss_weight,
@@ -130,7 +112,6 @@ def objective(trial):
         use_uavsar=True,
         img_num_patches=16,
         temporal_encoder="gru",
-        fusion_type="cross_attention",
         max_dist_ratio=8.0,
         position_encoding_dim=48,
         n_bands=2,
@@ -140,7 +121,6 @@ def objective(trial):
         # MULTI-SCALE ATTENTION: Per-head sigma values (requires 8 heads)
         # 2 heads @ σ=0.5m (very local), 4 heads @ σ=2.0m (medium), 2 heads @ σ=5.0m (wide)
         raster_distance_sigma=[0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0],
-        pre_agg_k_neighbors=15,
     )
 
 
@@ -175,14 +155,12 @@ def objective(trial):
     print(f"TRIAL {trial.number}")
     print(f"{'='*80}")
     print(f"Memory Configuration:")
-    print(f"  Model size: {feature_dim}D (img={img_embed_dim}, raster={raster_hidden_dim})")
+    print(f"  Model size: {feature_dim}D (img={img_embed_dim})")
     print(f"  Batch size: {batch_size}")
     print(f"  Gradient accumulation: {gradient_accumulation_steps}")
     print(f"  Effective batch size: {effective_batch_size}")
     print(f"\nArchitecture:")
     print(f"  raster_num_heads: {raster_num_heads} (multi-scale)")
-    print(f"  decoder_layers: {decoder_layers}")
-    print(f"  wide_decoder: {raster_use_wide_decoder}")
     print(f"  extractor_lcl_heads: {extractor_lcl_heads}")
     print(f"  extractor_glbl_heads: {extractor_glbl_heads}")
     print(f"\nRegularization:")

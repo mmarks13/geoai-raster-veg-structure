@@ -172,7 +172,7 @@ class BasicImageRasterHead(nn.Module):
 
     Takes patch embeddings [16, embed_dim] and predicts fuel metrics [n_bands, 5, 5].
 
-    Spatial conventions match GridCrossAttentionFusion for transfer learning:
+    Spatial conventions match the production raster head for transfer learning:
     - Patches at [-7.5, -2.5, 2.5, 7.5]m (20×20m imagery, 4×4 grid)
     - Target grid at [-4, -2, 0, 2, 4]m (10×10m target, 5×5 grid)
     - Sinusoidal positional encoding ADDED to embeddings (not concatenated)
@@ -198,13 +198,13 @@ class BasicImageRasterHead(nn.Module):
         self.grid_in = 4  # 16 patches = 4×4 grid
         self.grid_out = 5  # Output 5×5 grid
 
-        # Reuse PatchPositionEncoding from GridCrossAttentionFusion
-        # This ensures identical positional encoding for transfer learning
-        from src.models.grid_cross_attention import PatchPositionEncoding
+        # Reuse PatchPositionEncoding from the production raster head primitives
+        # to ensure identical positional encoding for transfer learning.
+        from src.models.raster_primitives import PatchPositionEncoding
         self.patch_pos_encoding = PatchPositionEncoding(
             feature_dim=embed_dim,
             patch_grid_size=4,
-            patch_extent=20.0
+            patch_extent_m=20.0,
         )
 
         # Precompute grid_sample coordinates for correct spatial mapping
@@ -241,7 +241,7 @@ class BasicImageRasterHead(nn.Module):
         Returns:
             raster: [n_bands, 5, 5] predicted fuel metrics
         """
-        # Add positional encoding (matches GridCrossAttentionFusion additive approach)
+        # Add positional encoding (matches the raster head's additive approach)
         pos_enc, _ = self.patch_pos_encoding()  # [16, embed_dim]
         patch_with_pos = patch_embeddings + pos_enc  # Additive, not concatenation
 
