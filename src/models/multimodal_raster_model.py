@@ -719,15 +719,19 @@ class MultimodalRasterPredictor(nn.Module):
         dep_points_and_attr = torch.cat([dep_attr, dep_points], dim=1)  # [N_total, 9]
 
         # ====== 1) Point Cloud Feature Extraction ======
+        # Pass batch_indices so V2 global attention restricts attention to within-tile
+        # keys (via to_dense_batch + key-padding mask) and per-tile KNN graphs are built
+        # for local attention. Without this, points from different tiles in the minibatch
+        # attend to each other.
         if self.use_global_only:
             # Global-only mode: n consecutive global attention blocks
-            x_feat, _ = self.feature_extractor_1(dep_points_and_attr, dep_points, edge_index)
-            x_feat, _ = self.feature_extractor_2(x_feat, dep_points, edge_index)
-            x_feat, _ = self.feature_extractor_3(x_feat, dep_points, edge_index)
-            x_feat, _ = self.feature_extractor_4(x_feat, dep_points, edge_index)
+            x_feat, _ = self.feature_extractor_1(dep_points_and_attr, dep_points, edge_index, batch_indices=batch_indices)
+            x_feat, _ = self.feature_extractor_2(x_feat, dep_points, edge_index, batch_indices=batch_indices)
+            x_feat, _ = self.feature_extractor_3(x_feat, dep_points, edge_index, batch_indices=batch_indices)
+            x_feat, _ = self.feature_extractor_4(x_feat, dep_points, edge_index, batch_indices=batch_indices)
         else:
             # Standard mode: Single block with local+global attention
-            x_feat, _ = self.feature_extractor(dep_points_and_attr, dep_points, edge_index)
+            x_feat, _ = self.feature_extractor(dep_points_and_attr, dep_points, edge_index, batch_indices=batch_indices)
         # x_feat: [N_total, feature_dim]
 
         if debug_logging:
