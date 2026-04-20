@@ -674,7 +674,8 @@ class NAIPEncoder(nn.Module):
         self.patch_embed = PatchEmbeddingV2(
             in_channels=in_channels,
             patch_size=patch_size,
-            embed_dim=embed_dim
+            embed_dim=embed_dim,
+            dropout=dropout,
         )
         
         # Positional encoding (applied before transformer)
