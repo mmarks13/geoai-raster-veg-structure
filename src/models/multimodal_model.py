@@ -36,6 +36,7 @@ class MultimodalModelConfig:
 
     # Point Transformer parameters
     pt_attn_dropout: float = 0.05
+    pt_block_dropout: float = 0.0
 
     # Feature extractor attention heads
     extractor_lcl_heads: int = 4
@@ -107,6 +108,7 @@ class MultimodalModelConfig:
                 self.up_ratio,
                 self.pos_mlp_hdn,
                 self.pt_attn_dropout,
+                self.pt_block_dropout,
                 self.extractor_lcl_heads,
                 self.extractor_glbl_heads,
                 self.expansion_lcl_heads,
@@ -161,7 +163,14 @@ from torch_geometric.typing import Adj, OptTensor, SparseTensor
 import torch_sparse  # For set_diag function
 from torch_geometric.utils import add_self_loops, remove_self_loops, softmax
 from torch_geometric.nn.pool import knn_graph
-from torch_geometric.utils import to_undirected
+from torch_geometric.utils import to_undirected, to_dense_batch
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+# Backends used for masked SDPA (batch-aware path). PyTorch 2.5's cuDNN SDPA
+# backend rejects broadcasted bool key-padding masks with
+# "No execution plans support the graph". EFFICIENT_ATTENTION handles
+# arbitrary masks and is still memory-efficient; MATH is the universal fallback.
+_MASKED_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
 class PosAwareGlobalFlashAttention(nn.Module):
@@ -177,7 +186,18 @@ class PosAwareGlobalFlashAttention(nn.Module):
     - Includes feedforward network similar to standard transformer
     - Optional stochastic depth (DropPath) for regularization
     """
-    def __init__(self, dim, pos_encoding_dim=32, num_heads=4, dropout=0, ffn_expansion_factor=2, drop_path=0.0):
+    def __init__(
+        self,
+        dim,
+        pos_encoding_dim=32,
+        num_heads=4,
+        dropout=0,
+        block_dropout=0.0,
+        ffn_expansion_factor=2,
+        drop_path=0.0,
+        pos_encoder_dropout=0.0,
+        stochastic_pos_dropout_prob=0.0,
+    ):
         """
         Initialize Position-Aware Global Flash Attention module.
 
@@ -194,6 +214,7 @@ class PosAwareGlobalFlashAttention(nn.Module):
         self.pos_encoding_dim = pos_encoding_dim
         self.num_heads = num_heads
         self.dropout = dropout
+        self.block_dropout = block_dropout
 
         # Position encoding MLP
         self.pos_encoder = nn.Sequential(
@@ -214,6 +235,7 @@ class PosAwareGlobalFlashAttention(nn.Module):
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
+        self.out_drop = nn.Dropout(block_dropout) if block_dropout > 0 else nn.Identity()
 
         # Layer normalization for stability
         self.norm1 = nn.LayerNorm(dim)
@@ -228,28 +250,73 @@ class PosAwareGlobalFlashAttention(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * ffn_expansion_factor),
             nn.GELU(),
+            nn.Dropout(block_dropout),
             nn.Linear(dim * ffn_expansion_factor, dim)
         )
+        self.ffn_out_drop = nn.Dropout(block_dropout) if block_dropout > 0 else nn.Identity()
    
     def forward(self, x, pos):
         """
         Apply position-aware flash attention followed by feedforward network to input tensor.
-       
+
         Args:
             x: Input feature tensor of shape [N, dim]
             pos: Point position tensor of shape [N, 3]
-           
+
         Returns:
             Output tensor of shape [N, dim]
+
+        NOTE (cross-tile leakage):
+            When the caller concatenates multiple tiles into a single flat [N_total, dim]
+            tensor, the `x.unsqueeze(0)` below makes this block run one big softmax over
+            all points in the minibatch, so points from different tiles attend to each
+            other. V1's signature is frozen to preserve reproducibility of the published
+            point-cloud-upsampling study (which always runs with a single tile per call).
+
+            V2 (PosAwareGlobalFlashAttentionV2) has a batch-aware path that accepts a
+            `batch_indices` kwarg and uses `to_dense_batch` + a key-padding mask to
+            restrict attention to within-tile keys. To enable the same behavior in V1,
+            uncomment the block below and route `batch_indices` through
+            LocalGlobalPointAttentionBlock -> here. You will also need to remove the
+            `self.use_v2_attention or not self.use_global_attention` guard in
+            LocalGlobalPointAttentionBlock.forward.
+
+            # --- Optional V1 batch-aware path (uncomment to enable) ---
+            # if batch_indices is not None:
+            #     from torch_geometric.utils import to_dense_batch
+            #     residual = x
+            #     x_norm = self.norm1(x)
+            #     x_padded, valid_mask = to_dense_batch(x_norm, batch_indices)  # [B, N_max, dim]
+            #     pos_padded, _ = to_dense_batch(pos, batch_indices)            # [B, N_max, 3]
+            #     B, N_max, _ = x_padded.shape
+            #     pos_enc = self.pos_encoder(pos_padded.reshape(-1, 3)).view(B, N_max, self.pos_encoding_dim)
+            #     x_with_pos = torch.cat([x_padded, pos_enc], dim=-1)
+            #     x_combined = self.pos_feature_combiner(x_with_pos)
+            #     q = self.q_proj(x_combined).view(B, N_max, self.num_heads, self.head_dim).transpose(1, 2)
+            #     k = self.k_proj(x_combined).view(B, N_max, self.num_heads, self.head_dim).transpose(1, 2)
+            #     v = self.v_proj(x_combined).view(B, N_max, self.num_heads, self.head_dim).transpose(1, 2)
+            #     attn_mask = valid_mask[:, None, None, :]  # True = attend
+            #     attn_out = scaled_dot_product_attention(
+            #         q, k, v, attn_mask=attn_mask,
+            #         dropout_p=self.dropout if self.training else 0.0, is_causal=False,
+            #     )
+            #     attn_out = attn_out.transpose(1, 2).contiguous().view(B, N_max, self.dim)
+            #     attn_out = self.out_drop(self.out_proj(attn_out))
+            #     output = attn_out[valid_mask]  # unpack back to [N_total, dim]
+            #     output = self.norm2(self.drop_path1(output) + residual)
+            #     residual = output
+            #     output = self.norm3(output)
+            #     output = self.drop_path2(self.ffn_out_drop(self.ffn(output))) + residual
+            #     return output
         """
         # Apply residual connection pattern with normalization
         residual = x
         x = self.norm1(x)
-       
+
         # Get original shape
         orig_shape = x.shape
         seq_len = orig_shape[0]
-       
+
         # Add batch dimension if not present
         if len(orig_shape) == 2:
             x = x.unsqueeze(0)  # [1, N, dim]
@@ -282,7 +349,7 @@ class PosAwareGlobalFlashAttention(nn.Module):
        
         # Reshape and project back
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.dim)
-        output = self.out_proj(attn_output)
+        output = self.out_drop(self.out_proj(attn_output))
        
         # Remove batch dimension if it was added
         if len(orig_shape) == 2:
@@ -294,7 +361,7 @@ class PosAwareGlobalFlashAttention(nn.Module):
         # Apply feedforward network with residual connection (with stochastic depth)
         residual = output
         output = self.norm3(output)
-        output = self.drop_path2(self.ffn(output)) + residual
+        output = self.drop_path2(self.ffn_out_drop(self.ffn(output))) + residual
 
         return output
 
@@ -309,6 +376,7 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
     This separates "where to attend" from "what to aggregate."
     """
     def __init__(self, dim, pos_encoding_dim=32, num_heads=4, dropout=0,
+                 block_dropout=0.0,
                  ffn_expansion_factor=2, drop_path=0.0,
                  pos_encoder_dropout=0.1,
                  stochastic_pos_dropout_prob=0.0):
@@ -328,6 +396,7 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
         self.pos_encoding_dim = pos_encoding_dim
         self.num_heads = num_heads
         self.dropout = dropout
+        self.block_dropout = block_dropout
 
         assert dim % num_heads == 0, f"Dimension {dim} must be divisible by number of heads {num_heads}"
         self.head_dim = dim // num_heads
@@ -352,6 +421,7 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
         # V takes only dim - carries WHAT to aggregate (pure semantics)
         self.v_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
+        self.out_drop = nn.Dropout(block_dropout) if block_dropout > 0 else nn.Identity()
 
         # Standard Pre-LN (2 norms)
         self.norm1 = nn.LayerNorm(dim)
@@ -364,21 +434,79 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * ffn_expansion_factor),
             nn.GELU(),
+            nn.Dropout(block_dropout),
             nn.Linear(dim * ffn_expansion_factor, dim)
         )
+        self.ffn_out_drop = nn.Dropout(block_dropout) if block_dropout > 0 else nn.Identity()
 
-    def forward(self, x, pos):
+    def forward(self, x, pos, batch_indices=None):
         """
         Apply V2 position-aware flash attention followed by FFN.
 
         Args:
-            x: Input feature tensor [N, dim] or [B, N, dim]
+            x: Input feature tensor [N, dim] (flat) or [B, N, dim] (legacy batched)
             pos: Point position tensor [N, 3] or [B, N, 3]
+            batch_indices: Optional [N] long tensor assigning each point to a tile id
+                in [0, B). When provided, points are packed into [B, N_max, dim] via
+                to_dense_batch and attention is restricted to within-tile keys using a
+                key-padding mask. Required to prevent cross-tile leakage when the
+                caller concatenates multiple tiles into one flat tensor. Assumes
+                batch_indices is sorted (points grouped by tile).
 
         Returns:
-            Output tensor of same shape as input
+            Output tensor of same shape as input x.
         """
-        # Handle unbatched input (add batch dim if needed)
+        if batch_indices is not None:
+            # ---- Batch-aware path: pack flat [N_total, dim] into [B, N_max, dim] ----
+            assert x.dim() == 2, "batch_indices requires flat [N_total, dim] input"
+            residual = x                                                 # [N_total, dim]
+            x_norm = self.norm1(x)                                       # per-row LN (flat)
+
+            x_padded, valid_mask = to_dense_batch(x_norm, batch_indices)  # [B, N_max, dim], [B, N_max]
+            pos_padded, _ = to_dense_batch(pos, batch_indices)            # [B, N_max, 3]
+            B, N_max, _ = x_padded.shape
+
+            pos_enc = self.pos_encoder(pos_padded)                        # [B, N_max, pos_encoding_dim]
+
+            if self.training and self.stochastic_pos_dropout_prob > 0.0:
+                keep_prob = 1.0 - self.stochastic_pos_dropout_prob
+                pos_mask = torch.bernoulli(torch.full((B, N_max, 1), keep_prob, device=pos_enc.device))
+                pos_enc = pos_enc * pos_mask
+
+            x_with_pos = torch.cat([x_padded, pos_enc], dim=-1)           # [B, N_max, dim + pos_enc_dim]
+
+            q = self.q_proj(x_with_pos)                                   # position-aware
+            k = self.k_proj(x_with_pos)                                   # position-aware
+            v = self.v_proj(x_padded)                                     # pure semantics
+
+            q = q.view(B, N_max, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(B, N_max, self.num_heads, self.head_dim).transpose(1, 2)
+            v = v.view(B, N_max, self.num_heads, self.head_dim).transpose(1, 2)
+
+            # Key-padding mask [B, 1, 1, N_max]; True = attend (PyTorch SDPA convention).
+            # Force a non-cuDNN backend: cuDNN SDPA in PyTorch 2.5 rejects this mask shape.
+            attn_mask = valid_mask[:, None, None, :]
+
+            with sdpa_kernel(_MASKED_SDPA_BACKENDS):
+                x_attn = scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
+                )
+
+            x_attn = x_attn.transpose(1, 2).contiguous().view(B, N_max, self.dim)
+            x_attn = self.out_drop(self.out_proj(x_attn))
+
+            # Unpack: mask-indexing returns valid slots in row-major order (tile 0, tile 1, ...);
+            # matches the original flat order since batch_indices is sorted.
+            x_attn_flat = x_attn[valid_mask]                              # [N_total, dim]
+
+            x = residual + self.drop_path(x_attn_flat)
+            x = x + self.drop_path(self.ffn_out_drop(self.ffn(self.norm2(x))))
+            return x
+
+        # ---- Legacy path: unbatched [N, dim] or pre-batched [B, N, dim] ----
         orig_shape = x.shape
         if len(orig_shape) == 2:
             x = x.unsqueeze(0)  # [1, N, dim]
@@ -423,13 +551,13 @@ class PosAwareGlobalFlashAttentionV2(nn.Module):
 
         # Reshape back [B, N, dim]
         x_attn = x_attn.transpose(1, 2).contiguous().view(B, N, self.dim)
-        x_attn = self.out_proj(x_attn)
+        x_attn = self.out_drop(self.out_proj(x_attn))
 
         # Residual connection 1
         x = residual + self.drop_path(x_attn)
 
         # --- Block 2: FFN with Pre-LN ---
-        x = x + self.drop_path(self.ffn(self.norm2(x)))
+        x = x + self.drop_path(self.ffn_out_drop(self.ffn(self.norm2(x))))
 
         # Remove batch dim if it was added
         if len(orig_shape) == 2:
@@ -549,6 +677,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                  num_glbl_heads=4,
                  pos_encoding_dim=32,
                  dropout=0.0,
+                 block_dropout=0.0,
                  up_ratio=None,
                  k_neighbors=15,
                  pos_gen_hidden_dim=64,
@@ -579,6 +708,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
         self.num_glbl_heads = num_glbl_heads
         self.pos_encoding_dim = pos_encoding_dim
         self.dropout = dropout
+        self.block_dropout = block_dropout
         self.up_ratio = up_ratio
         self.k_neighbors = k_neighbors
         self.global_drop_path = global_drop_path
@@ -619,6 +749,7 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                 pos_encoding_dim=pos_encoding_dim,
                 num_heads=num_glbl_heads,
                 dropout=dropout,
+                block_dropout=block_dropout,
                 drop_path=global_drop_path,
                 pos_encoder_dropout=pos_encoder_dropout,
                 stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
@@ -647,36 +778,55 @@ class LocalGlobalPointAttentionBlock(nn.Module):
                 f'glbl_heads={self.num_glbl_heads}, '
                 f'up_ratio={self.up_ratio})')
         
-    def forward(self, x_feat, pos, edge_index=None):
+    def forward(self, x_feat, pos, edge_index=None, batch_indices=None):
         """
         Forward pass through the LocalGlobalPointAttentionBlock
-        
+
         Args:
             x_feat: [N, in_channels] Input features
             pos: [N, 3] Input 3D positions
             edge_index: [2, E] Graph connectivity (optional, will build KNN if None)
-            
+            batch_indices: Optional [N] long tensor assigning each point to a tile id.
+                When provided:
+                  * Per-tile KNN graphs are built (passed as `batch=` to knn_edge_index)
+                    so local attention does not cross tile boundaries.
+                  * Forwarded to the global attention module (V2 only) so attention is
+                    restricted to within-tile keys via a key-padding mask.
+                Only supported with V2 attention and when up_ratio is None.
+
         Returns:
             Tuple containing:
               - Output features: [N, out_channels] or [up_ratio*N, out_channels]
               - Output positions: [N, 3] or [up_ratio*N, 3]
         """
+        if batch_indices is not None:
+            assert self.up_ratio is None, (
+                "LocalGlobalPointAttentionBlock: batch_indices is not supported with up_ratio "
+                "(upsampling reorders points in a way that would require re-aligning batch ids)."
+            )
+            assert self.use_v2_attention or not self.use_global_attention, (
+                "LocalGlobalPointAttentionBlock: batch_indices requires V2 global attention "
+                "(V1 signature is preserved for published-study reproducibility)."
+            )
+
         # Build KNN graph if edge_index is not provided and using local attention
         if edge_index is None and self.use_local_attention:
             edge_index = knn_edge_index(
-                pos, k=self.k_neighbors + 1  # +1 because first nn is the point itself
+                pos,
+                k=self.k_neighbors + 1,  # +1 because first nn is the point itself
+                batch=batch_indices,      # per-tile KNN when batch_indices provided
             )
             edge_index = to_undirected(edge_index)  # Make edges bidirectional
-            
+
         # Store input for potential residual connection
         identity = x_feat if self.in_channels == self.out_channels else None
-        
+
         # 1. Apply local attention via MultiHeadPointTransformer or simple projection
         if self.use_local_attention:
             x_local = self.point_transformer(x_feat, pos, edge_index)
         else:
             x_local = self.local_projection(x_feat)
-        
+
 
         # 3. Apply upsampling if up_ratio is specified
         if self.up_ratio is not None:
@@ -684,34 +834,38 @@ class LocalGlobalPointAttentionBlock(nn.Module):
             r = self.up_ratio
             N = x_feat.shape[0]
             C = self.flash_attn_dim
-            
+
             # Group features: reshape to [N, r, out_channels]
             x_grouped = x_local.view(N, r, C)
-            
+
             # Convert to upsampled format: from [N, r, out_channels] to [r*N, out_channels]
             x_upsampled = x_grouped.permute(1, 0, 2).reshape(r * N, C)
-            
+
             # Feature-guided position generation
             base_positions = pos.repeat_interleave(r, dim=0)  # [r*N, 3]
             position_offsets = self.position_generator(x_upsampled)  # [r*N, 3]
             pos_upsampled = base_positions + position_offsets  # [r*N, 3]
-            
+
             # Apply global attention on upsampled features or skip if disabled
             if self.use_global_attention:
                 x_global = self.pos_flash_attention(x_upsampled, pos_upsampled)
             else:
                 x_global = x_upsampled
-            
-            
+
+
             return x_global, pos_upsampled
         else:
             # Without upsampling - apply global attention or skip
             if self.use_global_attention:
-                x_global = self.pos_flash_attention(x_local, pos)
+                if self.use_v2_attention:
+                    x_global = self.pos_flash_attention(x_local, pos, batch_indices=batch_indices)
+                else:
+                    # V1 signature is frozen for reproducibility; never pass batch_indices.
+                    x_global = self.pos_flash_attention(x_local, pos)
             else:
                 x_global = x_local
-            
-            
+
+
             return x_global, pos
 
 
@@ -742,6 +896,7 @@ class MultimodalPointUpsampler(nn.Module):
         extractor_dropout = getattr(config, 'extractor_dropout', config.pt_attn_dropout)
         expansion_dropout = getattr(config, 'expansion_dropout', config.pt_attn_dropout)
         refinement_dropout = getattr(config, 'refinement_dropout', config.pt_attn_dropout)
+        block_dropout = getattr(config, 'pt_block_dropout', 0.0)
 
         # Get position encoder parameters with fallback
         pos_encoder_dropout = getattr(config, 'pos_encoder_dropout', 0.1)
@@ -767,6 +922,7 @@ class MultimodalPointUpsampler(nn.Module):
             num_glbl_heads=extractor_glbl_heads,
             pos_encoding_dim=config.position_encoding_dim,
             dropout=extractor_dropout,
+            block_dropout=block_dropout,
             k_neighbors=config.k,
             pos_encoder_dropout=pos_encoder_dropout,
             stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
@@ -827,6 +983,7 @@ class MultimodalPointUpsampler(nn.Module):
             num_glbl_heads=expansion_glbl_heads,
             pos_encoding_dim=config.position_encoding_dim,
             dropout=expansion_dropout,
+            block_dropout=block_dropout,
             up_ratio=config.up_ratio,
             pos_gen_hidden_dim=pos_gen_hidden_dim,
             k_neighbors=config.k,
@@ -842,6 +999,7 @@ class MultimodalPointUpsampler(nn.Module):
             num_glbl_heads=refinement_glbl_heads,
             pos_encoding_dim=config.position_encoding_dim,
             dropout=refinement_dropout,
+            block_dropout=block_dropout,
             k_neighbors=config.k,
             pos_encoder_dropout=pos_encoder_dropout,
             stochastic_pos_dropout_prob=stochastic_pos_dropout_prob
