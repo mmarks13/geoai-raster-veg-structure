@@ -9,7 +9,7 @@ Architecture:
 1. Feature Extraction: LocalGlobalPointAttentionBlock (shared with point cloud model)
 2. Image Encoding: NAIPEncoder + UAVSAREncoder (shared)
 3. Fusion: CrossAttentionFusion (shared, with denormalization support)
-4. Raster Decoder: RasterPredictionHead (new, raster-specific)
+4. Raster Decoder: CrossAttnGridMlpHead (grid aggregation → FFN → small MLP)
 
 Key differences from point cloud model:
 - Uses z-score normalized coordinates (not just bbox-normalized)
@@ -20,14 +20,85 @@ Key differences from point cloud model:
 
 import torch
 import torch.nn as nn
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
+
+
+# Field order in the OLD positional `__reduce__` (pre-refactor). Used to remap
+# legacy checkpoint pickles into kwargs at unpickle time. DO NOT REORDER.
+_LEGACY_REDUCE_FIELDS = (
+    "k", "feature_dim", "pos_mlp_hdn", "pt_attn_dropout",
+    "extractor_lcl_heads", "extractor_glbl_heads", "use_global_only",
+    "use_v2_attention", "attr_dim", "use_naip", "use_uavsar",
+    "img_embed_dim", "img_num_patches", "fusion_type", "max_dist_ratio",
+    "fusion_num_heads", "fusion_dropout", "position_encoding_dim",
+    "use_batched_fusion", "grid_fusion_num_heads", "grid_fusion_distance_sigma",
+    "grid_fusion_dropout", "naip_dropout", "uavsar_dropout", "temporal_encoder",
+    "pos_encoder_dropout", "stochastic_pos_dropout_prob", "n_bands",
+    "target_band_indices", "grid_size", "tile_extent", "raster_num_heads",
+    "raster_distance_sigma", "raster_hidden_dim", "raster_decoder_layers",
+    "raster_attention_dropout", "raster_decoder_dropout", "raster_ffn_dropout",
+    "raster_use_wide_decoder", "num_pre_agg_blocks", "pre_agg_lcl_heads",
+    "pre_agg_glbl_heads", "pre_agg_dropout", "pre_agg_k_neighbors",
+    "checkpoint_path", "layers_to_load", "layers_to_freeze",
+    "correlation_loss_weight", "huber_delta", "transfer_lr_multiplier",
+    "use_heteroscedastic_loss", "heteroscedastic_min_var",
+    "heteroscedastic_overconfidence_weight", "encoder_drop_path",
+    "decoder_drop_path", "extractor_point_attn_drop_path",
+    "pre_agg_point_attn_drop_path", "use_spectral_norm", "swa_enabled",
+    "swa_start_epoch", "swa_update_freq", "training_augmentation_enabled",
+    "aug_coord_jitter_sigma_xy", "aug_coord_jitter_sigma_z",
+    "aug_coord_jitter_prob", "aug_intensity_noise_sigma",
+    "aug_intensity_noise_prob", "aug_intensity_outlier_prob",
+    "aug_bird_outlier_prob", "aug_bird_z_offset_range",
+    "aug_point_dup_tile_prob", "aug_point_dup_min_point_prob",
+    "aug_point_dup_max_point_prob", "aug_point_dup_min_offset",
+    "aug_point_dup_max_offset", "aug_omni_outlier_tile_prob",
+    "aug_omni_outlier_point_prob", "aug_omni_outlier_min_magnitude",
+    "aug_omni_outlier_max_magnitude", "aug_temporal_shift_prob",
+    "aug_temporal_max_shift_days", "coordinate_normalization_stats_path",
+    "aug_return_scale_prob", "aug_return_scale_range", "aug_return_noise_prob",
+    "aug_return_noise_sigma", "aug_return_zero_prob", "aug_return_shuffle_prob",
+    "aug_naip_noise_sigma", "aug_naip_noise_prob", "aug_naip_blur_kernel",
+    "aug_naip_blur_sigma", "aug_naip_blur_prob", "aug_naip_motion_blur_kernel",
+    "aug_naip_motion_blur_angle", "aug_naip_motion_blur_prob",
+    "aug_naip_erasing_scale", "aug_naip_erasing_prob",
+    "aug_naip_sharpness_range", "aug_naip_sharpness_prob",
+    "aug_naip_radiometric_prob", "aug_naip_radiometric_strength",
+    "aug_naip_post_clip_range", "aug_uavsar_noise_sigma", "aug_uavsar_noise_prob",
+    "aug_uavsar_blur_kernel", "aug_uavsar_blur_sigma", "aug_uavsar_blur_prob",
+    "aug_uavsar_motion_blur_kernel", "aug_uavsar_motion_blur_angle",
+    "aug_uavsar_motion_blur_prob", "aug_uavsar_erasing_scale",
+    "aug_uavsar_erasing_prob", "aug_geometric_enabled", "aug_rotation_prob",
+    "aug_reflection_prob", "aug_temporal_enabled", "aug_naip_subsample_prob",
+    "aug_naip_min_frames", "aug_uavsar_t_subsample_prob",
+    "aug_uavsar_t_min_frames", "aug_uavsar_g_mask_prob",
+    "aug_uavsar_g_min_images", "aug_modality_dropout_enabled",
+    "aug_naip_dropout_prob", "aug_uavsar_dropout_prob",
+    "aug_point_removal_enabled", "aug_point_removal_prob",
+    "aug_point_min_removal_ratio", "aug_point_max_removal_ratio",
+    "aug_point_min_points", "ood_val_enabled", "ood_val_tiles_path",
+    "ood_val_metadata_path", "ood_val_every_n_epochs",
+    "ood_val_band_config_path",
+)
+
+
+def _unpickle_raster_config(state: dict):
+    """Stable, kwargs-based unpickler for `MultimodalRasterConfig`.
+
+    Filters out fields no longer present on the current class so configs
+    pickled by future versions can still load on older versions, and vice
+    versa. Used by the new `__reduce__`.
+    """
+    valid = {f.name for f in dataclasses.fields(MultimodalRasterConfig)}
+    return MultimodalRasterConfig(**{k: v for k, v in state.items() if k in valid})
 
 # Import shared encoder components
 from .encoders import NAIPEncoder, UAVSAREncoder
 from .multimodal_model import LocalGlobalPointAttentionBlock
 from .cross_attn_fusion import CrossAttentionFusion
-from .raster_head import RasterPredictionHead
+from .raster_head import CrossAttnGridMlpHead
 from .training_augmentation import TrainingAugmentation
 
 
@@ -46,6 +117,7 @@ class MultimodalRasterConfig:
 
     # Point Transformer parameters
     pt_attn_dropout: float = 0.05
+    pt_block_dropout: float = 0.0
 
     # Feature extractor attention heads
     extractor_lcl_heads: int = 4
@@ -74,21 +146,11 @@ class MultimodalRasterConfig:
     img_num_patches: int = 16
 
     # Fusion parameters
-    # fusion_type: "cross_attention" (points attend to images) or "grid_cross_attention" (grid queries attend to all)
-    fusion_type: str = "cross_attention"
     max_dist_ratio: float = 5.0  # Maximum distance in METERS for cross-attention masking (note: parameter name is misleading)
     fusion_num_heads: int = 4
     fusion_dropout: float = 0.1
     position_encoding_dim: int = 48  # Must be divisible by 6 for 3D positions (2 * D_pos = 2 * 3 = 6)
     use_batched_fusion: bool = True  # Use batched fusion (2x faster) vs original per-tile loop
-
-    # GridCrossAttention-specific parameters (used when fusion_type="grid_cross_attention")
-    # Grid queries attend to all sources: [N points + 16 NAIP patches + 16 UAVSAR patches]
-    grid_fusion_num_heads: int = 8  # 8 heads → 32 dim per head (with feature_dim=256)
-    grid_fusion_distance_sigma: Union[float, List[float]] = field(
-        default_factory=lambda: [1.0, 1.5, 2.5, 3.0, 3.5, 4.0, 6.0, 8.0]
-    )  # 2 local (point-dominant), 4 balanced, 2 wide (patch-inclusive)
-    grid_fusion_dropout: float = 0.1
 
     # Encoder dropouts
     naip_dropout: float = 0.1
@@ -111,19 +173,12 @@ class MultimodalRasterConfig:
     # Can be a single float (same for all heads) or list of floats (per-head multi-scale)
     # Multi-scale example: [0.5, 0.5, 2.0, 2.0, 2.0, 2.0, 5.0, 5.0] for 8 heads
     raster_distance_sigma: Union[float, List[float]] = 2.0
-    raster_hidden_dim: int = 128  # Hidden dimension in raster decoder
-    raster_decoder_layers: int = 3  # Number of MLP layers in raster decoder (tunable: 2/3)
-    # Split dropout: separate values for attention (preserve sparse signal) and decoder MLP (regularize)
+    # Split dropout: separate values for attention (preserve sparse signal), FFN
+    # capacity bump, and decoder MLP (regularize final head).
+    # For cross_attn_grid_mlp: attention→aggregator, ffn→PreLNFFN, decoder→SmallMlpDecoder.
     raster_attention_dropout: float = 0.1  # Dropout for grid aggregation attention (keep low)
-    raster_decoder_dropout: float = 0.1  # Dropout for decoder MLP (can be higher)
-    raster_use_wide_decoder: bool = False  # Use wide decoder with Pre-LN residuals (256→256→256→n_bands)
-
-    # Pre-aggregation refinement parameters
-    num_pre_agg_blocks: int = 2  # Number of pre-aggregation LG-PAB blocks (0-5 configurable)
-    pre_agg_lcl_heads: int = 4  # Local attention heads for pre-aggregation blocks
-    pre_agg_glbl_heads: int = 4  # Global attention heads for pre-aggregation blocks
-    pre_agg_dropout: float = 0.1  # Dropout for pre-aggregation blocks
-    pre_agg_k_neighbors: int = 15  # KNN neighbors for pre-aggregation blocks
+    raster_ffn_dropout: float = 0.1        # Dropout for post-aggregator PreLN FFN (can be higher)
+    raster_decoder_dropout: float = 0.1    # Dropout for final decoder MLP
 
     # Checkpoint loading parameters
     checkpoint_path: str = None
@@ -153,12 +208,10 @@ class MultimodalRasterConfig:
 
     # Stochastic depth (DropPath) - separate configs for different components
     encoder_drop_path: float = 0.0  # Drop path for image encoder TransformerBlocks (NAIPEncoder/UAVSAREncoder)
-    decoder_drop_path: float = 0.0  # Drop path for WideRasterDecoder residual blocks
     extractor_point_attn_drop_path: float = 0.0  # Drop path for feature extractor's PosAwareGlobalFlashAttention
-    pre_agg_point_attn_drop_path: float = 0.0  # Drop path for pre-aggregation blocks' PosAwareGlobalFlashAttention
 
     # Spectral normalization (Lipschitz constraint for OOD robustness)
-    use_spectral_norm: bool = False  # Apply spectral norm to PreLNResidualBlock and DistanceMaskedAttention.out_proj
+    use_spectral_norm: bool = False  # Apply spectral norm to the final decoder head only (Lipschitz-bounded readout for OOD)
 
     # Stochastic Weight Averaging (SWA) for OOD robustness
     swa_enabled: bool = False  # Enable SWA model averaging
@@ -220,7 +273,9 @@ class MultimodalRasterConfig:
     aug_naip_erasing_prob: float = 0.1
     aug_naip_sharpness_range: tuple = (0.5, 1.5)
     aug_naip_sharpness_prob: float = 0.2
-    aug_naip_equalize_prob: float = 0.1
+    aug_naip_radiometric_prob: float = 0.0   # Master probability for z-score gain/bias augmentation
+    aug_naip_radiometric_strength: float = 1.0  # 1.0 = base ranges; <1 shrinks them, >1 widens them
+    aug_naip_post_clip_range: tuple = (-4.0, 4.0)  # Final z-score clamp after the radiometric step
 
     # UAVSAR augmentation
     aug_uavsar_noise_sigma: float = 0.05
@@ -260,157 +315,58 @@ class MultimodalRasterConfig:
     aug_point_max_removal_ratio: float = 0.7
     aug_point_min_points: int = 20
 
+    # ===== OOD Forest-Plot Validation =====
+    # When enabled, runs a small set of forest plot tiles every N epochs and
+    # logs ood_<band>_medae / tsmae / spearman_rho / ... metrics. Can be used
+    # as the early-stopping metric (e.g.
+    # early_stopping_metric="ood_overall_mean_tsmae").
+    ood_val_enabled: bool = False
+    ood_val_tiles_path: Optional[str] = None       # .pt file from build_ood_validation_set.py
+    ood_val_metadata_path: Optional[str] = None    # .json file from build_ood_validation_set.py
+    ood_val_every_n_epochs: int = 5
+    ood_val_band_config_path: str = "src/evaluation/configs/raster/veg_structure_8band.json"
+
     def __post_init__(self):
-        """Set default target_band_indices if not provided."""
+        """Set default target_band_indices."""
         if self.target_band_indices is None:
             self.target_band_indices = [2, 7, 14]  # Default: Height, TFL, Total_cover
 
     def __reduce__(self):
-        """Custom reduce method for multiprocessing compatibility."""
-        return (
-            self.__class__,
-            (
-                self.k,
-                self.feature_dim,
-                self.pos_mlp_hdn,
-                self.pt_attn_dropout,
-                self.extractor_lcl_heads,
-                self.extractor_glbl_heads,
-                self.use_global_only,
-                self.use_v2_attention,
-                self.attr_dim,
-                self.use_naip,
-                self.use_uavsar,
-                self.img_embed_dim,
-                self.img_num_patches,
-                self.fusion_type,
-                self.max_dist_ratio,
-                self.fusion_num_heads,
-                self.fusion_dropout,
-                self.position_encoding_dim,
-                self.use_batched_fusion,
-                # Grid fusion parameters
-                self.grid_fusion_num_heads,
-                self.grid_fusion_distance_sigma,
-                self.grid_fusion_dropout,
-                self.naip_dropout,
-                self.uavsar_dropout,
-                self.temporal_encoder,
-                self.pos_encoder_dropout,
-                self.stochastic_pos_dropout_prob,
-                self.n_bands,
-                self.target_band_indices,
-                self.grid_size,
-                self.tile_extent,
-                self.raster_num_heads,
-                self.raster_distance_sigma,
-                self.raster_hidden_dim,
-                self.raster_decoder_layers,
-                self.raster_attention_dropout,
-                self.raster_decoder_dropout,
-                self.raster_use_wide_decoder,
-                self.num_pre_agg_blocks,
-                self.pre_agg_lcl_heads,
-                self.pre_agg_glbl_heads,
-                self.pre_agg_dropout,
-                self.pre_agg_k_neighbors,
-                self.checkpoint_path,
-                self.layers_to_load,
-                self.layers_to_freeze,
-                self.correlation_loss_weight,
-                self.huber_delta,
-                self.transfer_lr_multiplier,
-                self.use_heteroscedastic_loss,
-                self.heteroscedastic_min_var,
-                self.heteroscedastic_overconfidence_weight,
-                self.encoder_drop_path,
-                self.decoder_drop_path,
-                self.extractor_point_attn_drop_path,
-                self.pre_agg_point_attn_drop_path,
-                # OOD robustness
-                self.use_spectral_norm,
-                self.swa_enabled,
-                self.swa_start_epoch,
-                self.swa_update_freq,
-                # GPU augmentation parameters
-                self.training_augmentation_enabled,
-                self.aug_coord_jitter_sigma_xy,
-                self.aug_coord_jitter_sigma_z,
-                self.aug_coord_jitter_prob,
-                self.aug_intensity_noise_sigma,
-                self.aug_intensity_noise_prob,
-                self.aug_intensity_outlier_prob,
-                self.aug_bird_outlier_prob,
-                self.aug_bird_z_offset_range,
-                # Point duplication
-                self.aug_point_dup_tile_prob,
-                self.aug_point_dup_min_point_prob,
-                self.aug_point_dup_max_point_prob,
-                self.aug_point_dup_min_offset,
-                self.aug_point_dup_max_offset,
-                # Omnidirectional outliers
-                self.aug_omni_outlier_tile_prob,
-                self.aug_omni_outlier_point_prob,
-                self.aug_omni_outlier_min_magnitude,
-                self.aug_omni_outlier_max_magnitude,
-                # Temporal shift
-                self.aug_temporal_shift_prob,
-                self.aug_temporal_max_shift_days,
-                # Return attribute augmentation
-                self.coordinate_normalization_stats_path,
-                self.aug_return_scale_prob,
-                self.aug_return_scale_range,
-                self.aug_return_noise_prob,
-                self.aug_return_noise_sigma,
-                self.aug_return_zero_prob,
-                self.aug_return_shuffle_prob,
-                self.aug_naip_noise_sigma,
-                self.aug_naip_noise_prob,
-                self.aug_naip_blur_kernel,
-                self.aug_naip_blur_sigma,
-                self.aug_naip_blur_prob,
-                self.aug_naip_motion_blur_kernel,
-                self.aug_naip_motion_blur_angle,
-                self.aug_naip_motion_blur_prob,
-                self.aug_naip_erasing_scale,
-                self.aug_naip_erasing_prob,
-                self.aug_naip_sharpness_range,
-                self.aug_naip_sharpness_prob,
-                self.aug_naip_equalize_prob,
-                self.aug_uavsar_noise_sigma,
-                self.aug_uavsar_noise_prob,
-                self.aug_uavsar_blur_kernel,
-                self.aug_uavsar_blur_sigma,
-                self.aug_uavsar_blur_prob,
-                self.aug_uavsar_motion_blur_kernel,
-                self.aug_uavsar_motion_blur_angle,
-                self.aug_uavsar_motion_blur_prob,
-                self.aug_uavsar_erasing_scale,
-                self.aug_uavsar_erasing_prob,
-                # Synchronized geometric augmentation
-                self.aug_geometric_enabled,
-                self.aug_rotation_prob,
-                self.aug_reflection_prob,
-                # Temporal subsampling augmentation
-                self.aug_temporal_enabled,
-                self.aug_naip_subsample_prob,
-                self.aug_naip_min_frames,
-                self.aug_uavsar_t_subsample_prob,
-                self.aug_uavsar_t_min_frames,
-                self.aug_uavsar_g_mask_prob,
-                self.aug_uavsar_g_min_images,
-                # Modality dropout augmentation
-                self.aug_modality_dropout_enabled,
-                self.aug_naip_dropout_prob,
-                self.aug_uavsar_dropout_prob,
-                # Point cloud sparse augmentation
-                self.aug_point_removal_enabled,
-                self.aug_point_removal_prob,
-                self.aug_point_min_removal_ratio,
-                self.aug_point_max_removal_ratio,
-                self.aug_point_min_points,
-            )
-        )
+        """Stable kwargs-based pickler.
+
+        Serializes the config as a `(field_name -> value)` dict so future
+        field additions, removals, and reorderings can't silently corrupt
+        loaded checkpoints. See `_unpickle_raster_config`.
+        """
+        state = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+        return (_unpickle_raster_config, (state,))
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compat shim for unpickling legacy checkpoints.
+#
+# Old checkpoints were pickled with a positional `__reduce__` that listed
+# 133 fields in `_LEGACY_REDUCE_FIELDS` order. Unpickling those calls
+# `MultimodalRasterConfig(*args)` with 133 positional values that no longer
+# match the current dataclass field layout. Detect that exact shape and
+# remap to kwargs (filtering out fields that have since been removed).
+# ---------------------------------------------------------------------------
+_dataclass_init = MultimodalRasterConfig.__init__
+
+
+def _bc_init(self, *args, **kwargs):
+    # Detect legacy positional unpickle: only positional args, count matches
+    # the historical 133-field layout *or* is shorter (older even). When the
+    # leading positional run begins with the legacy `k` field, treat as legacy.
+    if args and not kwargs and len(args) <= len(_LEGACY_REDUCE_FIELDS):
+        legacy_kwargs = dict(zip(_LEGACY_REDUCE_FIELDS, args))
+        valid = {f.name for f in dataclasses.fields(MultimodalRasterConfig)}
+        kwargs = {k: v for k, v in legacy_kwargs.items() if k in valid}
+        args = ()
+    _dataclass_init(self, *args, **kwargs)
+
+
+MultimodalRasterConfig.__init__ = _bc_init
 
 
 class MultimodalRasterPredictor(nn.Module):
@@ -442,6 +398,7 @@ class MultimodalRasterPredictor(nn.Module):
 
         # Get extractor dropout
         extractor_dropout = getattr(config, 'extractor_dropout', config.pt_attn_dropout)
+        block_dropout = getattr(config, 'pt_block_dropout', 0.0)
 
         # Get position generation hidden dimension
         pos_gen_hidden_dim = getattr(config, 'pos_gen_hidden_dim', 64)
@@ -464,6 +421,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim // 8,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
                 use_v2_attention=config.use_v2_attention,
@@ -477,6 +435,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim // 4,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=0,
                 use_v2_attention=config.use_v2_attention,
@@ -490,6 +449,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim // 2,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path/2,
                 use_v2_attention=config.use_v2_attention,
@@ -503,6 +463,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,  # Not used when num_lcl_heads=0
                 global_drop_path=config.extractor_point_attn_drop_path,
                 use_v2_attention=config.use_v2_attention,
@@ -518,6 +479,7 @@ class MultimodalRasterPredictor(nn.Module):
                 num_glbl_heads=config.extractor_glbl_heads,
                 pos_encoding_dim=config.position_encoding_dim,
                 dropout=extractor_dropout,
+                block_dropout=block_dropout,
                 k_neighbors=config.k,
                 global_drop_path=config.extractor_point_attn_drop_path,
                 use_v2_attention=config.use_v2_attention,
@@ -550,85 +512,35 @@ class MultimodalRasterPredictor(nn.Module):
                 drop_path=config.encoder_drop_path
             )
 
-        # ====== 3) Fusion and Raster Head ======
-        # Two approaches:
-        # - "cross_attention": Points attend to images → RasterPredictionHead (grid queries attend to points)
-        # - "grid_cross_attention": Grid queries attend to all sources (points + patches) directly
-        if config.fusion_type == "grid_cross_attention":
-            # Grid Cross-Attention: Single unified step
-            from .grid_cross_attention import GridCrossAttentionFusion
-            from .raster_head import WideRasterDecoder
+        # ====== 3) Fusion ======
+        # Shared `CrossAttentionFusion` (also used by the point cloud model).
+        self.fusion = CrossAttentionFusion(
+            point_dim=config.feature_dim,
+            patch_dim=config.img_embed_dim,
+            use_naip=self.use_naip,
+            use_uavsar=self.use_uavsar,
+            num_patches=config.img_num_patches,
+            max_dist_ratio=config.max_dist_ratio,
+            num_heads=config.fusion_num_heads,
+            attention_dropout=config.fusion_dropout,
+            position_encoding_dim=config.position_encoding_dim,
+        )
 
-            self.grid_fusion = GridCrossAttentionFusion(
-                point_dim=config.feature_dim,
-                patch_dim=config.img_embed_dim,
-                grid_size=config.grid_size,
-                tile_extent=config.tile_extent,
-                num_heads=config.grid_fusion_num_heads,
-                distance_sigma=config.grid_fusion_distance_sigma,
-                dropout=config.grid_fusion_dropout,
-                use_naip=self.use_naip,
-                use_uavsar=self.use_uavsar
-            )
-
-            # Raster decoder (grid_fusion outputs [B, 5, 5, feature_dim])
-            self.raster_decoder = WideRasterDecoder(
-                feature_dim=config.feature_dim,
-                n_bands=config.n_bands,
-                num_layers=config.raster_decoder_layers,
-                dropout=config.raster_decoder_dropout,
-                drop_path=config.decoder_drop_path,
-                use_spectral_norm=config.use_spectral_norm,
-                output_variance=config.use_heteroscedastic_loss
-            )
-
-            # Set fusion and raster_head to None for compatibility checks
-            self.fusion = None
-            self.raster_head = None
-        else:
-            # Standard: CrossAttentionFusion + RasterPredictionHead
-            self.fusion = CrossAttentionFusion(
-                point_dim=config.feature_dim,
-                patch_dim=config.img_embed_dim,
-                use_naip=self.use_naip,
-                use_uavsar=self.use_uavsar,
-                num_patches=config.img_num_patches,
-                max_dist_ratio=config.max_dist_ratio,
-                num_heads=config.fusion_num_heads,
-                attention_dropout=config.fusion_dropout,
-                position_encoding_dim=config.position_encoding_dim
-            )
-
-            self.raster_head = RasterPredictionHead(
-                feature_dim=config.feature_dim,
-                n_bands=config.n_bands,
-                num_heads=config.raster_num_heads,
-                distance_sigma=config.raster_distance_sigma,
-                grid_size=config.grid_size,
-                tile_extent=config.tile_extent,
-                hidden_dim=config.raster_hidden_dim,
-                num_decoder_layers=config.raster_decoder_layers,
-                attention_dropout=config.raster_attention_dropout,
-                decoder_dropout=config.raster_decoder_dropout,
-                use_wide_decoder=config.raster_use_wide_decoder,
-                decoder_drop_path=config.decoder_drop_path,
-                num_pre_agg_blocks=config.num_pre_agg_blocks,
-                pre_agg_lcl_heads=config.pre_agg_lcl_heads,
-                pre_agg_glbl_heads=config.pre_agg_glbl_heads,
-                pre_agg_dropout=config.pre_agg_dropout,
-                pre_agg_k_neighbors=config.pre_agg_k_neighbors,
-                position_encoding_dim=config.position_encoding_dim,
-                point_attn_drop_path=config.pre_agg_point_attn_drop_path,
-                use_v2_attention=config.use_v2_attention,
-                use_spectral_norm=config.use_spectral_norm,
-                pos_encoder_dropout=pos_encoder_dropout,
-                stochastic_pos_dropout_prob=stochastic_pos_dropout_prob,
-                output_variance=config.use_heteroscedastic_loss
-            )
-
-            # Set grid_fusion and raster_decoder to None for compatibility checks
-            self.grid_fusion = None
-            self.raster_decoder = None
+        # ====== 4) Raster Head ======
+        self.head = CrossAttnGridMlpHead(
+            feature_dim=config.feature_dim,
+            num_heads=config.raster_num_heads,
+            distance_sigma=config.raster_distance_sigma,
+            attn_dropout=config.raster_attention_dropout,
+            ffn_dropout=config.raster_ffn_dropout,
+            decoder_dropout=config.raster_decoder_dropout,
+            ffn_ratio=2,
+            grid_size=config.grid_size,
+            tile_extent_m=config.tile_extent,
+            n_bands=config.n_bands,
+            output_variance=config.use_heteroscedastic_loss,
+            use_spectral_norm=config.use_spectral_norm,
+        )
 
         # ====== 5) GPU Training Augmentation (raster model only) ======
         self.training_aug = TrainingAugmentation(config)
@@ -701,15 +613,19 @@ class MultimodalRasterPredictor(nn.Module):
         dep_points_and_attr = torch.cat([dep_attr, dep_points], dim=1)  # [N_total, 9]
 
         # ====== 1) Point Cloud Feature Extraction ======
+        # Pass batch_indices so V2 global attention restricts attention to within-tile
+        # keys (via to_dense_batch + key-padding mask) and per-tile KNN graphs are built
+        # for local attention. Without this, points from different tiles in the minibatch
+        # attend to each other.
         if self.use_global_only:
             # Global-only mode: n consecutive global attention blocks
-            x_feat, _ = self.feature_extractor_1(dep_points_and_attr, dep_points, edge_index)
-            x_feat, _ = self.feature_extractor_2(x_feat, dep_points, edge_index)
-            x_feat, _ = self.feature_extractor_3(x_feat, dep_points, edge_index)
-            x_feat, _ = self.feature_extractor_4(x_feat, dep_points, edge_index)
+            x_feat, _ = self.feature_extractor_1(dep_points_and_attr, dep_points, edge_index, batch_indices=batch_indices)
+            x_feat, _ = self.feature_extractor_2(x_feat, dep_points, edge_index, batch_indices=batch_indices)
+            x_feat, _ = self.feature_extractor_3(x_feat, dep_points, edge_index, batch_indices=batch_indices)
+            x_feat, _ = self.feature_extractor_4(x_feat, dep_points, edge_index, batch_indices=batch_indices)
         else:
             # Standard mode: Single block with local+global attention
-            x_feat, _ = self.feature_extractor(dep_points_and_attr, dep_points, edge_index)
+            x_feat, _ = self.feature_extractor(dep_points_and_attr, dep_points, edge_index, batch_indices=batch_indices)
         # x_feat: [N_total, feature_dim]
 
         if debug_logging:
@@ -857,161 +773,72 @@ class MultimodalRasterPredictor(nn.Module):
                 naip_embeddings_list, uavsar_embeddings_list, device
             )
 
-        # ====== 3) Fusion and 4) Raster Prediction ======
-        # Stack embeddings into batched tensors (needed for both fusion types)
+        # ====== 3) Stack imagery embeddings + per-tile presence masks ======
+        # Tiles missing a modality have a zero-filled slot here. The presence masks
+        # (naip_present_mask / uavsar_present_mask) are how we tell every downstream
+        # consumer which slots are real vs. zero-filled, so embedding dropout and
+        # missing modalities behave identically.
         naip_stacked = None
         uavsar_stacked = None
+        naip_present_mask = None
+        uavsar_present_mask = None
 
         if self.use_naip and len(naip_embeddings_list) > 0:
             num_patches = self.config.img_num_patches
             embed_dim = self.config.img_embed_dim
             naip_stacked = torch.zeros(batch_size, num_patches, embed_dim, device=device)
+            naip_present_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
             for b, emb in enumerate(naip_embeddings_list):
                 if emb is not None:
                     naip_stacked[b] = emb
+                    naip_present_mask[b] = True
 
         if self.use_uavsar and len(uavsar_embeddings_list) > 0:
             num_patches = self.config.img_num_patches
             embed_dim = self.config.img_embed_dim
             uavsar_stacked = torch.zeros(batch_size, num_patches, embed_dim, device=device)
+            uavsar_present_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
             for b, emb in enumerate(uavsar_embeddings_list):
                 if emb is not None:
                     uavsar_stacked[b] = emb
+                    uavsar_present_mask[b] = True
 
-        if self.config.fusion_type == "grid_cross_attention":
-            # Grid Cross-Attention: Single unified step
-            # Grid queries attend directly to [points + NAIP patches + UAVSAR patches]
-            grid_features = self.grid_fusion(
-                point_features=x_feat,
-                point_positions=dep_points,
-                batch_indices=batch_indices,
-                norm_params=norm_params,
-                naip_embeddings=naip_stacked,
-                uavsar_embeddings=uavsar_stacked
-            )  # [batch_size, 5, 5, feature_dim]
+        # ====== 4) CrossAttentionFusion ======
+        modality_mask = {}
+        if naip_present_mask is not None:
+            modality_mask['naip'] = naip_present_mask
+        if uavsar_present_mask is not None:
+            modality_mask['uavsar'] = uavsar_present_mask
 
-            if debug_logging:
-                has_nan = torch.isnan(grid_features).any().item()
-                print(f"  [DEBUG] After grid_fusion: NaN={has_nan}")
-                if has_nan:
-                    print(f"    NaN count: {torch.isnan(grid_features).sum().item()}/{grid_features.numel()}")
+        x_feat = self.fusion.forward_batched(
+            point_features=x_feat,
+            point_positions=dep_points,
+            batch_indices=batch_indices,
+            norm_params=norm_params,
+            naip_embeddings=naip_stacked,
+            uavsar_embeddings=uavsar_stacked,
+            modality_mask=modality_mask if modality_mask else None,
+        )  # [N_total, feature_dim]
 
-            # Decode to raster
-            pred_raster = self.raster_decoder(grid_features)  # [batch_size, n_bands, 5, 5] or (mean, log_var) tuple
+        if debug_logging:
+            has_nan = torch.isnan(x_feat).any().item()
+            print(f"  [DEBUG] After cross-attn fusion: NaN={has_nan}")
+            if has_nan:
+                print(f"    NaN count: {torch.isnan(x_feat).sum().item()}/{x_feat.numel()}")
 
-            if debug_logging:
-                # Handle tuple output from heteroscedastic loss
-                debug_tensor = pred_raster[0] if isinstance(pred_raster, tuple) else pred_raster
-                has_nan = torch.isnan(debug_tensor).any().item()
-                print(f"  [DEBUG] After raster_decoder: NaN={has_nan}")
-                if has_nan:
-                    print(f"    NaN count: {torch.isnan(debug_tensor).sum().item()}/{debug_tensor.numel()}")
+        # ====== 5) Raster head ======
+        pred_raster = self.head(
+            point_features=x_feat,
+            point_positions=dep_points,
+            batch_indices=batch_indices,
+            norm_params=norm_params,
+        )
 
-        else:
-            # Standard: CrossAttentionFusion + RasterPredictionHead
-            if self.config.use_batched_fusion:
-                # Batched fusion (2x faster, no CPU sync)
-                naip_mask = None
-                uavsar_mask = None
-
-                if naip_stacked is not None:
-                    naip_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-                    for b, emb in enumerate(naip_embeddings_list):
-                        if emb is not None:
-                            naip_mask[b] = True
-
-                if uavsar_stacked is not None:
-                    uavsar_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-                    for b, emb in enumerate(uavsar_embeddings_list):
-                        if emb is not None:
-                            uavsar_mask[b] = True
-
-                # Build modality mask dict
-                modality_mask = {}
-                if naip_mask is not None:
-                    modality_mask['naip'] = naip_mask
-                if uavsar_mask is not None:
-                    modality_mask['uavsar'] = uavsar_mask
-
-                # Batched fusion call
-                x_fused = self.fusion.forward_batched(
-                    point_features=x_feat,
-                    point_positions=dep_points,
-                    batch_indices=batch_indices,
-                    norm_params=norm_params,
-                    naip_embeddings=naip_stacked,
-                    uavsar_embeddings=uavsar_stacked,
-                    modality_mask=modality_mask if modality_mask else None
-                )  # [N_total, feature_dim]
-
-                if debug_logging:
-                    has_nan = torch.isnan(x_fused).any().item()
-                    print(f"  [DEBUG] After batched fusion: NaN={has_nan}")
-                    if has_nan:
-                        print(f"    NaN count: {torch.isnan(x_fused).sum().item()}/{x_fused.numel()}")
-            else:
-                # Original per-tile loop (for comparison/debugging)
-                fused_features = []
-
-                for b in range(batch_size):
-                    # Get points and features for this tile
-                    mask_b = (batch_indices == b)
-                    dep_points_b = dep_points[mask_b]  # [N_b, 3]
-                    x_feat_b = x_feat[mask_b]  # [N_b, feature_dim]
-
-                    # Get imagery embeddings for this tile
-                    naip_emb_b = naip_embeddings_list[b] if len(naip_embeddings_list) > 0 else None
-                    uavsar_emb_b = uavsar_embeddings_list[b] if len(uavsar_embeddings_list) > 0 else None
-
-                    # Get imagery bboxes
-                    naip_bbox_b = None
-                    if naip is not None and naip[b] is not None:
-                        naip_bbox_b = naip[b].get('img_bbox', None)
-
-                    uavsar_bbox_b = None
-                    if uavsar is not None and uavsar[b] is not None:
-                        uavsar_bbox_b = uavsar[b].get('img_bbox', None)
-
-                    # Apply fusion with norm_params for denormalization
-                    x_fused_b = self.fusion(
-                        point_features=x_feat_b,
-                        edge_index=None,
-                        point_positions=dep_points_b,
-                        naip_embeddings=naip_emb_b,
-                        uavsar_embeddings=uavsar_emb_b,
-                        main_bbox=None,
-                        naip_bbox=naip_bbox_b,
-                        uavsar_bbox=uavsar_bbox_b,
-                        center=None,
-                        scale=None,
-                        norm_params=norm_params[b]
-                    )  # [N_b, feature_dim]
-
-                    if debug_logging:
-                        has_nan = torch.isnan(x_fused_b).any().item()
-                        print(f"  [DEBUG] After fusion (tile {b}): NaN={has_nan}")
-                        if has_nan:
-                            print(f"    NaN count: {torch.isnan(x_fused_b).sum().item()}/{x_fused_b.numel()}")
-
-                    fused_features.append(x_fused_b)
-
-                # Concatenate fused features back to full batch
-                x_fused = torch.cat(fused_features, dim=0)  # [N_total, feature_dim]
-
-            # Raster Prediction (standard path)
-            pred_raster = self.raster_head(
-                point_features=x_fused,
-                point_positions=dep_points,
-                batch_indices=batch_indices,
-                norm_params=norm_params
-            )  # [batch_size, n_bands, 5, 5] or (mean, log_var) tuple
-
-            if debug_logging:
-                # Handle tuple output from heteroscedastic loss
-                debug_tensor = pred_raster[0] if isinstance(pred_raster, tuple) else pred_raster
-                has_nan = torch.isnan(debug_tensor).any().item()
-                print(f"  [DEBUG] After raster_head: NaN={has_nan}")
-                if has_nan:
-                    print(f"    NaN count: {torch.isnan(debug_tensor).sum().item()}/{debug_tensor.numel()}")
+        if debug_logging:
+            debug_tensor = pred_raster[0] if isinstance(pred_raster, tuple) else pred_raster
+            has_nan = torch.isnan(debug_tensor).any().item()
+            print(f"  [DEBUG] After raster head: NaN={has_nan}")
+            if has_nan:
+                print(f"    NaN count: {torch.isnan(debug_tensor).sum().item()}/{debug_tensor.numel()}")
 
         return pred_raster

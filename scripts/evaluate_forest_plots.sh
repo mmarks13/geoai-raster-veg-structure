@@ -23,7 +23,7 @@
 #   # Multiple models with specific GPU count
 #   bash scripts/evaluate_forest_plots.sh \
 #       --model path1/best_model.pth \
-#       --model path2/best_model.pth \
+#       --model path2/best_model.pth \exclude-plots-file
 #       --band-config src/evaluation/configs/raster/cover_only.json \
 #       --multi-gpu --num-gpus 2
 #
@@ -118,6 +118,10 @@ fi
 # Check required input files
 TILES_FILE="data/processed/forest_plot_data/inference_ready/precomputed_forest_plot_tiles_32bit.pt"
 FIELD_DATA="data/processed/forest_plot_data/forest_plots_processed.gpkg"
+
+# Optional: plots held out for in-training OOD validation. When present, these
+# plots are excluded from §7 final evaluation to prevent double-counting.
+OOD_EXCLUDE_FILE="data/processed/forest_plot_data/ood_validation/ood_validation_plot_ids.txt"
 
 # Read stats file path from band config
 FUEL_STATS=$(python -c "import json; print(json.load(open('$BAND_CONFIG'))['stats_file'])")
@@ -296,11 +300,18 @@ for MODEL_PATH in "${MODELS[@]}"; do
     echo ""
     echo "Step 3: Comparing predictions to field measurements..."
 
+    EXCLUDE_ARG=""
+    if [ -f "$OOD_EXCLUDE_FILE" ]; then
+        EXCLUDE_ARG="--exclude-plots-file $OOD_EXCLUDE_FILE"
+        echo "  → Excluding OOD-training plots listed in $OOD_EXCLUDE_FILE"
+    fi
+
     python src/evaluation/compare_predictions_to_plots.py \
         --site-rasters-dir "$RASTERS_DIR" \
         --field-data "$FIELD_DATA" \
         --band-config "$BAND_CONFIG" \
-        --output "$COMPARISON_DIR"
+        --output "$COMPARISON_DIR" \
+        $EXCLUDE_ARG
 
     if [ $? -ne 0 ]; then
         echo "Error: Comparison failed for $MODEL_NAME"
@@ -319,6 +330,27 @@ for MODEL_PATH in "${MODELS[@]}"; do
     if [ $? -ne 0 ]; then
         echo "Error: QGIS export failed for $MODEL_NAME"
         continue
+    fi
+
+    # Step 5: Compare to structural baseline
+    echo ""
+    echo "Step 5: Comparing to structural baseline..."
+
+    BASELINE_CSV="data/processed/veg_structure_baseline/comparison/baseline_comparison_results.csv"
+    BASELINE_STATS="data/processed/veg_structure_baseline/comparison/baseline_comparison_stats.json"
+
+    if [ -f "$BASELINE_CSV" ] && [ -f "$BASELINE_STATS" ]; then
+        python src/evaluation/compare_to_baseline.py \
+            --model-csv      "$COMPARISON_DIR/comparison_results.csv" \
+            --baseline-csv   "$BASELINE_CSV" \
+            --model-stats    "$COMPARISON_DIR/comparison_stats.json" \
+            --baseline-stats "$BASELINE_STATS" \
+            --output-dir     "$COMPARISON_DIR/vs_baseline"
+        if [ $? -ne 0 ]; then
+            echo "Warning: Baseline comparison failed for $MODEL_NAME (continuing)"
+        fi
+    else
+        echo "  → Baseline files not found; skipping baseline comparison."
     fi
 
     echo ""

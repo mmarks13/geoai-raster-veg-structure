@@ -36,6 +36,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.ops import StochasticDepth
 from tqdm import tqdm
 
 # Add project root to path for src imports (avoids PYTHONPATH requirement)
@@ -65,6 +66,9 @@ def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
 
     Switches dropout modules to training mode so they apply dropout
     during inference. BatchNorm layers are NOT affected (remain in eval mode).
+    StochasticDepth (DropPath) layers are explicitly forced back to eval mode
+    because parent .train() calls recurse into children — we only want to
+    vary weight/activation dropout, not drop entire residual branches.
 
     Args:
         model: Model in eval mode
@@ -84,12 +88,13 @@ def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
 
     # Custom classes that use F.dropout with training=self.training
     custom_dropout_class_names = (
-        'DistanceMaskedAttention',
+        # Shared / point cloud attention classes
         'CrossAttentionFusion',
         'PositionEnhancedCrossAttention',
-        'GridCrossAttentionLayer',
         'PointTransformerConv',  # Uses dropout in attention
         'LocalGlobalPointAttentionBlock',  # Contains dropout layers
+        # Raster head primitive (src/models/raster_primitives.py)
+        'GaussianDistanceBiasedCrossAttention',
     )
 
     for name, module in model.named_modules():
@@ -103,6 +108,15 @@ def enable_mc_dropout(model: nn.Module) -> List[nn.Module]:
             if not module.training:
                 module.train()
                 modified.append(module)
+
+    # Force all StochasticDepth (DropPath) layers to eval mode. Parent modules
+    # toggled above would otherwise recursively put these children in train
+    # mode, which changes network topology per sample rather than approximating
+    # Bayesian weight uncertainty. MC dropout should only vary weight/activation
+    # dropout, not residual-branch drops.
+    for module in model.modules():
+        if isinstance(module, StochasticDepth) and module.training:
+            module.eval()
 
     return modified
 
@@ -203,7 +217,6 @@ def build_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> n
             use_uavsar=config_dict.get('use_uavsar', True),
             img_embed_dim=config_dict.get('img_embed_dim', 256),
             img_num_patches=config_dict.get('img_num_patches', 16),
-            fusion_type=config_dict.get('fusion_type', 'cross_attention'),
             max_dist_ratio=config_dict.get('max_dist_ratio', 5.0),
             fusion_num_heads=config_dict.get('fusion_num_heads', 4),
             fusion_dropout=config_dict.get('fusion_dropout', 0.1),
@@ -218,17 +231,9 @@ def build_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> n
             raster_num_heads=config_dict.get('raster_num_heads', 8),
             # RASTER MODEL: Support both old 'raster_radius' and new 'raster_distance_sigma'
             # Converts old radius to sigma if found, else uses sigma directly, else default 2.0
-            raster_distance_sigma=config_dict.get('raster_distance_sigma', 
+            raster_distance_sigma=config_dict.get('raster_distance_sigma',
                 config_dict.get('raster_radius', 2.0)),  # Backwards compat
-            raster_hidden_dim=config_dict.get('raster_hidden_dim', 512),
-            raster_decoder_layers=config_dict.get('raster_decoder_layers', 4),
-            raster_dropout=config_dict.get('raster_dropout', 0.1),
-            num_pre_agg_blocks=config_dict.get('num_pre_agg_blocks', 1),
-            pre_agg_lcl_heads=config_dict.get('pre_agg_lcl_heads', 4),
-            pre_agg_glbl_heads=config_dict.get('pre_agg_glbl_heads', 4),
-                pre_agg_dropout=config_dict.get('pre_agg_dropout', 0.1),
-                pre_agg_k_neighbors=config_dict.get('pre_agg_k_neighbors', 15),
-            )
+        )
     else:
         # Use defaults matching run_raster_model.py
         logger.warning("No config found in checkpoint, using defaults")
@@ -240,9 +245,6 @@ def build_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> n
             img_embed_dim=256,
             n_bands=2,
             target_band_indices=[11, 7],
-            raster_hidden_dim=512,
-            raster_decoder_layers=4,
-            num_pre_agg_blocks=1,
         )
     
     logger.info(f"Model config: use_naip={config.use_naip}, use_uavsar={config.use_uavsar}")

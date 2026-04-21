@@ -71,7 +71,9 @@ class ImageEncoderPretrainConfig:
     aug_naip_erasing_prob: float = 0.0
     aug_naip_sharpness_range: tuple = (0.5, 1.5)
     aug_naip_sharpness_prob: float = 0.1
-    aug_naip_equalize_prob: float = 0.1
+    aug_naip_radiometric_prob: float = 0.0   # Master probability for z-score gain/bias augmentation
+    aug_naip_radiometric_strength: float = 1.0  # 1.0 = base ranges; <1 shrinks them, >1 widens them
+    aug_naip_post_clip_range: tuple = (-4.0, 4.0)  # Final z-score clamp after the radiometric step
 
     # UAVSAR augmentation
     aug_uavsar_noise_sigma: float = 0.05
@@ -145,6 +147,14 @@ class ImageEncoderPretrainConfig:
     aug_point_max_removal_ratio: float = 0.0
     aug_point_min_points: int = 20
 
+    # OOD validation — disabled for pretraining. The training loop reads
+    # these unconditionally (even when OOD is off), so they must exist.
+    ood_val_enabled: bool = False
+    ood_val_tiles_path: Optional[str] = None
+    ood_val_metadata_path: Optional[str] = None
+    ood_val_every_n_epochs: int = 5
+    ood_val_band_config_path: Optional[str] = None
+
     def __post_init__(self):
         """Set modality flags based on encoder_type."""
         if self.encoder_type == "naip":
@@ -162,7 +172,7 @@ class BasicImageRasterHead(nn.Module):
 
     Takes patch embeddings [16, embed_dim] and predicts fuel metrics [n_bands, 5, 5].
 
-    Spatial conventions match GridCrossAttentionFusion for transfer learning:
+    Spatial conventions match the production raster head for transfer learning:
     - Patches at [-7.5, -2.5, 2.5, 7.5]m (20×20m imagery, 4×4 grid)
     - Target grid at [-4, -2, 0, 2, 4]m (10×10m target, 5×5 grid)
     - Sinusoidal positional encoding ADDED to embeddings (not concatenated)
@@ -188,13 +198,13 @@ class BasicImageRasterHead(nn.Module):
         self.grid_in = 4  # 16 patches = 4×4 grid
         self.grid_out = 5  # Output 5×5 grid
 
-        # Reuse PatchPositionEncoding from GridCrossAttentionFusion
-        # This ensures identical positional encoding for transfer learning
-        from src.models.grid_cross_attention import PatchPositionEncoding
+        # Reuse PatchPositionEncoding from the production raster head primitives
+        # to ensure identical positional encoding for transfer learning.
+        from src.models.raster_primitives import PatchPositionEncoding
         self.patch_pos_encoding = PatchPositionEncoding(
             feature_dim=embed_dim,
             patch_grid_size=4,
-            patch_extent=20.0
+            patch_extent_m=20.0,
         )
 
         # Precompute grid_sample coordinates for correct spatial mapping
@@ -231,7 +241,7 @@ class BasicImageRasterHead(nn.Module):
         Returns:
             raster: [n_bands, 5, 5] predicted fuel metrics
         """
-        # Add positional encoding (matches GridCrossAttentionFusion additive approach)
+        # Add positional encoding (matches the raster head's additive approach)
         pos_enc, _ = self.patch_pos_encoding()  # [16, embed_dim]
         patch_with_pos = patch_embeddings + pos_enc  # Additive, not concatenation
 

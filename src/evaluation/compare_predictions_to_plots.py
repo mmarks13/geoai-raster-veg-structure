@@ -1363,8 +1363,38 @@ def main():
         default=None,
         help='Optional: Directory containing baseline raster GeoTIFFs for 3-way comparison (pattern: {site}/veg_structure_2m.tif)'
     )
+    parser.add_argument(
+        '--exclude-plots-file',
+        type=str,
+        default=None,
+        help='Optional: Path to a text file listing plot IDs (one per line) to exclude '
+             'from the comparison. Used to hold out the OOD-training validation plots '
+             'from the final §7 evaluation so they are not double-counted.'
+    )
 
     args = parser.parse_args()
+
+    # Load exclusion list (plot IDs that were used for in-training OOD validation)
+    excluded_plot_ids = set()
+    if args.exclude_plots_file:
+        exclude_path = Path(args.exclude_plots_file)
+        if not exclude_path.exists():
+            raise FileNotFoundError(
+                f"--exclude-plots-file not found: {exclude_path}"
+            )
+        with open(exclude_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                try:
+                    excluded_plot_ids.add(int(line))
+                except ValueError:
+                    excluded_plot_ids.add(line)
+        logger.info(
+            f"Loaded {len(excluded_plot_ids)} plot IDs to exclude from "
+            f"{exclude_path}: {sorted(excluded_plot_ids)}"
+        )
     
     # Setup
     output_dir = Path(args.output)
@@ -1422,6 +1452,18 @@ def main():
                 how='left'
             )
             logger.info(f"Merged uncertainty values for {len(unc_df)} plots")
+
+    # Drop plots that were used for in-training OOD validation (if any).
+    # The filter is applied *after* extraction so the saved comparison_results.csv
+    # reflects the final §7 sample, matching whatever was used for statistics.
+    if excluded_plot_ids:
+        before_n = len(comparison_df)
+        comparison_df = comparison_df[~comparison_df['plot_id'].isin(excluded_plot_ids)].copy()
+        after_n = len(comparison_df)
+        logger.info(
+            f"Excluded {before_n - after_n} OOD-training plots from §7 comparison "
+            f"({before_n} → {after_n} rows)"
+        )
 
     # Save comparison results
     results_path = output_dir / 'comparison_results.csv'
