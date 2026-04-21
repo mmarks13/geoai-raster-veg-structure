@@ -1,83 +1,67 @@
 # Data Preparation
 
-Data acquisition, preprocessing, and training data generation using STAC-based workflows.
+Data acquisition, preprocessing, and training-data generation using STAC-based workflows. Supports both the **raster vegetation-structure pipeline (active)** and the **point-cloud upsampling pipeline (historical)**.
 
-## Main Workflow
+## STAC catalog creation (shared)
 
-Scripts called by `scripts/get_data.sh` and `scripts/process_data.sh` to create training-ready PyTorch files.
+- `make_local_naip_stac.py` — NAIP optical imagery from Microsoft Planetary Computer.
+- `make_local_uavsar_stac.py` — UAVSAR L-band SAR from Alaska Satellite Facility.
+- `make_local_3dep_stac.py` — 3DEP LiDAR. Supports building a catalog from the pre-processed 3DEP HAG features (`--mode processed --input-dir data/processed/3dep_hag_features`).
+- `make_local_uavlidar_stac.py` — catalog UAV LiDAR ground truth from local `.las/.laz`.
 
-### Data Acquisition (STAC Catalog Creation)
+## 3DEP HAG + enhanced features
 
-- `make_local_naip_stac.py` - Query Planetary Computer for NAIP optical imagery, download full-resolution COGs, crop to bounding boxes, create local STAC catalog
-- `make_local_uavsar_stac.py` - Download UAVSAR L-band SAR data from Alaska Satellite Facility, create local STAC catalog
-- `make_local_3dep_stac.py` - Download 3DEP LiDAR point clouds from Planetary Computer, create local STAC catalog
-- `make_local_uavlidar_stac.py` - Catalog UAV LiDAR ground truth point clouds from local files
+- `download_3dep_for_sites.py`, `download_and_process_3dep_sites.py` — pull 3DEP tiles from Planetary Computer and run the PDAL pipeline that adds Height Above Ground, Planarity, Sphericity, Verticality, and writes a COPC. Driven by `scripts/process_3dep_hag_features.sh`.
 
-### Training Data Generation
+## Raster pipeline (active)
 
-- `generate_training_data.py` - Generate 10m×10m training tiles by querying STAC catalogs for each tile geometry, combining UAV LiDAR, 3DEP LiDAR, UAVSAR, and NAIP data into HDF5 files
-- `train_test_split_and_precompute.py` - Split combined training data into train/val/test sets based on spatial polygons, apply quality filters (minimum points, coverage), precompute KNN graphs and normalized features, save as PyTorch files
+- `create_tile_grid.py` — pixel-aligned 10 m tile grid with 20 % overlap, per site.
+- `generate_training_data_raster.py` — per-tile extraction of 3DEP points, NAIP stacks, UAVSAR stacks, and the vegetation-structure target raster.
+- `train_test_split_and_precompute_raster.py` — spatial train/val split, two-stage coord normalization (bbox → z-score), precompute tile dicts. Writes global normalization stats.
+- `data_augmentation_raster.py` — offline augmented-tile generation (complement to online GPU augmentation during training).
+- `validate_preprocessed_raster.py`, `validate_raster_training_data.py` — sanity checks.
+- `create_forest_plot_tile_grid.py`, `preprocess_forest_plots_for_inference.py`, `build_ood_validation_set.py` — tiles and inputs for the 4 OOD forest-plot validation sites.
 
-### Data Augmentation
+Driven by `scripts/process_data_raster_v2.sh`.
 
-- `data_augmentation.py` - Generate augmented training tiles using geometric transformations and point perturbations
+## Point cloud pipeline (historical)
 
-## Supporting Utilities
+- `generate_training_data.py` — generate 10 m × 10 m training tiles (point-cloud targets).
+- `train_test_split_and_precompute.py` — split + precompute KNN graphs + normalize (single-stage bbox normalization only).
+- `data_augmentation.py` — augmented tile generation.
 
-Internal utilities called by main workflow scripts:
+Driven by `scripts/process_data.sh`.
 
-- `process_uav_lidar.py` - Process raw UAV LiDAR files
-- `create_training_tile_bboxes.py` - Generate tile bounding box geometries
-- `h5_chunk_loader.py` - Combine HDF5 training data chunks into single PyTorch file
-- `pointcloud_footprints_to_geojson.py` - Export point cloud footprints to GeoJSON for visualization
-- `bbox_tile_filter.py` - Filter tiles by bounding box region
-- `imagery_stac.py` - STAC utilities for imagery data loading (imported by generate_training_data.py)
-- `imagery_training_data.py` - Imagery data extraction for training tiles
-- `las_to_copc_stac.py` - Convert LAS files to Cloud-Optimized Point Cloud (COPC) format and create STAC entries
-- `process_pointcloud_stac.py` - Point cloud processing utilities (gridding, aggregation)
-- `compress_las.py` - Compress .las files to .laz format
+## Supporting utilities
+
+- `process_uav_lidar.py` — process raw UAV LiDAR files.
+- `create_training_tile_bboxes.py` — tile bounding box generator (used by the historical pipeline).
+- `h5_chunk_loader.py` — combine HDF5 training data chunks into a single `.pt`.
+- `imagery_stac.py`, `imagery_training_data.py` — imagery STAC loading and per-tile extraction helpers.
+- `las_to_copc_stac.py` — convert LAS to COPC and create STAC entries.
+- `process_pointcloud_stac.py` — point-cloud STAC gridding/aggregation utilities.
+- `pointcloud_footprints_to_geojson.py` — export point cloud footprints.
+- `bbox_tile_filter.py` — filter tiles by bbox region.
+- `compress_las.py` — `.las` → `.laz`.
 
 ## Subfolders
 
 ### `legacy/`
-
-Superseded implementations replaced by improved versions:
-
-- `split_train_test_val_tiles.py` - Splits PyTorch tiles into train/val/test sets based on spatial polygons with quality filters
-  - **Replaced by:** `train_test_split_and_precompute.py` (combines splitting and precomputation in one script)
-
-- `precompute_data.py` - Precomputes KNN graphs and normalized features for training tiles
-  - **Replaced by:** `train_test_split_and_precompute.py` (combines splitting and precomputation in one script)
+Superseded implementations (split and precompute were previously separate scripts, etc.).
 
 ### `unused_alternatives/`
+- `uavsar_to_stac.py` — builds a STAC from pre-downloaded UAVSAR; the active workflow downloads directly from ASF.
+- `wv2_to_stac.py` — WorldView-2 ingestion; the project uses NAIP instead.
 
-Alternative approaches explored but not used in published work:
+## Typical raster workflow
 
-- `uavsar_to_stac.py` - Creates STAC catalog for UAVSAR products from local COG files
-  - **Why unused:** Alternative workflow that assumes pre-downloaded UAVSAR data; published workflow uses `make_local_uavsar_stac.py` which downloads directly from Alaska Satellite Facility
-
-- `wv2_to_stac.py` - Processes WorldView-2 satellite imagery with orthorectification and TOA reflectance conversion
-  - **Why unused:** WorldView-2 is a commercial high-resolution optical alternative to NAIP; published work uses NAIP (freely available from Planetary Computer)
-
-## Workflow
-
-1. **Download remote sensing data:**
-   ```bash
-   ./scripts/get_data.sh
-   ```
-   Calls: `make_local_naip_stac.py`, `make_local_uavsar_stac.py`, `make_local_uavlidar_stac.py`
-
-2. **Generate and process training tiles:**
-   ```bash
-   ./scripts/process_data.sh
-   ```
-   Calls: `generate_training_data.py`, `h5_chunk_loader.py`, `train_test_split_and_precompute.py`
-
-3. **Output:**
-   - `data/processed/model_data/precomputed_training_tiles_32bit.pt`
-   - `data/processed/model_data/precomputed_validation_tiles_32bit.pt`
-   - `data/processed/model_data/precomputed_test_tiles_32bit.pt`
+```bash
+bash scripts/get_data.sh                       # STAC catalogs (shared)
+bash scripts/process_3dep_hag_features.sh      # 3DEP HAG + geometric features
+bash scripts/veg_structure_metrics/run_all_sites.sh   # UAV-LiDAR ground truth rasters
+bash scripts/process_data_raster_v2.sh         # Tile grid → extraction → split → precompute
+```
 
 ---
 
-See [../../README.md](../../README.md) for complete workflow documentation.
+See [../../README.md](../../README.md) and [../../CLAUDE.md](../../CLAUDE.md).

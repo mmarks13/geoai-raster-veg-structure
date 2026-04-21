@@ -1,77 +1,38 @@
 # Evaluation
 
-Inference, statistical analysis, and manuscript figure generation.
+Inference, forest plot evaluation, baselines, and manuscript figure generation.
 
-## Main Workflow
+## Active: raster model evaluation
 
-Scripts for generating published results and figures:
+- `raster_inference.py` — inference on the raster vegetation-structure model. `enable_mc_dropout()` keeps dropout active at eval time so multiple stochastic forward passes produce a predictive mean and uncertainty.
+- `compute_3dep_baseline_metrics.py` — **3DEP-only baseline.** Applies the Moudry vegetation-structure pipeline (`compute_vegetation_structure_metrics` from `src/utils/point_cloud_utils.py`) directly to sparse 3DEP point clouds at the validation sites. Produces a LiDAR-only reference to isolate the multimodal-fusion value-add of the trained model.
+- `configs/raster/` — band configs governing which vegetation-structure bands are trained/evaluated in a given run (e.g., `veg_structure_4band.json`, `veg_structure_3band.json`, `veg_structure_baseline.json`, plus OOD variants).
 
-- `inference_eval.py` - Run model inference on test set
-  - Loads trained model checkpoints
-  - Generates predictions for test tiles
-  - Computes Chamfer distance metrics
-  - Saves results for downstream analysis
+**Forest plot evaluation** (4 OOD sites: BluffMesa, NorthBigBear, ReyesPeak, Laguna) is orchestrated by:
 
-- `generate_eval_df.py` - Generate evaluation dataframes
-  - Aggregates inference results into structured dataframes
-  - Computes summary statistics
-  - Prepares data for statistical tests
+```bash
+bash scripts/evaluate_forest_plots.sh \
+    --model <checkpoint.pth> \
+    --band-config <config.json> \
+    --multi-gpu \
+    --mc-samples <N> \
+    --batch-size <B>
+```
 
-- `RQ_test_v2.py` - Statistical tests for research questions
-  - Performs statistical hypothesis tests
-  - Compares ablation study variants
-  - Generates significance test results for manuscript
+Laguna has no UAVSAR — the model handles this via graceful degradation at inference (skips the UAVSAR fusion branch when `uavsar=None`).
 
-- `manuscript_figures.py` - Generate publication figures
-  - Creates all figures used in the manuscript
-  - Point cloud visualizations
-  - Performance comparisons
-  - Ablation study results
+## Historical: point cloud upsampling (published)
 
-## Development Tools
+- `inference_eval.py` — model inference on the point-cloud test set; Chamfer distance metrics.
+- `generate_eval_df.py` — aggregates inference results into evaluation dataframes.
+- `RQ_test_v2.py` — statistical tests (Wilcoxon, effect sizes) for the published research questions.
+- `manuscript_figures.py` — figures for the *Remote Sensing* (2025) paper.
 
-Utilities for model development and analysis (not part of published workflow):
+## Development tools (not in any published workflow)
 
-- `val_eval.py` - Validation evaluation utilities
-  - Functions for evaluating models on validation set
-  - Imported by `model_val_report.py`
-
-- `model_val_report.py` - Generate validation reports
-  - Creates detailed PDF reports for model validation
-  - 3D point cloud visualizations
-  - Per-sample metrics
-
-- `model_comparison_report.py` - Multi-model comparison reports
-  - Side-by-side model comparison with 3D visualizations
-  - Chamfer distance comparisons
-  - High-loss and high-improvement sample analysis
-
-- `df_based_model_comparison_report.py` - DataFrame-based model comparison
-  - Alternative comparison visualization approach
-  - Uses pre-computed evaluation dataframes
-
-## Typical Evaluation Workflow
-
-1. **Run inference:**
-   ```python
-   python src/evaluation/inference_eval.py --model-path [checkpoint] --test-data [test_tiles.pt]
-   ```
-
-2. **Generate evaluation dataframes:**
-   ```python
-   python src/evaluation/generate_eval_df.py
-   ```
-
-3. **Perform statistical tests:**
-   ```python
-   python src/evaluation/RQ_test_v2.py
-   ```
-
-4. **Create manuscript figures:**
-   ```python
-   python src/evaluation/manuscript_figures.py
-   ```
+- `val_eval.py`, `model_val_report.py` — validation evaluation utilities and PDF reporting.
+- `model_comparison_report.py`, `df_based_model_comparison_report.py` — multi-model comparison reports with 3D point-cloud visualizations.
 
 ---
 
-See [../../README.md](../../README.md) for complete workflow documentation.
+See [../../README.md](../../README.md) and [../../CLAUDE.md](../../CLAUDE.md).

@@ -1,45 +1,51 @@
 # Source Code
 
-Source code for the multimodal LiDAR point cloud enhancement model using Local-Global Point Attention Blocks (LG-PAB).
+Source code for multimodal fusion of sparse 3DEP LiDAR, NAIP optical imagery, and UAVSAR L-band SAR.
+
+Two pipelines share the encoder backbone:
+
+- **Raster vegetation-structure prediction (active).** Predicts a multi-band vegetation-structure raster per tile using the standardized metric family of Moudry et al. (2023). Entry point: `run_raster_model.py`.
+- **Point cloud upsampling (published historical).** Predicts dense UAV-quality point clouds from sparse 3DEP. Published in *Remote Sensing* (2025). Entry points: `run_model_test.py`, `run_ablation_study.py`.
 
 ## Directory Structure
 
 ### `data_prep/`
-Data acquisition, preprocessing, and training data generation. Downloads remote sensing data via STAC catalogs, generates 10m×10m training tiles, splits into train/val/test sets, and precomputes KNN graphs and normalized features. Called by `scripts/get_data.sh` and `scripts/process_data.sh`.
+Data acquisition, preprocessing, and training-data generation. STAC catalog builders for NAIP, UAVSAR, 3DEP, and UAV LiDAR; tile grid creation; per-tile data extraction (raster and point-cloud variants); train/val/test split; precompute. Called from `scripts/` shell pipelines.
 
 ### `models/`
-Model architecture implementation including the main multimodal LG-PAB model, Vision Transformer encoders for NAIP/UAVSAR imagery, and cross-attention fusion modules.
+Shared encoder and raster decoder. Includes the multimodal point-attention model (LG-PAB), ViT image encoders for NAIP / UAVSAR, cross-attention fusion, the raster decoder (learnable grid queries + distance-biased cross-attention + MLP head), and online GPU augmentation.
 
 ### `training/`
-Training infrastructure with distributed data parallel (DDP) support. Main training loop, ablation study orchestration, and utility functions for multi-GPU training.
+Training loops with DDP support. `raster_training.py` is the active loop (heteroscedastic Gaussian NLL / Huber, MC Dropout, SWA, spectral norm, online augmentation). `multimodal_training.py` is the historical PC-upsampling loop. Datasets and DDP utilities live here too.
 
 ### `evaluation/`
-Inference, statistical analysis, and figure generation. Runs model inference on test sets, generates evaluation dataframes, performs statistical tests for research questions, and creates manuscript figures.
+Inference, forest-plot evaluation (4 OOD sites), 3DEP-only baseline (same Moudry metric pipeline applied to sparse 3DEP for isolating fusion value-add), band configs, and statistical/figure tooling from the published paper.
 
 ### `utils/`
-Core utility functions for point cloud processing, Chamfer distance metric computation, and GPU-accelerated KNN graph generation.
+Core utilities: vegetation-structure metric computation (`compute_vegetation_structure_metrics`), Chamfer distance (published PC loss), GPU KNN graphs, point cloud helpers.
+
+### `raster_mapping/`
+Forest plot visualization helpers.
+
+### `fuel_metrics/` (legacy)
+LidarForFuel Python wrappers and orchestration. Was the initial raster target before the pivot to Moudry vegetation-structure metrics. Code retained; may be revisited.
 
 ## Legacy and Unused Code
 
 Each subdirectory may contain:
-- `legacy/` - Superseded implementations replaced by improved versions
-- `unused_alternatives/` - Alternative approaches explored but not used in published work
-
-See individual folder READMEs for details.
+- `legacy/` — superseded implementations (mostly from the PC-upsampling era).
+- `unused_alternatives/` — explored but not used in the published work.
 
 ## Entry Points
 
-Model training is initiated through root-level scripts:
-- `run_ablation_study.py` - Runs all ablation experiments (baseline, NAIP-only, UAVSAR-only, fused)
-- `run_model_test.py` - Trains a single model configuration
+All entry points live at the repo root:
 
-Both scripts:
-1. Import `MultimodalModelConfig` from `src/models/multimodal_model`
-2. Import training functions from `src/training/multimodal_training`
-3. Load precomputed data from `data/processed/model_data/`
-4. Configure model parameters and training hyperparameters
-5. Save checkpoints to `data/output/checkpoints/`
+- `run_raster_model.py` — train the active raster model.
+- `run_raster_cross_attn_grid_mlp_sweep.py` — architecture/hyperparameter sweep.
+- `run_pretrain_image_encoders.py` — pretrain NAIP / UAVSAR encoders before the main raster training.
+- `run_model_test.py` — train a single point-cloud upsampling model (historical).
+- `run_ablation_study.py` — published PC-upsampling ablations (baseline / NAIP / UAVSAR / fused).
 
 ---
 
-See [../README.md](../README.md) for complete workflow documentation.
+See [../README.md](../README.md) for the public-facing project overview and [../CLAUDE.md](../CLAUDE.md) for internal project memory.

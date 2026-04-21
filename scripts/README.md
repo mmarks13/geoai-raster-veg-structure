@@ -1,84 +1,59 @@
 # Data Pipeline Scripts
 
-End-to-end shell scripts for orchestrating data acquisition and preprocessing.
+End-to-end shell scripts for data acquisition, preprocessing, ground-truth generation, and evaluation.
 
-## Scripts
+## Shared acquisition
 
-### get_data.sh
-
+### `get_data.sh`
 Downloads and catalogs remote sensing data for the study regions.
+- NAIP optical (Planetary Computer)
+- UAVSAR L-band SAR (Alaska Satellite Facility — requires EarthData credentials)
+- 3DEP LiDAR (Planetary Computer)
+- UAV LiDAR (cataloged from `data/raw/uavlidar/study_las/`)
 
-**Calls:**
-- `src/data_prep/make_local_uavsar_stac.py` - Downloads UAVSAR L-band SAR from Alaska Satellite Facility
-- `src/data_prep/make_local_uavlidar_stac.py` - Catalogs UAV LiDAR ground truth point clouds
-- `src/data_prep/make_local_naip_stac.py` - Downloads NAIP optical imagery from Microsoft Planetary Computer
-- `src/data_prep/make_local_3dep_stac.py` - Downloads 3DEP LiDAR (commented out, data pre-downloaded)
+**Output:** local STAC catalogs in `data/stac/`.
 
-**Requirements:**
-- EARTHDATA credentials (username/password) for UAVSAR downloads
-- Study region bounding boxes: Southern California (2 regions)
-- Date range: 2014-2025
+## Raster pipeline (active)
 
-**Output:** Local STAC catalogs in `data/stac/` for each data source
+### `process_data_raster_v2.sh`
+Full raster-pipeline preprocessing: tile grid → per-tile 3DEP/NAIP/UAVSAR + vegetation-structure-target extraction → spatial train/val split → two-stage coord normalization (bbox → z-score) → precompute. Writes `data/processed/model_data_raster/precomputed_*_tiles_raster_32bit.pt` and normalization stats JSONs.
 
----
+### `process_3dep_hag_features.sh`
+Runs the PDAL pipeline that adds Height Above Ground, Planarity, Sphericity, and Verticality to each 3DEP site and writes a COPC-format output. Enables efficient per-tile spatial queries during tile extraction. Output: `data/processed/3dep_hag_features/<site>/<site>_hag_features.copc.laz`.
 
-### process_data.sh
+### `veg_structure_metrics/`
+Generates UAV-LiDAR ground-truth metric rasters (Moudry et al.).
+- `run_all_sites.sh` — process all training sites.
+- `process_single_site.sh` — per-site: ground classification (SMRF), HAG, outlier filtering, metric computation at 2 m resolution, output GeoTIFF + visualization.
+- `process_large_site.sh` — variant for larger-extent sites.
+- `pdal/` — PDAL pipeline templates.
 
-Processes downloaded data into training-ready PyTorch files.
+### `evaluate_forest_plots.sh`
+Forest plot evaluation on the 4 OOD sites (BluffMesa, NorthBigBear, ReyesPeak, Laguna). Supports multi-GPU inference and MC-Dropout sampling.
+```bash
+bash scripts/evaluate_forest_plots.sh \
+    --model <checkpoint.pth> \
+    --band-config src/evaluation/configs/raster/<config>.json \
+    --multi-gpu \
+    --mc-samples <N> \
+    --batch-size <B>
+```
 
-**Active step:**
-- `src/data_prep/train_test_split_and_precompute.py` - Splits combined training data into train/val/test sets, filters by quality criteria, precomputes KNN graphs and normalized features
+## Point cloud pipeline (historical)
 
-**Commented workflow (already completed):**
-- `src/data_prep/process_uav_lidar.py` - Process raw UAV LiDAR
-- `src/data_prep/create_training_tile_bboxes.py` - Generate tile bounding boxes
-- `src/data_prep/generate_training_data.py` - Generate 10m×10m training tiles from STAC catalogs
-- `src/data_prep/h5_chunk_loader.py` - Combine data chunks into single PyTorch file
-- `src/data_prep/pointcloud_footprints_to_geojson.py` - Export footprints for visualization
-- `src/data_prep/data_augmentation.py` - Generate augmented training data
-- `src/data_prep/bbox_tile_filter.py` - Filter tiles by region
+### `process_data.sh`
+Preprocessing for the published point-cloud upsampling model: tile generation, spatial split, KNN-graph precompute, single-stage bbox normalization.
 
-**Note:** Most steps are commented out as they represent the initial data preparation workflow that has been completed. The active step (`train_test_split_and_precompute.py`) can be re-run to regenerate splits with different quality criteria.
+## Utility
 
-**Input:** `data/processed/model_data/combined_training_data_v3.pt`
+### `compress_las_files.sh`
+Compress `.las` → `.laz` with `laszip`. Reduces storage of raw UAV LiDAR.
 
-**Output:**
-- `data/processed/model_data/precomputed_training_tiles_32bit.pt`
-- `data/processed/model_data/precomputed_validation_tiles_32bit.pt`
-- `data/processed/model_data/precomputed_test_tiles_32bit.pt`
+## Legacy: fuel metrics
 
----
-
-### compress_las_files.sh
-
-Utility script for compressing LAS point cloud files to LAZ format using `laszip`.
-
-**Purpose:** Reduces storage requirements for raw UAV LiDAR data.
-
-**Input:** `uavlidar/original_las/*.las`
-
-**Output:** `uavlidar/original_las/compressed/*.laz`
-
-**Usage:** Run once to compress raw data files.
+### `fuel_metrics/`
+LidarForFuel (R) pipeline scripts: ground classification + tiling in a single PDAL pass, pretreatment, per-tile fuel metric computation, merging. The project pivoted away from this target; code is retained for possible revisit. See `src/fuel_metrics/README.md` for operational specifics.
 
 ---
 
-## Typical Workflow
-
-1. **First time setup:**
-   ```bash
-   ./scripts/get_data.sh          # Download all remote sensing data
-   ./scripts/compress_las_files.sh # (Optional) Compress raw LiDAR
-   ```
-
-2. **Data processing** (most steps already completed):
-   ```bash
-   ./scripts/process_data.sh      # Run train/test split and precomputation
-   ```
-
-3. **Training:** See root-level `run_ablation_study.py` or `run_model_test.py`
-
----
-
-See [../README.md](../README.md) for complete workflow documentation.
+See [../README.md](../README.md) and [../CLAUDE.md](../CLAUDE.md).

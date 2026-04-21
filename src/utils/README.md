@@ -1,49 +1,24 @@
 # Utilities
 
-Core utility functions for point cloud processing and metrics.
+Core utility functions for point clouds, metrics, and raster ground-truth generation.
 
-## Active Files
+## Active files
 
-- `chamfer_distance.py` - Point cloud reconstruction metric
-  - GPU-accelerated Chamfer distance computation using PyTorch3D
-  - **Training:** Density-aware variant (α=4) for meter-scale coordinates
-  - **Evaluation:** Standard bidirectional Chamfer distance
-  - Computes nearest neighbor distance between predicted and ground truth point clouds
-
-- `knn_graph_gpu.py` - GPU-accelerated KNN graph generation
-  - Efficient k-nearest neighbor graph construction on GPU
-  - Used by model for local attention computation
-  - Precomputed during data preparation to accelerate training
-
-- `point_cloud_utils.py` - Point cloud processing utilities
-  - Various helper functions for point cloud manipulation
-  - Normalization, transformation, and sampling utilities
+- `point_cloud_utils.py` — point cloud helpers and the vegetation-structure metric computation.
+  - `compute_vegetation_structure_metrics()` — computes the standardized metric raster from Moudry et al. (2023): max/mean/std height, canopy cover, canopy/mid-story/understory density, foliage height diversity (Shannon–Wiener), height percentiles, and per-layer density proportions.
+  - Used both for generating UAV-LiDAR ground truth (`scripts/veg_structure_metrics/`) and the 3DEP-only baseline (`src/evaluation/compute_3dep_baseline_metrics.py`).
+  - Also contains normalization / transformation / sampling utilities.
+- `chamfer_distance.py` — point cloud reconstruction metric (GPU, PyTorch3D-backed). Density-aware α=4 variant for training the published PC-upsampling model; standard bidirectional variant for evaluation.
+- `knn_graph_gpu.py` — GPU-accelerated k-nearest-neighbor graph construction. Used by the PC-upsampling pipeline (precomputed during data prep to accelerate training).
 
 ## Subfolders
 
 ### `unused_alternatives/`
-
-Alternative approaches and utilities not used in published work:
-
-- `infocd.py` - InfoCD loss function with repulsion term
-  - **Purpose:** Alternative to Chamfer Distance for point cloud reconstruction
-  - **Features:** Information-theoretic Chamfer Distance (Lin et al., NeurIPS 2023) with softmax temperature and repulsion loss
-  - **Why unused:** Chamfer Distance proved sufficient for published work; InfoCD adds complexity without significant improvement for this application
-
-- `training_data_eval.py` - Training data quality evaluation and filtering
-  - **Purpose:** Filter invalid training tiles based on point count thresholds and shape validation
-  - **Functions:** `filter_invalid_shapes()` for detecting empty/malformed point clouds, `load_tile_from_h5()` for inspecting HDF5 tiles
-  - **Why unused:** Quality filtering now handled in `train_test_split_and_precompute.py` during data preparation
-
-- `dtm_calc.py` - Digital Terrain Model (DTM) calculation utilities
-  - **Purpose:** Generate DTMs from point clouds using various interpolation methods
-  - **Methods:** Raster minimum-z gridding, Progressive Morphological Filter, kriging
-  - **Why unused:** Published work focuses on point cloud reconstruction, not DTM generation
-
-- `octree_downsampling.py` - Octree-based point cloud downsampling
-  - **Purpose:** Hierarchical octree downsampling for reducing point cloud density
-  - **Why unused:** Anisotropic voxel downsampling (in `train_test_split_and_precompute.py`) used instead
+- `infocd.py` — information-theoretic Chamfer distance (alternative training loss; not shipped).
+- `training_data_eval.py` — filter invalid tiles; quality filtering now happens in `train_test_split_and_precompute*.py`.
+- `dtm_calc.py` — DTM generation utilities (project focuses on vegetation structure, not DTMs).
+- `octree_downsampling.py` — octree downsampling (anisotropic voxel downsampling used instead).
 
 ---
 
-See [../../README.md](../../README.md) for complete workflow documentation.
+See [../../README.md](../../README.md) and [../../CLAUDE.md](../../CLAUDE.md).

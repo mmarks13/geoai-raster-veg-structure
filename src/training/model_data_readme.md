@@ -1,73 +1,82 @@
-# Precomputed Data Structure
+# Precomputed Tile Data Structures
 
-This document describes the structure of the precomputed data files:
-- `precomputed_training_tiles.pt`
-- `precomputed_validation_tiles.pt`
-- `precomputed_test_tiles.pt`
+Two pipelines produce precomputed `.pt` tile files with closely related schemas:
 
-## Overview
+- **Raster pipeline (active)** — `data/processed/model_data_raster/precomputed_*_tiles_raster_32bit.pt` and `augmented_tiles_raster_32bit.pt`.
+- **Point cloud pipeline (historical)** — `data/processed/model_data/precomputed_{training,validation,test}_tiles_32bit.pt` and `augmented_tiles_32bit_16k_no_repl.pt`.
 
-Each file contains a list of dictionaries, where each dictionary represents a precomputed "tile" with normalized point cloud data, grid indices, KNN edge indices, and preprocessed imagery data.
+Each file is a **list of dictionaries**, one per tile. A tile is a 10 m × 10 m region in EPSG:32611 (UTM 11N).
 
-Each tile represents a 10x10m section of the earth's surface in EPSG:32611 coordinate system. These tiles serve as training samples for a PyTorch model designed to upsample 3DEP point clouds based on the UAV point cloud ground truth.
+---
 
-## Tile Structure
+## Raster pipeline tile schema
 
-Each tile dictionary contains the following top-level keys:
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `dep_points_norm` | Tensor | `[N, 3]` | z-scored 3DEP points. X,Y centered at tile center; Z = Height Above Ground. Stage-2 z-score applied per axis. |
+| `dep_points_attr_norm` | Tensor | `[N, 3]` | z-scored point attributes: `[Intensity, ReturnNumber, NumberOfReturns]`. The 3DEP HAG pipeline also produces Planarity / Sphericity / Verticality, but they are deliberately not loaded here: they are knn=15 eigenvalue features computed once at preprocessing time and go stale under point-removal augmentation and across sites with different 3DEP densities. |
+| `naip` | Dict or None | — | Multi-temporal NAIP imagery (see NAIP dict below). |
+| `uavsar` | Dict or None | — | Multi-temporal UAVSAR imagery. `None` for Laguna. |
+| `target` | Tensor | `[n_bands, H, W]` | Vegetation-structure raster over the 2 m grid (5×5 for a 10 m tile). Active band subset governed by the band config. |
+| `norm_params` | Dict | — | Contains bbox `center`, bbox `scale`, and Stage-2 coord `mean` / `std`. |
+| `tile_id` | str | — | Unique identifier. |
+| `bbox` | Tuple | `[4]` | `[xmin, ymin, xmax, ymax]` in EPSG:32611 (10 m × 10 m). |
 
-| Key | Data Type | Shape | Description |
-|-----|-----------|-------|-------------|
-| `dep_points_norm` | Tensor | [N_dep, 3] | Normalized 3DEP (3D Elevation Program) points (x,y,z). Point densities vary. Typically 1000-5000 points, sometimes as high as 10000 |
-| `uav_points_norm` | Tensor | [N_uav, 3] | Normalized UAV (Unmanned Aerial Vehicle) points (downsampled) (x,y,z). Point densities vary, but each one is downsampled to 20000 points or fewer.  |
-| `dep_points_attr` | Tensor | [N_dep, 3] | Attributes associated with 3DEP points. ['Intensity', 'ReturnNumber', 'NumberOfReturns'] |
-| `center` | Tensor | [1, 3] | Normalization center used for point cloud normalization |
-| `knn_edge_indices` | Dict | - | KNN edge indices for different k values |
-| `naip` | Dict or None | - | Preprocessed NAIP imagery data |
-| `uavsar` | Dict or None | - | Preprocessed UAVSAR imagery data |
-| `tile_id` | String or None | - | Optional tile identifier |
-| `bbox` | Tuple | [4] | Original bounding box [xmin, ymin, xmax, ymax] in EPSG:32611 |
+### Two-stage coordinate normalization
+1. **Bbox** (per tile): X,Y centered at 0 (so ∈ [-5, 5] m); min Z set to 0.
+2. **Z-score** (global): per-axis mean/std applied, using statistics stored at `data/processed/model_data_raster/coordinate_normalization_stats.json`.
 
-### KNN Edge Indices
+Denormalize back to bbox (meter) space before any distance operation: query attention, cross-attention fusion, positional encoding, `torch.cdist`.
 
-The `knn_edge_indices` dictionary maps k-values to edge indices:
+---
 
-| Key | Data Type | Shape | Description |
-|-----|-----------|-------|-------------|
-| k (integer) | Tensor | [2, E] | Edge indices for KNN graph with k neighbors |
+## Point cloud pipeline tile schema (historical)
 
-Where k is 15 E is the number of edges.
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `dep_points_norm` | Tensor | `[N_dep, 3]` | Normalized sparse 3DEP points. 1k–10k typical. |
+| `uav_points_norm` | Tensor | `[N_uav, 3]` | Normalized dense UAV ground-truth points, downsampled to ≤20k. |
+| `dep_points_attr` | Tensor | `[N_dep, 3]` | `[Intensity, ReturnNumber, NumberOfReturns]`. |
+| `center` | Tensor | `[1, 3]` | Bbox normalization center. |
+| `knn_edge_indices` | Dict[int, Tensor] | — | Precomputed KNN graphs keyed by `k` (typically `k=15`). Edge tensor shape `[2, E]` (PyG convention, undirected). |
+| `naip` | Dict or None | — | NAIP imagery dict. |
+| `uavsar` | Dict or None | — | UAVSAR imagery dict. |
+| `tile_id` | str or None | — | Optional identifier. |
+| `bbox` | Tuple | `[4]` | `[xmin, ymin, xmax, ymax]` in EPSG:32611. |
 
-### NAIP Dictionary
+### Single-stage coordinate normalization (bbox only)
+- X, Y centered at 0 (∈ [-5, 5] m).
+- Z shifted so min Z = 0.
+- Units are meters throughout (no z-score). This is why the density-aware Chamfer loss uses α=4 rather than the unit-cube α=1000.
 
-The `naip` dicionary contains the available NAIP imagery for a given tile between the 3DEP and UAV Lidar acquisition dates. It could contain anywhere from 2 to 6 images. The dates of these images DO NOT align with the dates of the UAVSAR imagery. The `naip` dictionary contains:
+---
 
-| Key | Data Type | Shape | Description |
-|-----|-----------|-------|-------------|
-| `images` | Tensor | [n_images, 4, h, w] | NAIP imagery tensor with 4 spectral bands. Resampled to 0.5m resolution so image is 40x40 height and width.  |
-| `ids` | List[str] | [n_images] | List of NAIP image IDs |
-| `dates` | List[str] | [n_images] | List of NAIP acquisition date strings |
-| `relative_dates` | Tensor | [n_images, 1] | Relative days from UAV acquisition date |
-| `img_bbox` | List or Tuple | [4] | NAIP imagery bounding box [minx, miny, maxx, maxy], 20x20m sharing centroid with main bbox |
-| `bands` | List | - | NAIP band information |
+## NAIP imagery dict
 
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `images` | Tensor | `[n_images, 4, 40, 40]` | 4-band (RGBN) chips at 0.5 m resolution. |
+| `ids` | List[str] | `[n_images]` | NAIP image IDs. |
+| `dates` | List[str] | `[n_images]` | Acquisition dates. |
+| `relative_dates` | Tensor | `[n_images, 1]` | Days relative to reference acquisition. |
+| `img_bbox` | Tuple | `[4]` | 20 m × 20 m bbox sharing centroid with the tile bbox. |
+| `bands` | List | — | Band metadata. |
 
-### UAVSAR Dictionary
+## UAVSAR imagery dict
 
-The `uavsar` dicionary contains the available UAVSAR imagery for a given tile between the 3DEP and UAV Lidar acquisition dates. It could contain anywhere from 4 to 30 images. The dates of these images DO NOT align with the dates of the NAIP imagery. The `uavsar` dictionary contains:
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `images` | Tensor | `[n_images, 6, 4, 4]` | 6-channel polarimetric chips resampled to ~5 m GSD (4×4 over the 20 m bbox). |
+| `ids` | List[str] | `[n_images]` | UAVSAR image IDs. |
+| `dates` | List[str] | `[n_images]` | Acquisition dates. |
+| `relative_dates` | Tensor | `[n_images, 1]` | Days relative to reference acquisition. |
+| `img_bbox` | Tuple | `[4]` | 20 m × 20 m bbox sharing centroid with the tile bbox. |
+| `bands` | List | — | Polarization labels. |
 
-| Key | Data Type | Shape | Description |
-|-----|-----------|-------|-------------|
-| `images` | Tensor | [n_images, n_bands, h, w] | UAVSAR imagery tensor. Should be six 'bands' (i.e. polarizations) and resampled to a standard 4x4 pixels height and width.|
-| `ids` | List[str] | [n_images] | List of UAVSAR image IDs |
-| `dates` | List[str] | [n_images] | List of UAVSAR acquisition date strings |
-| `relative_dates` | Tensor | [n_images, 1] | Relative days from UAV acquisition date |
-| `img_bbox` | List or Tuple | [4] | UAVSAR imagery bounding box [minx, miny, maxx, maxy], 20x20m sharing centroid with main bbox |
-| `bands` | List | - | UAVSAR band information |
+Imagery counts vary per tile and NAIP / UAVSAR acquisition dates do **not** align.
 
+---
 
-## Notes
+## Batching convention
 
-- **Point Normalization**: Points are normalized using a bounding box ('bbox') normalization where x and y coordinates are centered at 0,0 and units are in meters. Therefore, since the bounding box is 10x10 meters, the x and y values are between -5 and 5. The z-values are standardized so the minimum z value is 0 for every tile. The z value units are also meters. 
-- **Relative Dates**: Date differences are computed in days relative to the UAV LiDAR acquisition date.
-- **KNN Graphs**: K-nearest neighbor graphs are computed for the 3DEP points for each k value and converted to undirected graphs.
-- **Bounding Boxes**: The main tile bounding box is 10x10m, while NAIP and UAVSAR imagery use a 20x20m bounding box that shares the same centroid. Both are in EPSG:32611 coordinate system.
+Tiles are NOT stacked into `[B, N, 3]`. Points across a batch are concatenated and a PyG-style `batch_indices` tensor `[total_N]` identifies which tile each point belongs to. Within-tile attention and k-NN are enforced via this index (+ `to_dense_batch` key-padding masks in the global attention).
