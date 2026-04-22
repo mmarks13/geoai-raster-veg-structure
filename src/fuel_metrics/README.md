@@ -17,7 +17,7 @@ First, install the R environment and LidarForFuel package:
 
 ```bash
 # Create R environment (one-time setup)
-conda env create -f environment_r_fuel_metrics.yml
+conda env create -f scripts/fuel_metrics/environment_r_fuel_metrics.yml
 
 # Install LidarForFuel package
 bash scripts/fuel_metrics/install_lidarforfuel.sh
@@ -177,6 +177,24 @@ Default: 6 parallel jobs. Adjust based on available cores and RAM:
 - 4 cores / 32GB RAM → 3 jobs
 
 ## Troubleshooting
+
+### R environment issues
+
+**"Rscript not found"** — confirm the environment exists:
+```bash
+conda env list | grep r_fuel_metrics
+```
+
+**Package install fails with lock error** — clear stale lock files and retry:
+```bash
+conda activate r_fuel_metrics
+rm -rf /opt/conda/envs/r_fuel_metrics/lib/R/library/00LOCK-*
+```
+
+**Python wrapper can't find the environment** — verify `conda run` works:
+```bash
+conda run -n r_fuel_metrics Rscript --version
+```
 
 ### NULL from fPCpretreatment
 **Cause**: Tile contains only ground points (no vegetation)

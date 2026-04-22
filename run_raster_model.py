@@ -33,13 +33,13 @@ def build_config() -> MultimodalRasterConfig:
     return MultimodalRasterConfig(
         # Model architecture
         k=15,
-        feature_dim=384,  # Keep feature_dim // extractor_glbl_heads <= ~64; much larger head_dim can OOM batch-aware V2 global attention.
+        feature_dim=256,  # Keep feature_dim // extractor_glbl_heads <= ~64; much larger head_dim can OOM batch-aware V2 global attention.
         pt_attn_dropout=0.01,
         pt_block_dropout=0.10,  # Standard block dropout for extractor output + FFN paths
 
         # Feature extractor heads
         extractor_lcl_heads=4,
-        extractor_glbl_heads=6,
+        extractor_glbl_heads=4,
 
         # Modality selection (set to True to enable)
         use_naip=True,
@@ -82,14 +82,14 @@ def build_config() -> MultimodalRasterConfig:
         #   Band 12: 90th percentile height (m)
         # Density Proportions (Bands 13-22):
         #   Band 13-22: Proportion of returns in each 2.5m vertical layer (0-25m range)
-        n_bands=4,
+        n_bands=3,
         # OOD evaluation and training use a 4-band structure target set:
         #   output 0 -> source band 3: canopy_cover
         #   output 1 -> source band 4: canopy_density
         #   output 2 -> source band 5: midstory_density
         #   output 3 -> source band 7: foliage height diversity (kept in training for more robust/generalizable predictions)
 
-        target_band_indices=[3, 4, 5, 7],
+        target_band_indices=[3, 5, 7],
 
         grid_size=5,
         tile_extent=10.0,
@@ -104,7 +104,7 @@ def build_config() -> MultimodalRasterConfig:
         #   raster_decoder_dropout  → final SmallMlpDecoder.
         raster_attention_dropout=0.05,
         raster_ffn_dropout=0.5,
-        raster_decoder_dropout=0.0,
+        raster_decoder_dropout=0.05,
 
         # Optional: Transfer learning (only loads weights, not optimizer state)
         # Multi-checkpoint loading with key remapping for pretrained encoders
@@ -144,7 +144,7 @@ def build_config() -> MultimodalRasterConfig:
 
         # Stochastic depth (DropPath) - regularization for residual connections
         encoder_drop_path=0.0,      # Drop path for image encoder TransformerBlocks
-        extractor_point_attn_drop_path=0.1,  # Drop path for feature extractor
+        extractor_point_attn_drop_path=0.0,  # Drop path for feature extractor
 
         # Position encoder regularization
         pos_encoder_dropout=0.0,              # Dropout for position encoder (MLP + embedding) (point attn blocks 2+)
@@ -156,11 +156,11 @@ def build_config() -> MultimodalRasterConfig:
         # Correlation loss weight (addresses variance collapse)
 
         # Higher values encourage model to preserve variance in predictions
-        correlation_loss_weight=0,
+        correlation_loss_weight=0.0,
 
         # Transfer learning rate multiplier (for fine-tuning pretrained layers)
         # Transferred layers get lr * transfer_lr_multiplier
-        transfer_lr_multiplier=0.05,
+        transfer_lr_multiplier=0.1,
 
         # Heteroscedastic (Gaussian NLL) loss - outputs mean + variance per pixel
         # When enabled, model predicts uncertainty alongside values
@@ -246,12 +246,12 @@ def build_config() -> MultimodalRasterConfig:
 
         # Sharpness: simulates varying focus quality
         aug_naip_sharpness_range=(0.5, 1.5),
-        aug_naip_sharpness_prob=0.10,
+        aug_naip_sharpness_prob=0.0,
 
         # Z-score radiometric augmentation: master probability for global/per-channel gain+bias.
         # Strength = 1.0 uses the base ranges; <1 shrinks them and >1 widens them.
         # Post-clip bounds the final z-score values after the radiometric step.
-        aug_naip_radiometric_prob=0.50,
+        aug_naip_radiometric_prob=0.40,
         aug_naip_radiometric_strength=1,
         aug_naip_post_clip_range=(-4.0, 4.0),
 
@@ -292,7 +292,7 @@ def build_config() -> MultimodalRasterConfig:
 
 
         aug_temporal_shift_prob=0.9,          # 80% of tiles get temporal shift
-        aug_temporal_max_shift_days=730,    # ±365 days (12 months)
+        aug_temporal_max_shift_days=730,    # ±730 days
 
 
         # --- Modality Dropout Augmentation ---
@@ -304,7 +304,7 @@ def build_config() -> MultimodalRasterConfig:
         # --- Point Cloud Sparse Augmentation (Global-Only Mode) ---
         # Randomly removes points (only when use_global_only=True)
         aug_point_removal_enabled=True,  # Enable only with use_global_only=True
-        aug_point_removal_prob=0.5,  # Probability of applying point removal
+        aug_point_removal_prob=0.4,  # Probability of applying point removal
         aug_point_min_removal_ratio=0.01,  # Min fraction of points to remove
         aug_point_max_removal_ratio=0.9,  # Max fraction of points to remove
         aug_point_min_points=20,  # Minimum points to keep
@@ -332,7 +332,7 @@ def build_config() -> MultimodalRasterConfig:
         ood_val_tiles_path="data/processed/forest_plot_data/ood_validation/ood_validation_tiles.pt",
         ood_val_metadata_path="data/processed/forest_plot_data/ood_validation/ood_validation_metadata.json",
         ood_val_every_n_epochs=1,
-        ood_val_band_config_path="src/evaluation/configs/raster/veg_structure_4band.json",
+        ood_val_band_config_path="src/evaluation/configs/raster/veg_structure_3band_v2.json",
     )
 
 
@@ -364,11 +364,11 @@ def main():
     num_epochs = 100
     batch_size = 80  # Batch size per GPU
     learning_rate = 4.5e-3  # AdamWScheduleFree takes a higher learning rate than regular AdamW (does not update on checkpoint)
-    weight_decay = 0.4  # Weight regularization
+    weight_decay = 0.5  # Weight regularization
     beta1 = 0.95  # AdamW momentum (exponential moving average of gradients)
     beta2 = 0.999  # AdamW momentum (exponential moving average of squared gradients)
     gradient_accumulation_steps = 1  # Gradient accumulation for effective larger batches
-    max_grad_norm = 5  # prevent large gradient updates
+    max_grad_norm = 12  # prevent large gradient updates
     save_every_n_epochs = 5  # Save checkpoint every N epochs
     use_amp = True  # Automatic mixed precision (bfloat16)
     # Patience is counted in OOD-eval units when the metric is an ood_* metric:

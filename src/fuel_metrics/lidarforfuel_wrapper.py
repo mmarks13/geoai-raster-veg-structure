@@ -242,7 +242,7 @@ def run_pretreatment(
     if not check_rscript_available(r_env_path):
         raise FileNotFoundError(
             f"Rscript not found in conda environment '{r_env_path}'. Please ensure the environment exists:\n"
-            f"  conda env create -f environment_r_fuel_metrics.yml -p /home/jovyan/r_fuel_metrics\n"
+            f"  conda env create -f scripts/fuel_metrics/environment_r_fuel_metrics.yml -p /home/jovyan/r_fuel_metrics\n"
             f"  conda run -p /home/jovyan/r_fuel_metrics R -e \"remotes::install_github('oliviermartin7/lidarforfuel')\""
         )
 

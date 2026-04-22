@@ -6,7 +6,7 @@
 #   bash scripts/install_lidarforfuel.sh
 #
 # Requirements:
-#   - r_fuel_metrics conda environment must exist (create with: conda env create -f environment_r_fuel_metrics.yml)
+#   - r_fuel_metrics conda environment must exist (create with: conda env create -f scripts/fuel_metrics/environment_r_fuel_metrics.yml)
 #   - Internet connection for downloading packages
 
 set -e  # Exit on error
@@ -41,7 +41,7 @@ if ! conda env list | grep -q "^$CONDA_ENV "; then
     echo "ERROR: Conda environment '$CONDA_ENV' not found"
     echo ""
     echo "Please create it first:"
-    echo "  conda env create -f environment_r_fuel_metrics.yml"
+    echo "  conda env create -f scripts/fuel_metrics/environment_r_fuel_metrics.yml"
     exit 1
 fi
 
@@ -62,7 +62,7 @@ for (pkg in pkgs) {
 if (!all_ok) {
   cat('\nERROR: Base packages missing. Recreate environment:\n')
   cat('  conda env remove -n r_fuel_metrics\n')
-  cat('  conda env create -f environment_r_fuel_metrics.yml\n')
+  cat('  conda env create -f scripts/fuel_metrics/environment_r_fuel_metrics.yml\n')
   quit(status=1)
 }
 "

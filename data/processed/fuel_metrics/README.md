@@ -80,7 +80,7 @@ This runs the complete pipeline automatically:
 
 1. **Create R environment:**
 ```bash
-conda env create -f environment_r_fuel_metrics.yml
+conda env create -f scripts/fuel_metrics/environment_r_fuel_metrics.yml
 ```
 
 2. **Install LidarForFuel package:**

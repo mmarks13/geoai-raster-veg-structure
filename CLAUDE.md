@@ -303,7 +303,7 @@ data/processed/3dep_hag_features/
 - **Package manager:** Conda
 
 ### R (legacy fuel-metrics exploration)
-- **Env:** `r_fuel_metrics` (`environment_r_fuel_metrics.yml`)
+- **Env:** `r_fuel_metrics` (`scripts/fuel_metrics/environment_r_fuel_metrics.yml`)
 - **R:** 4.5.1; key packages: `r-lidr`, `r-terra`, `r-sf`, `LidarForFuel` (from GitHub)
 - **Usage:** LidarForFuel-based fuel hazard mapping. Used only if revisiting the legacy fuel-metrics path (see §12). Invoked automatically via `conda run` from the wrapper scripts.
 
