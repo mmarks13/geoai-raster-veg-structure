@@ -17,20 +17,27 @@ flowchart LR
   classDef out fill:#e8f1e4,stroke:#5a8a4d,font-size:15px;
 ```
 
-## The headline result
+## Results
+Across 49 field plots at four Southern California sites the model never saw during training, fusing sparse public LiDAR with multi-temporal aerial imagery yields substantially more accurate estimates of the vegetation structure than calculating from raw public LiDAR alone:
 
-The model predicts a small multi-band vegetation-structure raster per tile (height, cover, density by vertical layer) at a 2 m pixel resolution. It is trained on dense UAV-LiDAR ground truth from two Southern California sites (Sedgwick Reserve and Volcan Mountain), and evaluated against **49 matched field plots at four held-out sites that the model never saw during training** (Bluff Mesa, North Big Bear, Reyes Peak, Laguna), spanning mixed chaparral, Jeffrey pine, and mixed-conifer forest. The variables for which independent field measurements are available are canopy cover and the **1–3 m vegetation layer (forest understory or open chaparral)**.
+- For **1–3 m vegetation layer (forest understory or chaparral)**, the model explains roughly **3× more** of the plot-to-plot variation than raw public LiDAR alone (*r*² 6% → 19%; Williams *t*, *p* = 0.025).
+- Ranking those 49 plots by predicted 1–3 m density matches a field biologist's ordering nearly **twice as well** as ranking them by raw LiDAR (Spearman *ρ* 0.18 → 0.34).
+- For **canopy cover**, fusion captures more than 3× more of the plot-to-plot variation at the held-out site with the oldest public LiDAR (2015 vs 2018–19 elsewhere; r² 10% → 34%) and adds little where the LiDAR is more recent (overall Pearson r 0.47 → 0.48), suggesting the value of fusion is to keep structural estimates current as public LiDAR ages.
 
-| Variable (49 plots, 4 held-out sites)              | Raw 3DEP LiDAR (direct measurement) | Multimodal model |
-| -------------------------------------------------- | ----------------------------------- | ---------------- |
-| 1–3 m vegetation density, Pearson *r*              | 0.24                                | **0.44**         |
-| 1–3 m vegetation density, variance explained (*r*²) | 6%                                  | **19%**          |
-| Canopy cover, Pearson *r*                          | 0.47                                | 0.48             |
 
-- **1–3 m vegetation layer (the layer hardest to see from airborne LiDAR alone):** agreement with field measurements improved at all four held-out sites. The model explains roughly 3× more of the plot-to-plot variation in 1–3 m vegetation density than raw LiDAR alone, and the overall gain is statistically significant (Williams *t*, *p* = 0.025).
-- **Canopy cover:** already well-captured by LiDAR alone, so overall gains are small. The largest canopy-cover improvement occurs at the held-out site with the oldest public LiDAR acquisition (4 years older than the other held-out sites, Pearson *r* 0.32 → **0.58**), where multi-temporal optical imagery appears to help compensate for stale structural data.
+<details>
+<summary><b>Methodology and overall statistics</b></summary>
 
-Field measurements and LiDAR-derived structure are related but non-equivalent indicators, so these numbers reflect stronger *agreement with independent field observations*, not exact one-to-one prediction.
+Trained on dense UAV-LiDAR ground truth at Sedgwick Reserve and Volcan Mountain, and evaluated against 49 matched field plots at four ecologically distinct held-out sites (Bluff Mesa, North Big Bear, Reyes Peak, Laguna) spanning mixed chaparral, Jeffrey pine, and mixed-conifer forest. Two variables have independent field measurements: canopy cover and 1–3 m vegetation density. Field measurements and LiDAR-derived structure are related but non-equivalent indicators, so these numbers reflect stronger agreement with independent field observations, not exact one-to-one prediction.
+
+| Metric                   | n  | Pearson *r* (B → M) | Spearman *ρ* (B → M) | RMSE (B → M)      | Williams *t* (*p*) |
+| ------------------------ | -- | ------------------- | -------------------- | ----------------- | ------------------ |
+| Canopy cover             | 49 | 0.466 → 0.475 ↑     | 0.512 → 0.556 ↑      | 16.670 → 16.507 ↓ | 0.126 (0.901)      |
+| 1–3 m vegetation density | 49 | 0.236 → 0.439 ↑     | 0.177 → 0.338 ↑      | 17.505 → 15.593 ↓ | **2.325 (0.025)**  |
+
+B → M = Raw 3DEP LiDAR baseline → Multimodal model. ↑/↓ indicates the direction preferred for that metric (↑ for *r*, *ρ*; ↓ for RMSE). Williams *t* = dependent-correlation test on the difference in Pearson *r*.
+
+</details>
 
 <details>
 <summary><b>Per-site breakdown (4 held-out sites, 49 plots)</b></summary>
@@ -57,27 +64,12 @@ B → M = Raw 3DEP LiDAR baseline → Multimodal model. Bold = model improves on
 
 </details>
 
-## What this is, why it's hard, what it contributes
+## Lineage: From Point Clouds to Structure
 
-**What.** Inputs are all publicly available: sparse USGS 3DEP airborne LiDAR, multi-temporal NAIP optical imagery, and multi-temporal UAVSAR L-band SAR. Outputs are small multi-band vegetation-structure rasters on a 2 m grid per 10 m tile: height, cover, and density-by-layer variables drawn from the Moudry et al. (2023) standardized set. Because every input is open data, the pipeline is in principle reproducible and scalable across the continental US.
-
-**Why it's hard.** Dense UAV LiDAR measures vegetation structure accurately but is expensive and spatially limited. Sparse public airborne LiDAR is cheap and continental, but frequently misses the 1–3 m vegetation layer (whether that layer is functioning as forest understory or as open chaparral) because returns at those heights are sparse and easily confused with low canopy. Satellite indices are frequent and broad but don't resolve vertical structure. Fusing these modalities is the core technical problem: each has a different resolution, a different temporal cadence, and inconsistent coverage.
-
-**What this contributes.** A peer-reviewed multimodal fusion approach extended from point-cloud reconstruction to a more ecologically useful target, evaluated against independent field data at sites outside the training distribution.
-
-## From points to structure: published proof, extended scope
-
-The [2025 *Remote Sensing* paper](https://doi.org/10.3390/rs17193278) proved that multimodal fusion of sparse LiDAR, NAIP, and UAVSAR can reconstruct dense UAV-quality LiDAR point clouds. Points, however, are a means rather than an end. Ecologists, fire modelers, and land managers work in terms of structure: cover, height, density by layer, not raw returns.
+The [2025 *Remote Sensing* paper](https://doi.org/10.3390/rs17193278) proved that multimodal fusion of sparse LiDAR, NAIP, and UAVSAR can enhance LiDAR point clouds in vegetated landcapes. Points, however, are a means rather than an end. Ecologists, fire modelers, and land managers work in terms of structure: cover, height, density by layer, not raw returns.
 
 This repo closes that gap. It reuses the published encoder lineage (see [`geoai_veg_map`](https://github.com/mmarks13/geoai_veg_map)) and swaps the decoder to predict a gridded raster of vegetation-structure variables directly, then validates the result against field plots at four sites the model never saw during training.
 
-## What I built
-
-**Full-stack geospatial ML pipeline.** STAC-driven ingestion of NAIP, UAVSAR, 3DEP, and UAV LiDAR, PDAL-based Height-Above-Ground and geometric-feature computation, tile generation with two-stage coordinate normalization, online on-GPU augmentation, DDP multi-GPU training with mixed precision, Monte-Carlo-dropout inference, and field-plot evaluation.
-
-**Novel architecture.** A local-global point-attention encoder (LG-PAB) over sparse LiDAR, ViT-based image encoders for NAIP and UAVSAR with temporal aggregation, cross-attention multimodal fusion between point features and image patch embeddings, and a raster decoder built from learnable per-cell grid queries that attend into fused point features via Gaussian distance-biased cross-attention. UAVSAR is fully supported by the architecture, but was ablated out of the final training run after its added noise consistently degraded out-of-distribution generalization in held-out validation.
-
-**Rigor aimed at OOD generalization.** Spectral normalization, stochastic depth, heteroscedastic Gaussian NLL loss with an overconfidence penalty, MC-dropout uncertainty at inference, modality dropout as a training-time regularizer that forces each modality pathway to stand on its own, synchronized geometric augmentation across points, imagery, and targets, and point-cloud sparsification up to 90% to induce density invariance.
 
 <details>
 <summary><b>Architecture details</b></summary>
@@ -138,7 +130,7 @@ To isolate the value-add of multimodal fusion, the same Moudry vegetation-struct
 
 </details>
 
-## What changed from the point-cloud upsampling model
+## Changes from the Published Pipeline
 
 The raster predictor reuses the encoder backbone of the [published point-cloud upsampling model](https://github.com/mmarks13/geoai_veg_map) and swaps the output target from a dense 3D point cloud to a small gridded raster of vegetation-structure metrics. Along the way, a set of encoder-level improvements were folded in that benefit both pipelines. At a glance, the encoder now keeps positional and semantic information cleanly separated, attention and neighborhood graphs are restricted to within-tile context, and the NAIP tokenizer preserves within-patch texture instead of averaging it away.
 
@@ -163,7 +155,7 @@ The raster predictor reuses the encoder backbone of the [published point-cloud u
 
 </details>
 
-## Getting started
+## Getting Started
 
 Environment setup is via Conda:
 
@@ -178,7 +170,7 @@ Data preparation, training, and evaluation pipelines are documented in [`scripts
 - Forest-plot evaluation: `scripts/evaluate_forest_plots.sh`
 - LiDAR direct-measurement baseline: `src/evaluation/compute_3dep_baseline_metrics.py`
 
-## What's next
+## Future Direction
 
 **Broader sensor palette.** UAVSAR coverage is sparse, inconsistent, and (in this project) noisy enough that it was dropped from the final training run. In the near term, Sentinel-1 (10 m, open, global, high temporal cadence) is the natural SAR replacement. Longer term, NISAR opens up L-band coverage at a scale that UAVSAR cannot match.
 
@@ -186,7 +178,7 @@ Data preparation, training, and evaluation pipelines are documented in [`scripts
 
 **A point-cloud foundation model on 3DEP.** To my knowledge no such model exists at continental scale on airborne LiDAR. Given that 3DEP is open, standardized, and near-continental in US coverage, this is plausibly the highest-leverage piece of missing infrastructure for this problem family, and a research direction I would pursue given the opportunity.
 
-## Related publication
+## Related Publication
 
 Marks, M.; Sousa, D.; Franklin, J. **Attention-Based Enhancement of Airborne LiDAR Across Vegetated Landscapes Using SAR and Optical Imagery Fusion.** *Remote Sensing* **2025**, *17*, 3278. <https://doi.org/10.3390/rs17193278>. Published code: [`geoai_veg_map`](https://github.com/mmarks13/geoai_veg_map).
 
