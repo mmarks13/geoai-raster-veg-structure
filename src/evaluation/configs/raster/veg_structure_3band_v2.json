@@ -1,0 +1,37 @@
+{
+  "name": "veg_structure_8band",
+  "description": "8-band vegetation structure metrics from LiDAR point cloud analysis",
+  "stats_file": "data/processed/model_data_veg_structure/target_raster_normalization_stats_train.json",
+  "bands": [
+    {
+      "output_index": 0,
+      "name": "canopy_cover",
+      "display_name": "Canopy Cover",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "TreeCover",
+      "field_units": "percent"
+    },
+    {
+      "output_index": 1,
+      "name": "midstory_density",
+      "display_name": "Mid-story Density",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "ShrubCover",
+      "field_units": "percent"
+    },
+    {
+      "output_index": 2,
+      "name": "fhd",
+      "display_name": "Foliage Height Diversity",
+      "model_units": "normalized",
+      "display_units": "index",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    }
+  ]
+}

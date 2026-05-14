@@ -2,17 +2,32 @@
 Training entry point for multimodal raster prediction model.
 
 Usage:
-    python run_raster_model.py
+    python run_raster_model.py                 # 3-band target (default)
+    python run_raster_model.py --bands 13      # 13-band target
 
-This script trains a single raster prediction model with default hyperparameters.
-For ablation studies or custom configurations, modify the config parameters below.
+The --bands flag switches only `n_bands`, `target_band_indices`, and the
+output-directory suffix; all other hyperparameters are identical between the
+two runs. To customize further, edit `build_config()` below.
 """
 
+import argparse
+import datetime
+
 import torch
+
 from src.models.multimodal_raster_model import MultimodalRasterConfig
 from src.training.raster_training import train_raster_model
-from pathlib import Path
-import datetime
+
+# Mapping from --bands choice to the corresponding (n_bands, target_band_indices).
+# Source band indices follow the comment block in build_config() below.
+# 3-band:  output 0 -> src 3 (canopy_cover), output 1 -> src 5 (midstory_density),
+#          output 2 -> src 7 (foliage height diversity).
+# 13-band: heights (0-2) + densities (3-6) + FHD (7) + height percentiles (8-12).
+#          Matches src/evaluation/configs/raster/veg_structure_13band.json.
+BAND_PRESETS = {
+    3: [3, 5, 7],
+    13: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+}
 
 # ====== CUDA Performance Optimizations ======
 # Enable cuDNN benchmark for faster convolution algorithm selection
@@ -28,8 +43,21 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-def build_config() -> MultimodalRasterConfig:
-    """Build the canonical raster model config used for training."""
+def build_config(bands: int = 3) -> MultimodalRasterConfig:
+    """Build the canonical raster model config used for training.
+
+    Args:
+        bands: Number of output bands. Must be a key in BAND_PRESETS (3 or 13).
+            Only `n_bands` and `target_band_indices` are affected by this
+            argument; every other hyperparameter is identical between the two.
+    """
+    if bands not in BAND_PRESETS:
+        raise ValueError(
+            f"Unsupported --bands value: {bands}. "
+            f"Supported: {sorted(BAND_PRESETS)}."
+        )
+    target_band_indices = BAND_PRESETS[bands]
+
     return MultimodalRasterConfig(
         # Model architecture
         k=15,
@@ -82,14 +110,10 @@ def build_config() -> MultimodalRasterConfig:
         #   Band 12: 90th percentile height (m)
         # Density Proportions (Bands 13-22):
         #   Band 13-22: Proportion of returns in each 2.5m vertical layer (0-25m range)
-        n_bands=3,
-        # OOD evaluation and training use a 4-band structure target set:
-        #   output 0 -> source band 3: canopy_cover
-        #   output 1 -> source band 4: canopy_density
-        #   output 2 -> source band 5: midstory_density
-        #   output 3 -> source band 7: foliage height diversity (kept in training for more robust/generalizable predictions)
-
-        target_band_indices=[3, 5, 7],
+        # n_bands and target_band_indices are driven by the --bands CLI flag;
+        # see BAND_PRESETS at the top of this file.
+        n_bands=bands,
+        target_band_indices=target_band_indices,
 
         grid_size=5,
         tile_extent=10.0,
@@ -121,7 +145,7 @@ def build_config() -> MultimodalRasterConfig:
             # ("data/output/raster_model_baseline_20260415_041056/checkpoints/epoch_10.pth",
             #  ["feature_extractor"], None),
             # NAIP encoder: remap "encoder.*" → "naip_encoder.*"
-            ("data/output/naip_encoder_pretrain_d128_20260414_233516/checkpoints/epoch_20.pth",
+            ("data/output/pretrained_naip_encoder_d128/checkpoints/epoch_20.pth",
              ["encoder"], {"encoder": "naip_encoder"}),
             # # UAVSAR encoder: remap "encoder.*" → "uavsar_encoder.*"
             # ("data/output/uavsar_encoder_pretrain_d128_20260415_044952/checkpoints/epoch_40.pth",
@@ -339,8 +363,19 @@ def build_config() -> MultimodalRasterConfig:
 def main():
     """Main training function."""
 
+    # ====== Command-line arguments ======
+    parser = argparse.ArgumentParser(description="Train multimodal raster prediction model")
+    parser.add_argument(
+        "--bands",
+        type=int,
+        default=3,
+        choices=sorted(BAND_PRESETS),
+        help="Number of output bands (3 or 13). Selects n_bands + target_band_indices preset.",
+    )
+    args = parser.parse_args()
+
     # ====== Configuration ======
-    config = build_config()
+    config = build_config(bands=args.bands)
 
     # ====== Data Paths ======
     train_data_path = "data/processed/model_data_veg_structure/precomputed_training_tiles_raster_32bit.pt"
@@ -358,7 +393,7 @@ def main():
     else:
         modality_str = "baseline"
 
-    output_dir = f"data/output/raster_model_{modality_str}_{timestamp}"
+    output_dir = f"data/output/raster_model_{modality_str}_{args.bands}band_{timestamp}"
 
     # ====== Training Hyperparameters ======
     num_epochs = 100

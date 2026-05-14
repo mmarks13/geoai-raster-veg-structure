@@ -88,6 +88,7 @@ data/agg/**/*
 *vsix
 *.ipynb
 *.json
+!src/evaluation/configs/**/*.json
 *.log
 data/processed/forest_plot_data/forest_plot_sample_obfuscated.csv
 temp/*
@@ -145,3 +146,16 @@ data/processed/uav_lidar_coverage_boundary.geojson
 *tfevents*
 *processing_log.txt
 data/processed/veg_structure_metrics/*
+!data/processed/veg_structure_metrics/README.md
+
+# Symlinks into a sibling source repo on this VM. Materialize before migration.
+data/processed/3dep_hag_features
+data/processed/3dep_hag_features/
+data/processed/veg_structure_baseline
+data/processed/veg_structure_baseline/
+data/output/pretrained_3band_naip
+data/output/pretrained_3band_naip/
+data/output/pretrained_13band_naip
+data/output/pretrained_13band_naip/
+data/output/pretrained_naip_encoder_d128
+data/output/pretrained_naip_encoder_d128/

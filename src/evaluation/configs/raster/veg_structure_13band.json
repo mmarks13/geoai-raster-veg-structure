@@ -1,0 +1,138 @@
+{
+  "name": "veg_structure_13band",
+  "description": "13-band vegetation structure metrics (heights + densities + FHD + height percentiles) for trainable raster models. Mirrors veg_structure_baseline.json bands 0-12 but uses normalized model_units and links to target normalization stats so it runs through the same training/eval path as veg_structure_3band_v2.",
+  "stats_file": "data/processed/model_data_veg_structure/target_raster_normalization_stats_train.json",
+  "bands": [
+    {
+      "output_index": 0,
+      "name": "max_height",
+      "display_name": "Maximum Height",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": "CrownHt",
+      "field_units": "m",
+      "aggregation_method": "max"
+    },
+    {
+      "output_index": 1,
+      "name": "mean_height",
+      "display_name": "Mean Height",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 2,
+      "name": "std_height",
+      "display_name": "Height Std Dev",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 3,
+      "name": "canopy_cover",
+      "display_name": "Canopy Cover",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "TreeCover",
+      "field_units": "percent"
+    },
+    {
+      "output_index": 4,
+      "name": "canopy_density",
+      "display_name": "Canopy Density",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 5,
+      "name": "midstory_density",
+      "display_name": "Mid-story Density",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "ShrubCover",
+      "field_units": "percent"
+    },
+    {
+      "output_index": 6,
+      "name": "understory_density",
+      "display_name": "Understory Density",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "HerbCover",
+      "field_units": "percent"
+    },
+    {
+      "output_index": 7,
+      "name": "fhd",
+      "display_name": "Foliage Height Diversity",
+      "model_units": "normalized",
+      "display_units": "index",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 8,
+      "name": "height_p10",
+      "display_name": "Height P10",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 9,
+      "name": "height_p25",
+      "display_name": "Height P25",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 10,
+      "name": "height_p50",
+      "display_name": "Height P50 (Median)",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 11,
+      "name": "height_p75",
+      "display_name": "Height P75",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    },
+    {
+      "output_index": 12,
+      "name": "height_p90",
+      "display_name": "Height P90",
+      "model_units": "normalized",
+      "display_units": "m",
+      "unit_conversion_factor": 1.0,
+      "field_column": null,
+      "field_units": null
+    }
+  ]
+}
