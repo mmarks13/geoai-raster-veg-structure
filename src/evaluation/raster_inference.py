@@ -1001,6 +1001,46 @@ def run_multi_gpu_inference(args):
     logger.info("Multi-GPU inference complete!")
 
 
+def validate_band_config_against_checkpoint(band_config_path: str, checkpoint_path: str) -> None:
+    """
+    Assert that a band config describes the same number of output bands the checkpoint predicts.
+
+    The band config (src/evaluation/band_config.py) carries no target_band_indices — band
+    identity is positional via output_index — so the band count is the meaningful check against
+    the checkpoint's n_bands. Raises ValueError on mismatch with an actionable message.
+    """
+    from src.evaluation.band_config import load_band_config
+
+    band_config = load_band_config(band_config_path)
+    n_bands_config = len(band_config.bands)
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    config_obj = checkpoint.get('config', {})
+    # The config may be stored as a MultimodalRasterConfig object or a plain dict.
+    n_bands_ckpt = getattr(config_obj, 'n_bands', None)
+    if n_bands_ckpt is None and isinstance(config_obj, dict):
+        n_bands_ckpt = config_obj.get('n_bands')
+
+    if n_bands_ckpt is None:
+        logger.warning(
+            f"Could not read n_bands from checkpoint {checkpoint_path}; skipping band-config "
+            f"count validation (band config '{band_config.name}' has {n_bands_config} bands)."
+        )
+        return
+
+    if n_bands_config != n_bands_ckpt:
+        raise ValueError(
+            f"Band config mismatch: '{band_config_path}' describes {n_bands_config} bands "
+            f"({[b.name for b in band_config.bands]}) but checkpoint '{checkpoint_path}' predicts "
+            f"{n_bands_ckpt} bands. Pass the band config that matches this checkpoint."
+        )
+
+    logger.info(
+        f"Band config '{band_config.name}' validated against checkpoint "
+        f"({n_bands_config} bands: {[b.name for b in band_config.bands]})."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run raster model inference on forest plot tiles"
@@ -1058,8 +1098,22 @@ def main():
         default=1,
         help='Number of MC dropout samples for uncertainty estimation (default: 1 = deterministic)'
     )
+    parser.add_argument(
+        '--band-config',
+        type=str,
+        default=None,
+        help='Optional band-config JSON. If given, it is recorded in the inference config '
+             'summary and validated against the checkpoint (band count must match n_bands). '
+             'Used by the polygon-to-map pipeline to keep output band labels aligned with the model.'
+    )
 
     args = parser.parse_args()
+
+    # Fail fast if the band config does not describe the same number of bands the
+    # checkpoint predicts. band_config.py has no target_band_indices field (band identity
+    # is positional), so band count vs n_bands is the meaningful cross-check.
+    if args.band_config:
+        validate_band_config_against_checkpoint(args.band_config, args.checkpoint)
 
     # Dispatch to appropriate inference mode
     if args.multi_gpu:
