@@ -137,6 +137,7 @@ def block_command(block: Block, args) -> List[str]:
         "--device", "cuda",
         "--resume",
         "--cleanup",
+        "--no-split",
     ]
     return cmd
 
@@ -156,7 +157,10 @@ def run_blocks(blocks: List[Block], args) -> dict:
         }, indent=2))
 
     pending = list(blocks)
-    free_gpus = list(range(args.num_gpus))
+    # Data prep is CPU/IO-bound and inference is brief, so we run more concurrent
+    # blocks than GPUs and oversubscribe each GPU (round-robin to the least-loaded one).
+    max_concurrent = args.max_concurrent or args.num_gpus
+    gpu_load = {g: 0 for g in range(args.num_gpus)}
     running: dict = {}  # Popen -> (block, gpu, logfh, start)
 
     # Pre-mark already-finished blocks (resume).
@@ -165,17 +169,19 @@ def run_blocks(blocks: List[Block], args) -> dict:
             results[b.name] = {"status": "skipped (done)", "gpu": None, "seconds": 0}
             pending.remove(b)
     flush_status()
-    logger.info("%d blocks total; %d already complete; %d to run.",
-                len(blocks), len(results), len(pending))
+    logger.info("%d blocks total; %d already complete; %d to run "
+                "(max %d concurrent over %d GPU(s)).",
+                len(blocks), len(results), len(pending), max_concurrent, args.num_gpus)
 
     while pending or running:
-        while pending and free_gpus:
+        while pending and len(running) < max_concurrent:
             b = pending.pop(0)
-            gpu = free_gpus.pop(0)
+            gpu = min(gpu_load, key=gpu_load.get)  # least-loaded GPU
+            gpu_load[gpu] += 1
             b.out_dir.mkdir(parents=True, exist_ok=True)
             logfh = open(b.out_dir / "block.log", "w")
             env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
-            logger.info("▶ launch %s on GPU %d", b.name, gpu)
+            logger.info("▶ launch %s on GPU %d (load now %d)", b.name, gpu, gpu_load[gpu])
             proc = subprocess.Popen(block_command(b, args), cwd=str(_PROJECT_ROOT),
                                     stdout=logfh, stderr=subprocess.STDOUT, env=env)
             running[proc] = (b, gpu, logfh, time.time())
@@ -188,7 +194,7 @@ def run_blocks(blocks: List[Block], args) -> dict:
                 continue
             b, gpu, logfh, start = running.pop(proc)
             logfh.close()
-            free_gpus.append(gpu)
+            gpu_load[gpu] -= 1
             elapsed = round(time.time() - start, 1)
             ok = rc == 0 and block_done(b, args.mc_passes)
             results[b.name] = {
@@ -199,7 +205,7 @@ def run_blocks(blocks: List[Block], args) -> dict:
                         "✓" if ok else "✗", b.name, elapsed / 60, gpu)
             flush_status()
 
-        if running and not (pending and free_gpus):
+        if running and not (pending and len(running) < max_concurrent):
             time.sleep(5)
 
     return results
@@ -272,7 +278,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mc-passes", type=int, nargs="+", default=[1, 20],
                    help="MC passes per block (deterministic + uncertainty).")
     p.add_argument("--threads", type=int, default=4, help="H5-build workers per block.")
-    p.add_argument("--num-gpus", type=int, default=3, help="Concurrent blocks (one GPU each).")
+    p.add_argument("--num-gpus", type=int, default=3, help="GPUs to round-robin blocks across.")
+    p.add_argument("--max-concurrent", type=int, default=None,
+                   help="Max blocks running at once (default: --num-gpus). Set higher than "
+                        "--num-gpus to oversubscribe GPUs — data prep is CPU/IO-bound and "
+                        "inference is brief, so extra concurrency raises CPU/IO utilization.")
     p.add_argument("--tile-filter", choices=["centroid", "contains", "intersects"],
                    default="intersects")
     p.add_argument("--model", default=pp.DEFAULT_MODEL)
@@ -299,9 +309,10 @@ def main() -> None:
     if args.list_blocks:
         done = sum(block_done(b, args.mc_passes) for b in blocks)
         # ~6.9 GB inference_ready + ~2.5 GB other per ~1 km² block; peak ≈ concurrent × ~10 GB.
+        conc = args.max_concurrent or args.num_gpus
         logger.info("Blocks already complete: %d / %d", done, len(blocks))
         logger.info("Est. peak disk ≈ %.0f GB (%d concurrent × ~10 GB) + small COGs.",
-                    args.num_gpus * 10.0, args.num_gpus)
+                    conc * 10.0, conc)
         for b in blocks[:8] + (blocks[-2:] if len(blocks) > 10 else []):
             logger.info("  %s  NW=(%.5f, %.5f)  done=%s",
                         b.name, b.nw_lon, b.nw_lat, block_done(b, args.mc_passes))

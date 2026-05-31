@@ -946,6 +946,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cleanup", action="store_true",
                    help="After outputs are written, delete the AOI's work/ dir + NAIP/3DEP "
                         "caches, keeping only the COGs. Required for the full-Laguna block run.")
+    p.add_argument("--no-split", action="store_true",
+                   help="Treat a multipolygon AOI as one output (skip the >100 m split rule). "
+                        "Used by the block runner so a block never fans out into '<name>__NN' dirs.")
     # Smoke-test clip box.
     p.add_argument("--clip-box-corner", type=float, nargs=2, metavar=("LON", "LAT"),
                    default=None, help="WGS84 top-left corner to clip a fixed square (smoke test).")
@@ -974,7 +977,11 @@ def main() -> None:
     aoi = unary_union(gdf.geometry.values)
     if args.clip_box_corner is not None:
         aoi = apply_clip_box(aoi, tuple(args.clip_box_corner), args.clip_box_size)
-    aois = split_components(aoi)
+    # --no-split keeps the (possibly multipolygon) AOI as a single output. The
+    # multipolygon-split rule exists to avoid one huge mostly-NoData bbox spanning
+    # far-apart AOIs; inside a bounded block (block runner) it is counterproductive —
+    # it would emit '<name>__NN' dirs the block runner doesn't expect.
+    aois = [aoi] if args.no_split else split_components(aoi)
 
     if len(aois) == 1:
         process_aoi(aois[0], base_name, args, fuel_stats)
