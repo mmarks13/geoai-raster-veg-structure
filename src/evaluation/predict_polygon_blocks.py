@@ -249,6 +249,51 @@ def mosaic_blocks(blocks: List[Block], args) -> None:
         list_file.unlink(missing_ok=True)
         logger.info("Wrote mosaic: %s", out_cog)
 
+        # Also emit AOI-wide single-band GeoTIFFs (+ band-stack VRT) for ArcGIS users
+        # who prefer one-dataset-per-layer. Derived by splitting the mosaic so they
+        # are guaranteed consistent with the combined COG.
+        _split_to_single_bands(out_cog, final_dir / f"per_band_mc{mc}", args.band_config)
+
+
+def _split_to_single_bands(cog_path: Path, per_band_dir: Path, band_config_path: str) -> None:
+    """Split a mosaicked COG into single-band GeoTIFFs (named per band) + a band-stack VRT."""
+    import rasterio
+    per_band_dir.mkdir(parents=True, exist_ok=True)
+
+    labels = pp._band_labels(band_config_path)  # [(short, display, units), ...]
+    with rasterio.open(cog_path) as src:
+        descs = list(src.descriptions)
+        n = src.count
+        # mc>1 interleaves mean+std (2x bands); mc=1 is mean only.
+        has_std = (n == 2 * len(labels))
+        names: List[str] = []
+        for short, _disp, _units in labels:
+            names.append(short)
+            if has_std:
+                names.append(f"{short}_std")
+
+        profile = src.profile.copy()
+        profile.update(driver="GTiff", count=1, compress="DEFLATE", tiled=True)
+        for k in ("blocksize", "overview_resampling", "interleave"):
+            profile.pop(k, None)
+
+        out_files: List[Path] = []
+        for i in range(1, n + 1):
+            name = names[i - 1] if i - 1 < len(names) else f"band{i}"
+            out_p = per_band_dir / f"{name}.tif"
+            with rasterio.open(out_p, "w", **profile) as dst:
+                dst.write(src.read(i), 1)
+                if i - 1 < len(descs) and descs[i - 1]:
+                    dst.set_band_description(1, descs[i - 1])
+            out_files.append(out_p)
+
+    gdalbuildvrt = shutil.which("gdalbuildvrt")
+    if gdalbuildvrt:
+        vrt = per_band_dir / f"{cog_path.stem}.vrt"
+        subprocess.run([gdalbuildvrt, "-separate", "-overwrite", str(vrt),
+                        *[str(p) for p in out_files]], cwd=str(_PROJECT_ROOT), check=True)
+    logger.info("Wrote %d single-band GeoTIFFs → %s", len(out_files), per_band_dir)
+
 
 def _copy_band_descriptions(src_cog: str, dst: Path) -> None:
     """Copy per-band Description metadata from a block COG onto another dataset (e.g. the VRT)."""
