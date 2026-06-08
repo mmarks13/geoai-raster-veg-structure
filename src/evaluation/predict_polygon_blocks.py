@@ -77,6 +77,23 @@ class Block:
         self.nw_lon = nw.centroid.x
         self.nw_lat = nw.centroid.y
 
+    def clip_corner_size(self, overlap_m: float = 0.0):
+        """Return (nw_lon, nw_lat, size_m) for the per-block clip, optionally expanded.
+
+        Each block's tile grid is inset ~14 m from its far (E/S) edges (the grid helper
+        keeps only `contains`-ed tiles + a stride margin). With blocks placed edge-to-edge
+        that inset becomes a 14 m NoData seam between blocks. Expanding the clip box by
+        ``overlap_m`` on every side makes adjacent blocks' data overlap (>= ~7 m closes the
+        gap; 20 m is safe), so the mosaic is seamless. Overlap regions are recomputed by
+        neighbours and resolved last-wins in the mosaic.
+        """
+        minx, miny, maxx, maxy = self.geom.bounds
+        nw = gpd.GeoSeries(
+            [box(minx - overlap_m, maxy + overlap_m, minx - overlap_m, maxy + overlap_m)],
+            crs=pp.TARGET_CRS,
+        ).to_crs(pp.WGS84).iloc[0]
+        return nw.centroid.x, nw.centroid.y, self.size_m + 2 * overlap_m
+
     @property
     def out_dir(self) -> Path:
         return OUT_ROOT / self.name
@@ -123,12 +140,13 @@ def block_done(block: Block, mc_passes: List[int]) -> bool:
 # Per-block command + scheduler
 # ---------------------------------------------------------------------------
 def block_command(block: Block, args) -> List[str]:
+    nw_lon, nw_lat, clip_size = block.clip_corner_size(args.block_overlap)
     cmd = [
         PYTHON, "-u", "src/evaluation/predict_polygon.py",
         "--polygon", args.polygon,
         "--name", block.name,
-        "--clip-box-corner", f"{block.nw_lon:.8f}", f"{block.nw_lat:.8f}",
-        "--clip-box-size", str(block.size_m),
+        "--clip-box-corner", f"{nw_lon:.8f}", f"{nw_lat:.8f}",
+        "--clip-box-size", str(clip_size),
         "--mc-passes", *[str(m) for m in args.mc_passes],
         "--threads", str(args.threads),
         "--tile-filter", args.tile_filter,
@@ -320,6 +338,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--polygon", required=True, help="AOI polygon (GeoJSON/GPKG/SHP/zipped SHP).")
     p.add_argument("--name", default=None, help="Run name (default: polygon stem + '_full').")
     p.add_argument("--block-size", type=float, default=1000.0, help="Block side length (m).")
+    p.add_argument("--block-overlap", type=float, default=20.0,
+                   help="Expand each block's clip box by this many meters per side so adjacent "
+                        "blocks' data overlap and the mosaic has no seams (the per-block grid is "
+                        "inset ~14 m on far edges). 0 reproduces the old gapped behavior.")
     p.add_argument("--mc-passes", type=int, nargs="+", default=[1, 20],
                    help="MC passes per block (deterministic + uncertainty).")
     p.add_argument("--threads", type=int, default=4, help="H5-build workers per block.")
