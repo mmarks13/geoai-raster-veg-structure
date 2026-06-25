@@ -89,6 +89,41 @@ def copy_raw_band(src_band_path, out_path, description):
             dst.set_band_description(1, description)
 
 
+def build_combined_raster(priority_path, per_band_dir, out_path):
+    """Single multiband COG with everything: priority + tier + the 3 raw measures.
+
+    This is the one file to load and share in ArcGIS/QGIS. Band descriptions are
+    embedded so each band is self-labeling. All inputs share the same 2 m grid.
+    """
+    measures = [
+        ("canopy_cover", "Canopy cover: fraction of returns above 3 m (0-1)"),
+        ("midstory_density", "Mid-story density: proportion of vegetation returns 1-3 m (0-1)"),
+        ("fhd", "Foliage height diversity (context; not used in priority)"),
+    ]
+    with rasterio.open(priority_path) as src:
+        priority = src.read(1).astype(np.float32)
+        tier = src.read(2).astype(np.float32)
+        prof = _cog_profile(src.profile, count=2 + len(measures))
+        shape = priority.shape
+
+    bands = [
+        ("Fuel-treatment priority (0-1; within-forest percentile; 1=highest)", priority),
+        (f"Treatment tier (1-{N_TIERS}; {N_TIERS}=highest-priority 20% of forest)", tier),
+    ]
+    for stem, desc in measures:
+        with rasterio.open(os.path.join(per_band_dir, f"{stem}.tif")) as m:
+            data = m.read(1).astype(np.float32)
+        if data.shape != shape:
+            raise ValueError(f"Grid mismatch: {stem} {data.shape} != priority {shape}")
+        bands.append((desc, data))
+
+    with rasterio.open(out_path, "w", **prof) as dst:
+        for i, (desc, data) in enumerate(bands, start=1):
+            dst.write(data, i)
+            dst.set_band_description(i, desc)
+    return len(bands)
+
+
 def make_overview_png(priority_path, png_path):
     """Quick-look priority map with tier legend; downsampled so it opens fast."""
     import matplotlib
@@ -194,6 +229,14 @@ this metric is about crown-fire treatment in forest, not shrubland conversion.
 
 ## Files
 
+**Start here — one file has everything:**
+
+| File | Contents |
+|------|----------|
+| `Laguna_fuel_priority_and_structure.tif` | **all 5 bands in one — load/share this.** band 1 priority (0–1), band 2 tier (1–5), band 3 canopy cover, band 4 mid-story density, band 5 FHD |
+
+The same layers are also provided as separate single-band files if you prefer:
+
 | File | Contents |
 |------|----------|
 | `Laguna_fuel_treatment_priority.tif` | band 1 priority (0–1), band 2 tier (1–5) |
@@ -203,7 +246,7 @@ this metric is about crown-fire treatment in forest, not shrubland conversion.
 | `Laguna_fuel_treatment_priority_overview.png` | quick-look map (no GIS needed) |
 
 All rasters: GeoTIFF (COG), 2 m pixels, EPSG:32611, NoData = NaN. Opens in
-QGIS/ArcGIS; band descriptions are embedded.
+QGIS/ArcGIS; band descriptions are embedded (each band is self-labeling).
 
 ## Method parameters (for the record)
 
@@ -243,6 +286,10 @@ def main():
         dst = os.path.join(args.out_dir, out_name)
         copy_raw_band(src, dst, desc)
         print(f"raw band -> {dst}")
+
+    combined_path = os.path.join(args.out_dir, "Laguna_fuel_priority_and_structure.tif")
+    n_bands = build_combined_raster(prio_path, args.per_band_dir, combined_path)
+    print(f"combined  -> {combined_path}  ({n_bands}-band: priority, tier, canopy, mid-story, FHD)")
 
     png_path = os.path.join(args.out_dir, "Laguna_fuel_treatment_priority_overview.png")
     make_overview_png(prio_path, png_path)
