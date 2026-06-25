@@ -1700,6 +1700,10 @@ def process_bbox(args):
     tile_properties = args[19] if len(args) > 19 else None
     fuel_metrics_raster = args[20] if len(args) > 20 else None
     target_raster_map = args[21] if len(args) > 21 else None
+    # When True, missing 3DEP HAG / geometry dimensions are a hard error rather than
+    # being silently filled with neutral values. Used for inference / map products,
+    # where a defaulted attribute would corrupt the output (see process_bbox extraction).
+    strict_attributes = args[22] if len(args) > 22 else False
 
     # Resolve target raster path from map if provided
     target_raster_path = None
@@ -1836,25 +1840,44 @@ def process_bbox(args):
             return None
         
         # For the 3DEP data, we concatenate the returned arrays
-        # Use HeightAboveGround (HAG) if available, otherwise fall back to Z
+        # Use HeightAboveGround (HAG) if available, otherwise fall back to Z.
+        # In strict_attributes mode (inference / map products) a missing HAG dimension
+        # is a hard error: silently substituting raw Z would mix terrain elevation into
+        # a height-above-ground model input and produce a corrupt map.
         def _get_z_coordinate(p):
             """Get Z coordinate: use HAG if available, otherwise raw Z."""
             if 'HeightAboveGround' in p.dtype.names:
                 return p['HeightAboveGround']
-            else:
-                return p['Z']
+            if strict_attributes:
+                raise ValueError(
+                    f"Tile {tile_id}: 3DEP point cloud is missing 'HeightAboveGround'. "
+                    f"Run the 3DEP HAG pipeline (scripts/process_3dep_hag_features.sh) so the "
+                    f"COPC carries HAG before building inference/map tiles. "
+                    f"Available dimensions: {p.dtype.names}"
+                )
+            return p['Z']
 
         xyz_dep = np.vstack([np.column_stack((p['X'], p['Y'], _get_z_coordinate(p))) for p in dep_pc]).astype(np.float64)
 
-        # Helper function for extracting attributes with neutral fallback values
+        # Helper function for extracting attributes with neutral fallback values.
+        # In strict_attributes mode a missing dimension is a hard error (a defaulted
+        # geometry attribute would silently degrade the model input); per-point NaNs
+        # within a present dimension are still replaced with the neutral value, since
+        # those are genuine degenerate-neighborhood eigenvalue results, not a pipeline gap.
         def _extract_with_neutral_fallback(arr, dim_name, neutral_val):
             """Extract dimension with neutral value fallback for NaN/missing."""
             if dim_name in arr.dtype.names:
                 data = arr[dim_name].astype(np.float32)
                 return np.where(np.isnan(data), neutral_val, data)
-            else:
-                # Return array of neutral values if dimension is missing
-                return np.full(len(arr), neutral_val, dtype=np.float32)
+            if strict_attributes:
+                raise ValueError(
+                    f"Tile {tile_id}: 3DEP point cloud is missing geometry dimension "
+                    f"'{dim_name}'. Run the 3DEP HAG + covariance-features pipeline so the "
+                    f"COPC carries Planarity/Sphericity/Verticality before building "
+                    f"inference/map tiles. Available dimensions: {arr.dtype.names}"
+                )
+            # Return array of neutral values if dimension is missing
+            return np.full(len(arr), neutral_val, dtype=np.float32)
 
         # Combine point attributes for 3DEP data
         # 6 attributes: Intensity, ReturnNumber, NumberOfReturns,
@@ -2129,7 +2152,8 @@ def process_chunk(
     skip_uav_lidar=False,
     dep_stac_source=None,
     fuel_metrics_raster=None,
-    target_raster_map=None
+    target_raster_map=None,
+    strict_attributes=False
 ):
     """
     Process a single chunk of tiles and save results as HDF5 files.
@@ -2141,7 +2165,7 @@ def process_chunk(
     # Prepare arguments for parallel processing, including voxel downsampling parameters
     args_list = [
         (i, tile_id, bbox, start_date, end_date, lidar_stac_source, bbox_crs, max_api_retries, initial_retry_delay,
-         current_tile_index + i, total_tiles, verbose, uavsar_stac_source, naip_stac_source, initial_voxel_size_cm, max_points_list, min_uav_points, skip_uav_lidar, dep_stac_source, tile_properties, fuel_metrics_raster, target_raster_map)
+         current_tile_index + i, total_tiles, verbose, uavsar_stac_source, naip_stac_source, initial_voxel_size_cm, max_points_list, min_uav_points, skip_uav_lidar, dep_stac_source, tile_properties, fuel_metrics_raster, target_raster_map, strict_attributes)
         for i, (tile_id, bbox, tile_properties) in enumerate(chunk, start=1)
     ]
     
@@ -2425,7 +2449,8 @@ def process_tiles_from_geojson(
     dep_stac_source=None,
     fuel_metrics_raster=None,
     target_raster_map=None,
-    resume=False
+    resume=False,
+    strict_attributes=False
 ):
     """
     Process LiDAR and imagery data using pre-defined tiles from a GeoJSON file.
@@ -2512,8 +2537,12 @@ def process_tiles_from_geojson(
         bbox = [geom.bounds[0], geom.bounds[1], geom.bounds[2], geom.bounds[3]]
         tile_bounding_boxes.append(bbox)
 
-        # Use ID field if available, otherwise use index
-        tile_id = row.get('id', idx)
+        # Use the stable tile_id from the grid helper if present, then a generic
+        # 'id' column, otherwise fall back to the positional index. The forest-plot
+        # tile-grid helper emits a 'tile_id' column (e.g. "<site>_<i>_<j>"); without
+        # this lookup it would be dropped to an integer index, breaking resume and
+        # output naming.
+        tile_id = row.get('tile_id', row.get('id', idx))
         tile_ids.append(tile_id)
 
         # Extract properties (convert to dict, exclude geometry)
@@ -2597,7 +2626,8 @@ def process_tiles_from_geojson(
             skip_uav_lidar,
             dep_stac_source,
             fuel_metrics_raster,
-            target_raster_map
+            target_raster_map,
+            strict_attributes=strict_attributes
         )
 
         # Give the system a moment to recover between chunks
@@ -2677,7 +2707,8 @@ def process_tiles_from_geojson(
                 skip_uav_lidar,
                 dep_stac_source,
                 fuel_metrics_raster,
-                target_raster_map
+                target_raster_map,
+                strict_attributes=strict_attributes
             )
 
             # Give the system more time to recover between retry chunks
@@ -2892,6 +2923,14 @@ if __name__ == "__main__":
         help="Resume from a previous run by skipping tiles already in existing H5 chunk files in outdir"
     )
 
+    parser.add_argument(
+        "--strict-attributes",
+        action="store_true",
+        help="Fail hard if a tile's 3DEP point cloud is missing HeightAboveGround or the "
+             "Planarity/Sphericity/Verticality geometry dimensions, instead of silently "
+             "substituting raw Z / neutral values. Use for inference / map products."
+    )
+
     args = parser.parse_args()
 
     # Parse target raster map if provided
@@ -2924,5 +2963,6 @@ if __name__ == "__main__":
         dep_stac_source=args.dep_stac_source,
         fuel_metrics_raster=args.fuel_metrics_raster,
         target_raster_map=target_raster_map,
-        resume=args.resume
+        resume=args.resume,
+        strict_attributes=args.strict_attributes
     )

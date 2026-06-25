@@ -21,6 +21,28 @@ bash scripts/evaluate_forest_plots.sh \
 
 Laguna has no UAVSAR — the model handles this via graceful degradation at inference (skips the UAVSAR fusion branch when `uavsar=None`).
 
+## Polygon → map → fuel-treatment priority
+
+End-to-end map production for an arbitrary AOI, layered on the forest-plot inference path above.
+
+- `predict_polygon.py` — orchestrates the full chain for one AOI polygon (reproject to EPSG:32611, tile grid, NAIP + 3DEP fetch, H5 build, MC-dropout inference, mosaic) into a vegetation-structure map. Writes a per-AOI `OUTPUT_README.md`.
+- `predict_polygon_blocks.py` — block-tiled runner for large AOIs: splits the polygon into ~1 km blocks (edge-to-edge with overlap to avoid mosaic seams), runs `predict_polygon.py` per block across GPUs, and mosaics the result. Resumable. `run_laguna.sh` (repo root) is an idempotent, self-resuming launcher for the full Laguna run.
+- `fuel_treatment_priority.py` — combines the three predicted structure bands (canopy cover, mid-story density, FHD) into a crown-fire fuel-treatment priority index: canopy crown-fuel × ladder boost × neighborhood fuel continuity, percentile-ranked within forest. Reads the mosaic, writes a multi-band `fuel_priority.tif`.
+- `build_laguna_handoff.py` — assembles the shareable deliverable from `fuel_priority.tif` + the raw band mosaic: a continuous + 1–5 tiered priority raster, the raw structure COGs, an overview PNG, and a plain-language README.
+
+```bash
+# Full-AOI map (block-tiled, resumable)
+bash run_laguna.sh        # wraps: python src/evaluation/predict_polygon_blocks.py --polygon <AOI> ...
+
+# Fuel-treatment priority index from the mosaic
+python src/evaluation/fuel_treatment_priority.py
+
+# Package the deliverable
+python src/evaluation/build_laguna_handoff.py
+```
+
+Outputs land under `data/output/polygon_predictions/<NAME>/` (gitignored — regenerate from these scripts).
+
 ## Historical: point cloud upsampling (published)
 
 - `inference_eval.py` — model inference on the point-cloud test set; Chamfer distance metrics.

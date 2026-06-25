@@ -1,0 +1,27 @@
+{
+  "name": "veg_structure_ood_2band_density",
+  "description": "2-band (canopy_density, midstory_density) OOD config for image encoder pretraining — aligned with target_band_indices=[4, 5]",
+  "stats_file": "data/processed/model_data_veg_structure/target_raster_normalization_stats_train.json",
+  "bands": [
+    {
+      "output_index": 0,
+      "name": "canopy_density",
+      "display_name": "Canopy Density",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "TreeCover",
+      "field_units": "percent"
+    },
+    {
+      "output_index": 1,
+      "name": "midstory_density",
+      "display_name": "Mid-story Density",
+      "model_units": "fraction",
+      "display_units": "percent",
+      "unit_conversion_factor": 100.0,
+      "field_column": "ShrubCover",
+      "field_units": "percent"
+    }
+  ]
+}

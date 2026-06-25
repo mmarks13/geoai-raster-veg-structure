@@ -15,6 +15,7 @@ import logging
 from shapely.geometry import box, shape, mapping
 from shapely.ops import transform
 import pystac_client
+from pystac_client.exceptions import APIError
 import planetary_computer
 import rioxarray
 import pystac
@@ -174,7 +175,42 @@ def process_item(item, aoi_polygon, output_dir, stac_catalog, retry_count=3, ret
                 logger.error(f"Failed to process item {item.id} after {retry_count} attempts.")
                 return False
 
-def process_bbox(aoi_coords, date_range, output_dir, stac_catalog, catalog_client):
+def search_items_with_retry(catalog_client, aoi_polygon, date_range,
+                            retry_count=5, retry_delay=5):
+    """Run the Planetary Computer STAC search, retrying transient API failures.
+
+    The PC STAC endpoint intermittently returns timeouts ("The request exceeded the
+    maximum allowed time") or other transient HTTP errors. Without retry these bubble
+    up and fail the whole AOI/block. We retry the query (and the lazy item fetch) with
+    exponential backoff, re-raising only after the attempts are exhausted.
+    """
+    attempt = 0
+    while True:
+        try:
+            search = catalog_client.search(
+                collections=["naip"],
+                intersects={
+                    "type": "Polygon",
+                    "coordinates": [list(aoi_polygon.exterior.coords)]
+                },
+                datetime=date_range,
+                limit=100,  # adjust if needed
+            )
+            # list() forces the lazy query to execute — this is where APIError raises.
+            return list(search.items())
+        except APIError as e:
+            attempt += 1
+            if attempt > retry_count:
+                logger.error(f"NAIP STAC search failed after {retry_count} retries: {e}")
+                raise
+            sleep_s = retry_delay * (2 ** (attempt - 1))  # exponential backoff
+            logger.warning(f"NAIP STAC search transient error (attempt {attempt}/{retry_count}); "
+                           f"retrying in {sleep_s}s: {e}")
+            time.sleep(sleep_s)
+
+
+def process_bbox(aoi_coords, date_range, output_dir, stac_catalog, catalog_client,
+                 retry_count=5, retry_delay=5):
     """
     Processes a single bounding box by:
       - Constructing the AOI polygon (in EPSG:4326).
@@ -189,17 +225,11 @@ def process_bbox(aoi_coords, date_range, output_dir, stac_catalog, catalog_clien
     aoi_polygon = box(aoi_coords[0], aoi_coords[1], aoi_coords[2], aoi_coords[3])
     logger.info(f"\nSearching for NAIP imagery intersecting bounding box {aoi_coords} and date range {date_range}...")
 
-    # Query the API for NAIP imagery intersecting the AOI and date range.
-    search = catalog_client.search(
-        collections=["naip"],
-        intersects={
-            "type": "Polygon",
-            "coordinates": [list(aoi_polygon.exterior.coords)]
-        },
-        datetime=date_range,
-        limit=100  # adjust if needed
+    # Query the API for NAIP imagery (retries transient PC API timeouts).
+    items = search_items_with_retry(
+        catalog_client, aoi_polygon, date_range,
+        retry_count=retry_count, retry_delay=retry_delay
     )
-    items = list(search.items())
     if not items:
         logger.info("No NAIP imagery found for this bounding box and date range.")
         return
@@ -207,13 +237,14 @@ def process_bbox(aoi_coords, date_range, output_dir, stac_catalog, catalog_clien
     # Process each returned item, continuing even if some fail
     successful_items = 0
     failed_items = 0
-    
+
     for item in items:
-        if process_item(item, aoi_polygon, output_dir, stac_catalog):
+        if process_item(item, aoi_polygon, output_dir, stac_catalog,
+                        retry_count=retry_count, retry_delay=retry_delay):
             successful_items += 1
         else:
             failed_items += 1
-    
+
     logger.info(f"Processed {len(items)} items: {successful_items} successful, {failed_items} failed.")
 
 def main():
@@ -252,14 +283,15 @@ def main():
     parser.add_argument(
         "--retry",
         type=int,
-        default=3,
-        help="Number of retry attempts for failed downloads."
+        default=5,
+        help="Number of retry attempts for transient Planetary Computer API failures "
+             "(search query and per-item downloads)."
     )
     parser.add_argument(
         "--retry-delay",
         type=int,
         default=5,
-        help="Delay in seconds between retry attempts."
+        help="Base delay in seconds between retry attempts (exponential backoff)."
     )
     args = parser.parse_args()
 
@@ -269,18 +301,31 @@ def main():
     # Create the ISO8601 date range string.
     date_range = f"{args.start}/{args.end}"
 
-    # Open the Planetary Computer STAC API client.
-    catalog_client = pystac_client.Client.open(
-        "https://planetarycomputer.microsoft.com/api/stac/v1",
-        modifier=planetary_computer.sign_inplace,
-    )
+    # Open the Planetary Computer STAC API client (retry transient open failures).
+    catalog_client = None
+    for attempt in range(1, args.retry + 1):
+        try:
+            catalog_client = pystac_client.Client.open(
+                "https://planetarycomputer.microsoft.com/api/stac/v1",
+                modifier=planetary_computer.sign_inplace,
+            )
+            break
+        except APIError as e:
+            if attempt >= args.retry:
+                logger.error(f"Could not open Planetary Computer STAC client after {args.retry} tries: {e}")
+                raise
+            sleep_s = args.retry_delay * (2 ** (attempt - 1))
+            logger.warning(f"PC client open transient error (attempt {attempt}/{args.retry}); "
+                           f"retrying in {sleep_s}s: {e}")
+            time.sleep(sleep_s)
 
     # Load an existing catalog or create a new one.
     stac_catalog = load_or_create_catalog(args.output)
 
     # Process each bounding box.
     for bbox_coords in args.bbox:
-        process_bbox(bbox_coords, date_range, args.output, stac_catalog, catalog_client)
+        process_bbox(bbox_coords, date_range, args.output, stac_catalog, catalog_client,
+                     retry_count=args.retry, retry_delay=args.retry_delay)
 
     # Save the updated catalog.
     stac_catalog.normalize_and_save(args.output, catalog_type=CatalogType.SELF_CONTAINED)
