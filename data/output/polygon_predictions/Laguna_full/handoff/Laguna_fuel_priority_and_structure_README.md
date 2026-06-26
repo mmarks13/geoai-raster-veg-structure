@@ -73,18 +73,6 @@ terrain (slope, aspect, position on slope); weather and wind; surface and
 dead-and-down fuels; live fuel moisture; fire and treatment history; ignition
 likelihood and access; values at risk (communities, infrastructure, watersheds);
 land ownership and management constraints; and treatment cost or feasibility.
-Use it **alongside** local knowledge and operational judgment, not in place of them.
-
-## Please also keep in mind
-
-- **Relative, not absolute.** A Tier 5 here is not comparable to a Tier 5 from
-  another project area.
-- **Modeled, not field-measured.** Structure is predicted from public inputs, not
-  field cruise data. Expect error at the pixel level — **read it at stand scale,
-  not single 2 m pixels.**
-- **Ladder fuel is the weakest ingredient.** Airborne LiDAR sees poorly *under* a
-  closed canopy, so treat that contribution as a nudge, not a measurement.
-- **The 25 % "forest" cutoff is a choice;** moving it changes what gets ranked.
 
 ## Format
 
