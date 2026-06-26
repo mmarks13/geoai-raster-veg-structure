@@ -1,20 +1,20 @@
-# Laguna Fuel-Treatment Priority — Data Note (draft)
+# Laguna Fuel-Treatment Priority: Data Note (draft)
 
 _Prepared 2026-06-25_
 
-**File:** `Laguna_fuel_priority_and_structure.tif` — a single multiband GeoTIFF.
+**File:** `Laguna_fuel_priority_and_structure.tif`, a single multiband GeoTIFF.
 
 ## What this is
 
 A map of **where to focus fuel-treatment effort** to reduce crown-fire potential
 across the Laguna project area, together with the underlying vegetation-structure
-measures it is built from — all in one file. It is a **relative, structure-based
+measures it is built from, all in one file. It is a **relative, structure-based
 prioritization (a planning aid), not a calibrated fire-behavior model.** Values
 rank locations against each other *within this project area only.*
 
 **Please read this up front:** this is **my best current estimate of treatment
 priority given the data I have right now, and it is based on vegetation structure
-alone.** It is one input to inform planning, not a standalone decision — see
+alone.** It is one input to inform planning, not a standalone decision. See
 *What this does and doesn't account for* below.
 
 ## How this was made: training data → predicted bands → priority
@@ -22,15 +22,15 @@ alone.** It is one input to inform planning, not a standalone decision — see
 The end-to-end flow:
 
 > **dense drone-LiDAR "ground truth" + public 3DEP LiDAR & NAIP imagery → trained
-> model → three predicted structure bands → combined into the priority ranking**
+> model → two predicted structure bands → combined into the priority ranking**
 
 1. **Training (done once, at other sites).** At locations flown with dense,
    drone-mounted LiDAR, a machine-learning model learned how fine-scale canopy
    structure relates to two cheap, widely available inputs: sparse public USGS
    3DEP LiDAR and high-resolution NAIP aerial imagery (sub-meter, color +
    near-infrared).
-2. **Prediction (here, at Laguna).** Using *only* those public inputs — no drone
-   LiDAR exists for Laguna — the model predicts three vegetation-structure metrics
+2. **Prediction (here, at Laguna).** Using *only* those public inputs (no drone
+   LiDAR exists for Laguna), the model predicts two vegetation-structure metrics
    on a 2 m grid, following the standardized framework of Moudrý et al. (2023):
    **canopy cover** (fraction of returns above 3 m) and **mid-story density**
    (proportion of vegetation returns between 1–3 m). These are bands 3–4 in the
@@ -38,21 +38,21 @@ The end-to-end flow:
 3. **Priority (here).** The predicted bands are combined into the priority
    (bands 1–2): a location ranks high where there is **enough canopy** to carry a
    crown fire, a **mid-story ladder** into that canopy, and **continuous fuel** in
-   the surrounding ~40 m — as canopy or as dense brush. A closed canopy with no
-   ladder still ranks, just below canopy-plus-ladder.
+   the surrounding ~40 m, whether as canopy or as dense brush. A closed canopy with
+   no ladder still ranks, just below canopy-plus-ladder.
 
 ## The four bands
 
-The file is self-labeling — each band carries its description, so it names itself
+The file is self-labeling: each band carries its description, so it names itself
 when loaded in ArcGIS or QGIS.
 
-1. **Fuel-treatment priority (0–1)** — a within-forest percentile. **0.90 means
+1. **Fuel-treatment priority (0–1)**: a within-forest percentile. **0.90 means
    higher priority than 90 % of the forested area.** Pick your own
    "treat-the-worst-X %" cutoff.
-2. **Treatment tier (1–5)** — equal fifths of the forest; **Tier 5 = the
+2. **Treatment tier (1–5)**: equal fifths of the forest; **Tier 5 = the
    highest-priority 20 %.** For quick triage.
-3. **Canopy cover (0–1)** — fraction of returns above 3 m (overstory cover).
-4. **Mid-story density (0–1)** — proportion of *vegetation* returns 1–3 m (the
+3. **Canopy cover (0–1)**: fraction of returns above 3 m (overstory cover).
+4. **Mid-story density (0–1)**: proportion of *vegetation* returns 1–3 m (the
    ladder layer).
 
 Bands 1–2 are populated **only where there is forest** (canopy cover ≥ 25 %); open
@@ -60,7 +60,7 @@ ground, meadow, and shrub-only areas are left blank, because this metric is abou
 crown-fire treatment *in forest*. Bands 3–4 are populated across the whole area.
 About **3,800 acres** of forest are ranked.
 
-## What this does — and doesn't — account for
+## What this does and doesn't account for
 
 The priority reflects **vegetation structure only.** It deliberately does **not**
 (yet) account for many things that also drive real treatment decisions, including:
