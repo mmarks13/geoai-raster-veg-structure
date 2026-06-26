@@ -2,27 +2,49 @@
 
 _Prepared 2026-06-25_
 
-**File:** `Laguna_fuel_priority_and_structure.tif`, a single multiband GeoTIFF.
+## Summary (read this first)
 
-## What this is
+`Laguna_fuel_priority_and_structure.tif` is a single multiband GeoTIFF that maps
+**where to focus fuel-treatment effort** to reduce crown-fire potential across the
+Laguna project area. **This is my best current estimate of priority given the data
+I have right now, and it is based on vegetation structure alone.** Use it as one
+planning input, not a standalone decision.
+
+Read it with **band 1, fuel-treatment priority (0–1)**: a ranking within forested
+area, where 0.90 means higher priority than 90 % of the forest. **Band 2 is that
+same ranking binned into 1–5 tiers** (Tier 5 is the highest-priority fifth of
+forest) for quick triage. A place ranks high when it has enough canopy to carry a
+crown fire, a mid-story "ladder" into that canopy, and continuous fuel around it.
+The two structure measures behind the ranking are included as well: **band 3,
+canopy cover**, and **band 4, mid-story density**.
+
+Priority and tiers (bands 1 and 2) are filled in **only where there is forest**
+(canopy cover ≥ 25 %); open ground, meadow, and shrub-only areas are left blank.
+About **3,800 acres** of forest are ranked.
+
+To open it: a Cloud-Optimized GeoTIFF at 2 m resolution in EPSG:32611 (UTM Zone
+11N), ready for ArcGIS Pro, ArcGIS Online, or QGIS, with each band self-labeling.
+
+---
+
+## Details
+
+### What this is
 
 A map of **where to focus fuel-treatment effort** to reduce crown-fire potential
 across the Laguna project area, together with the underlying vegetation-structure
-measures it is built from, all in one file. It is a **relative, structure-based
-prioritization (a planning aid), not a calibrated fire-behavior model.** Values
-rank locations against each other *within this project area only.*
+measures it is built from, all in one file. It is a **relative prioritization (a
+planning aid), not a calibrated fire-behavior model.** Values rank locations
+against each other *within this project area only.*
 
 **Please read this up front:** this is **my best current estimate of treatment
 priority given the data I have right now, and it is based on vegetation structure
 alone.** It is one input to inform planning, not a standalone decision. See
 *What this does and doesn't account for* below.
 
-## How this was made: training data → predicted bands → priority
+### How this was made: training data → predicted bands → priority
 
-The end-to-end flow:
-
-> **dense drone-LiDAR "ground truth" + public 3DEP LiDAR & NAIP imagery → trained
-> model → two predicted structure bands → combined into the priority ranking**
+The product comes together in three stages:
 
 1. **Training (done once, at other sites).** At locations flown with dense,
    drone-mounted LiDAR, a machine-learning model learned how fine-scale canopy
@@ -41,7 +63,7 @@ The end-to-end flow:
    the surrounding ~40 m, whether as canopy or as dense brush. A closed canopy with
    no ladder still ranks, just below canopy-plus-ladder.
 
-## The four bands
+### The four bands
 
 The file is self-labeling: each band carries its description, so it names itself
 when loaded in ArcGIS or QGIS.
@@ -60,7 +82,7 @@ ground, meadow, and shrub-only areas are left blank, because this metric is abou
 crown-fire treatment *in forest*. Bands 3–4 are populated across the whole area.
 About **3,800 acres** of forest are ranked.
 
-## What this does and doesn't account for
+### What this does and doesn't account for
 
 The priority reflects **vegetation structure only.** It deliberately does **not**
 (yet) account for many things that also drive real treatment decisions, including:
@@ -69,7 +91,7 @@ dead-and-down fuels; live fuel moisture; fire and treatment history; ignition
 likelihood and access; values at risk (communities, infrastructure, watersheds);
 land ownership and management constraints; and treatment cost or feasibility.
 
-## Format
+### Format
 
 GeoTIFF (Cloud-Optimized), **2 m pixels, EPSG:32611 (UTM Zone 11N)**, NoData = NaN.
 Opens directly in ArcGIS Pro, ArcGIS Online, and QGIS. To symbolize: use **band 1**
