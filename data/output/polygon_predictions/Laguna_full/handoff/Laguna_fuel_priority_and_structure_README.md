@@ -32,19 +32,16 @@ The end-to-end flow:
 2. **Prediction (here, at Laguna).** Using *only* those public inputs — no drone
    LiDAR exists for Laguna — the model predicts three vegetation-structure metrics
    on a 2 m grid, following the standardized framework of Moudrý et al. (2023):
-   **canopy cover** (fraction of returns above 3 m), **mid-story density**
-   (proportion of vegetation returns between 1–3 m), and **foliage height
-   diversity** (Shannon–Wiener diversity of returns across 0–25 m height layers).
-   These are bands 3–5 in the file.
+   **canopy cover** (fraction of returns above 3 m) and **mid-story density**
+   (proportion of vegetation returns between 1–3 m). These are bands 3–4 in the
+   file.
 3. **Priority (here).** The predicted bands are combined into the priority
    (bands 1–2): a location ranks high where there is **enough canopy** to carry a
    crown fire, a **mid-story ladder** into that canopy, and **continuous fuel** in
    the surrounding ~40 m — as canopy or as dense brush. A closed canopy with no
-   ladder still ranks, just below canopy-plus-ladder. (Foliage height diversity is
-   carried for context but not used in the priority — it tracks canopy cover too
-   closely to add independent signal.)
+   ladder still ranks, just below canopy-plus-ladder.
 
-## The five bands
+## The four bands
 
 The file is self-labeling — each band carries its description, so it names itself
 when loaded in ArcGIS or QGIS.
@@ -57,12 +54,10 @@ when loaded in ArcGIS or QGIS.
 3. **Canopy cover (0–1)** — fraction of returns above 3 m (overstory cover).
 4. **Mid-story density (0–1)** — proportion of *vegetation* returns 1–3 m (the
    ladder layer).
-5. **Foliage height diversity** — vertical layering. Context only; not used in the
-   priority.
 
 Bands 1–2 are populated **only where there is forest** (canopy cover ≥ 25 %); open
 ground, meadow, and shrub-only areas are left blank, because this metric is about
-crown-fire treatment *in forest*. Bands 3–5 are populated across the whole area.
+crown-fire treatment *in forest*. Bands 3–4 are populated across the whole area.
 About **3,800 acres** of forest are ranked.
 
 ## What this does — and doesn't — account for

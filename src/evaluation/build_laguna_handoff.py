@@ -6,16 +6,17 @@ project from the model outputs.
 Inputs (already produced upstream):
   - fuel_priority.tif : 6-band index from fuel_treatment_priority.py
                         (band 1 = PRIMARY priority, percentile-ranked within forest)
-  - mean_mc20.tif / per_band_mc20/ : the 3 raw model structure bands
-                        (canopy cover, mid-story density, FHD)
+  - per_band_mc20/ : the raw model structure bands. This package uses canopy cover
+                     and mid-story density (the model also predicts FHD, but it is
+                     deliberately excluded from the deliverable as redundant).
 
 Outputs (written to <out-dir>, default .../Laguna_full/handoff/):
-  - Laguna_fuel_treatment_priority.tif : 2 bands
-        band 1 = priority (0-1, within-forest percentile)
-        band 2 = treatment tier (1-5; 5 = highest-priority 20% of forest)
+  - Laguna_fuel_priority_and_structure.tif : the single shareable file, 4 bands
+        band 1 = priority (0-1), band 2 = tier (1-5),
+        band 3 = canopy cover, band 4 = mid-story density
+  - Laguna_fuel_treatment_priority.tif : 2 bands (priority + tier)
   - Laguna_canopy_cover.tif        : raw model band, fraction 0-1
   - Laguna_midstory_density.tif    : raw model band, fraction 0-1
-  - Laguna_fhd.tif                 : raw model band, foliage height diversity
   - Laguna_fuel_treatment_priority_overview.png : quick-look map (no GIS needed)
   - README.md                      : one-page plain-language explainer
 
@@ -90,7 +91,7 @@ def copy_raw_band(src_band_path, out_path, description):
 
 
 def build_combined_raster(priority_path, per_band_dir, out_path):
-    """Single multiband COG with everything: priority + tier + the 3 raw measures.
+    """Single multiband COG with everything: priority + tier + the 2 raw measures.
 
     This is the one file to load and share in ArcGIS/QGIS. Band descriptions are
     embedded so each band is self-labeling. All inputs share the same 2 m grid.
@@ -98,7 +99,6 @@ def build_combined_raster(priority_path, per_band_dir, out_path):
     measures = [
         ("canopy_cover", "Canopy cover: fraction of returns above 3 m (0-1)"),
         ("midstory_density", "Mid-story density: proportion of vegetation returns 1-3 m (0-1)"),
-        ("fhd", "Foliage height diversity (context; not used in priority)"),
     ]
     with rasterio.open(priority_path) as src:
         priority = src.read(1).astype(np.float32)
@@ -211,9 +211,6 @@ this metric is about crown-fire treatment in forest, not shrubland conversion.
 - **`Laguna_canopy_cover.tif`** — fraction of returns above 3 m (overstory cover), 0–1.
 - **`Laguna_midstory_density.tif`** — proportion of *vegetation* returns between 1–3 m
   (ladder layer), 0–1.
-- **`Laguna_fhd.tif`** — foliage height diversity (vertical layering). Provided for
-  context; **not used** in the priority because it tracks canopy cover almost exactly
-  and adds no independent ladder signal.
 
 ## Honest caveats (please read)
 
@@ -233,7 +230,7 @@ this metric is about crown-fire treatment in forest, not shrubland conversion.
 
 | File | Contents |
 |------|----------|
-| `Laguna_fuel_priority_and_structure.tif` | **all 5 bands in one — load/share this.** band 1 priority (0–1), band 2 tier (1–5), band 3 canopy cover, band 4 mid-story density, band 5 FHD |
+| `Laguna_fuel_priority_and_structure.tif` | **all 4 bands in one — load/share this.** band 1 priority (0–1), band 2 tier (1–5), band 3 canopy cover, band 4 mid-story density |
 
 The same layers are also provided as separate single-band files if you prefer:
 
@@ -242,7 +239,6 @@ The same layers are also provided as separate single-band files if you prefer:
 | `Laguna_fuel_treatment_priority.tif` | band 1 priority (0–1), band 2 tier (1–5) |
 | `Laguna_canopy_cover.tif` | raw model canopy cover (0–1) |
 | `Laguna_midstory_density.tif` | raw model mid-story density (0–1) |
-| `Laguna_fhd.tif` | raw model foliage height diversity |
 | `Laguna_fuel_treatment_priority_overview.png` | quick-look map (no GIS needed) |
 
 All rasters: GeoTIFF (COG), 2 m pixels, EPSG:32611, NoData = NaN. Opens in
@@ -278,8 +274,6 @@ def main():
          "Canopy cover: fraction of returns above 3 m (0-1)"),
         ("midstory_density", "Laguna_midstory_density.tif",
          "Mid-story density: proportion of vegetation returns 1-3 m (0-1)"),
-        ("fhd", "Laguna_fhd.tif",
-         "Foliage height diversity (context only; not used in priority)"),
     ]
     for stem, out_name, desc in raw:
         src = os.path.join(args.per_band_dir, f"{stem}.tif")
@@ -289,7 +283,7 @@ def main():
 
     combined_path = os.path.join(args.out_dir, "Laguna_fuel_priority_and_structure.tif")
     n_bands = build_combined_raster(prio_path, args.per_band_dir, combined_path)
-    print(f"combined  -> {combined_path}  ({n_bands}-band: priority, tier, canopy, mid-story, FHD)")
+    print(f"combined  -> {combined_path}  ({n_bands}-band: priority, tier, canopy, mid-story)")
 
     png_path = os.path.join(args.out_dir, "Laguna_fuel_treatment_priority_overview.png")
     make_overview_png(prio_path, png_path)
