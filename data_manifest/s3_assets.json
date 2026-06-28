@@ -1,0 +1,575 @@
+{
+  "version": 1,
+  "repo": "geoai-raster-veg-structure",
+  "generated_at": "2026-06-27T23:23:55.930354+00:00",
+  "canonical_s3_root_env": "GEOAI_DATA_S3_URI",
+  "assets": [
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/blocks_status.json",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/blocks_status.json",
+      "size": 9014,
+      "sha256": "f9d14b34792a6c0c6b12d787b1f7fb0990044ffd8dd3a36b1555bd25e801a8b7",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/fuel_priority.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/fuel_priority.tif",
+      "size": 202546206,
+      "sha256": "845a947cd037264e3dd6d6e872c375e5e956ba2c1e8cc8a9c427340e38738630",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/Laguna_canopy_cover.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/Laguna_canopy_cover.tif",
+      "size": 63086586,
+      "sha256": "d3aac260a3d0a4ed688082d00891e4bc9807fce1bb0caea5902547e3db1bbd5e",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_priority_and_structure.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_priority_and_structure.tif",
+      "size": 169268857,
+      "sha256": "d43ddffd0d7d24d5b250802407ff204fa190eb4790348d36bf2423a04980e274",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_priority_and_structure_README.md",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_priority_and_structure_README.md",
+      "size": 5014,
+      "sha256": "da6db46ce4f6d445e033fb46eadab0e258486b9b009eecde2bde526b5ea7dda6",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_treatment_priority.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_treatment_priority.tif",
+      "size": 32862323,
+      "sha256": "99ae09604b18561fc24c0f056de1c337a4e4f91969254d30c239e61a0a2faec0",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_treatment_priority_overview.png",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/Laguna_fuel_treatment_priority_overview.png",
+      "size": 1852634,
+      "sha256": "ef0cdd25572837f2c5cc8348d2d52210d67083b5d78c9932062cdb7dcede86d1",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/Laguna_midstory_density.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/Laguna_midstory_density.tif",
+      "size": 61799983,
+      "sha256": "090e47d2bf7ff5d632b7b6eca348d3985c649073f8f316dc87d2be9a79f21002",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/handoff/README.md",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/handoff/README.md",
+      "size": 4051,
+      "sha256": "9f1b6246ffb56b60422bd032d2e67c3116ded89d6b093002e4d536c034ca408b",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/mean_mc1.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/mean_mc1.tif",
+      "size": 186007744,
+      "sha256": "0cacd69b212d88bfd4c9e6cf876d16bc753af1e6cbe19619c3d9a6d5d610b33e",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/mean_mc20.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/mean_mc20.tif",
+      "size": 376484248,
+      "sha256": "8b0b8c3eec3f40dea49a4fb14cd5eb4a1775768dbf2927398cf7f1f7a70f6feb",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc1/canopy_cover.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc1/canopy_cover.tif",
+      "size": 45472482,
+      "sha256": "fd6b863c3cf1ecf3f2bb96f05060dee294d635098c92c0bae8554f42d5a92939",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc1/fhd.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc1/fhd.tif",
+      "size": 45520002,
+      "sha256": "fd5f7df5dee4b08bc8905943f0bc479739b7c83dd532c5e1fe0c42fa59d5abca",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc1/mean_mc1.vrt",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc1/mean_mc1.vrt",
+      "size": 2436,
+      "sha256": "4861e0f2c25d8c17361ff99e8a17d6d7716e9da997c8fc2b09c2a035515f4f6c",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc1/midstory_density.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc1/midstory_density.tif",
+      "size": 45923053,
+      "sha256": "3fef15c9e0b9875049b08fa5d09d1c10f8b33dac6fcd556fa1db4922b2313126",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/canopy_cover.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/canopy_cover.tif",
+      "size": 47074596,
+      "sha256": "2868f36b98cc473070714b5fe8c5f54013e1813dab860cbc4d26eaab0798065c",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/canopy_cover_std.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/canopy_cover_std.tif",
+      "size": 44975759,
+      "sha256": "9e7effd5ca1ee4149c0ad77c597d3dc86a5ff54bb42fc1aac545b9f16fc2522a",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/fhd.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/fhd.tif",
+      "size": 46591050,
+      "sha256": "ec8218cb448cf2916757f26bfbeed9f8e556b72b28db19b773fe70fd995ad88d",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/fhd_std.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/fhd_std.tif",
+      "size": 44847455,
+      "sha256": "5e4c8396609209a0d74e56625fa72faae690b5a73bba24056f4af01a8288f16a",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/mean_mc20.vrt",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/mean_mc20.vrt",
+      "size": 3994,
+      "sha256": "8745d691b4198c4f5a02e26340ee454ae198dfb3d1804f37c9d293f94c245d42",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/midstory_density.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/midstory_density.tif",
+      "size": 46124109,
+      "sha256": "82cdf0899b055739450c3d5d100988257ddf59582d6b7b863b7852b4c8857340",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/polygon_predictions/Laguna_full/per_band_mc20/midstory_density_std.tif",
+      "s3_key": "geoai-raster-veg-structure/data/output/polygon_predictions/Laguna_full/per_band_mc20/midstory_density_std.tif",
+      "size": 45413126,
+      "sha256": "6a6519c500285331ec4ac8b4d52ab3b27a42342bb7f5a2d3e7e422f76d565d41",
+      "bundles": [
+        "laguna_deliverables"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/best_metric.json",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/best_metric.json",
+      "size": 57,
+      "sha256": "fd6b9ffad8baa49c454bcf821fb75fc1043202550d4eaffd88d120f254146a12",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/best_model.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/best_model.pth",
+      "size": 48873689,
+      "sha256": "8c772572b9292692b151604957b0530a18f413be9d19d6ed5be65e0838641265",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_100.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_100.pth",
+      "size": 48873082,
+      "sha256": "3b23ebf8cb85e9ec8f359818206e5a9842a348fa32ed1b60f83ecef5f01f2e02",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_70.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_70.pth",
+      "size": 48872539,
+      "sha256": "04c76c6a750d8486594a12b8530fc6fbb5b6edfb7cfbcbd389c4a0a242d25cd8",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_75.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_75.pth",
+      "size": 48872539,
+      "sha256": "d12d8186c7ddb5be0bb1699fa6414643acdd50afa460c50ee89df7259b1348b2",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_80.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_80.pth",
+      "size": 48872539,
+      "sha256": "b32129f184244c4dbcc7b4b6113d0c06d546a2ee4269bce7ec2451de8da71472",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_85.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_85.pth",
+      "size": 48872539,
+      "sha256": "7167378865e49005e7d77331b02c32c46e0d3a06e21522576c48378432929756",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_90.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_90.pth",
+      "size": 48872539,
+      "sha256": "78c6018f90fe6a79e0a4aeeef47c5798f75f3a33abcfd3231974e1d6da44d05a",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/epoch_95.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/epoch_95.pth",
+      "size": 48872539,
+      "sha256": "147c7b8c8937b08795a746f5788e5be305fbeb05db4d61d54b8e6f916521619f",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/checkpoints/final_model.pth",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/checkpoints/final_model.pth",
+      "size": 48874232,
+      "sha256": "f8cc08d18f3ad120f74287ad8ee5767068fe2a6d59c526749dce6831901fbcb6",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/logs/events.out.tfevents.1776831503.jupyter-mmarks0561-sdsu-edu---d947dbc2.2434244.0",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/logs/events.out.tfevents.1776831503.jupyter-mmarks0561-sdsu-edu---d947dbc2.2434244.0",
+      "size": 2785511,
+      "sha256": "9fb35c37bf02afa3ecc95e067426a4d59b29329f862b87b883882394ada96453",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/training.log",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/training.log",
+      "size": 17302,
+      "sha256": "025988a6ea9e4c7c0fe717ee70e32106c74f29c3040c1257734802beb3198b63",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_3band_naip/training_history.json",
+      "s3_key": "geoai_veg_map/data/output/raster_model_naip_20260422_041816/training_history.json",
+      "size": 3103,
+      "sha256": "e9063eef3596253bd972673afff15b51c0a6e823dc8ffcb81602b51c4f07ac19",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_naip_encoder_d128/checkpoints/best_model.pth",
+      "s3_key": "geoai_veg_map/data/output/naip_encoder_pretrain_d128_20260414_233516/checkpoints/best_model.pth",
+      "size": 25532046,
+      "sha256": "efe577fa76042cbd0d68a9d9fc0ad5ec22cca92bfce6be9ba186480874f08359",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_naip_encoder_d128/checkpoints/epoch_10.pth",
+      "s3_key": "geoai_veg_map/data/output/naip_encoder_pretrain_d128_20260414_233516/checkpoints/epoch_10.pth",
+      "size": 25531686,
+      "sha256": "959f6946a90a054c35b7f6e9799f43ff565d03accd8746d5e5300a46a891a42f",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_naip_encoder_d128/checkpoints/epoch_20.pth",
+      "s3_key": "geoai_veg_map/data/output/naip_encoder_pretrain_d128_20260414_233516/checkpoints/epoch_20.pth",
+      "size": 25531686,
+      "sha256": "2e2515cbcd3c60a16979394ee401345de5f7dadd5304d0a3c199a5a6bda899f6",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_naip_encoder_d128/logs/events.out.tfevents.1776209722.jupyter-mmarks0561-sdsu-edu---d947dbc2.51087.0",
+      "s3_key": "geoai_veg_map/data/output/naip_encoder_pretrain_d128_20260414_233516/logs/events.out.tfevents.1776209722.jupyter-mmarks0561-sdsu-edu---d947dbc2.51087.0",
+      "size": 2173163,
+      "sha256": "50b9b1f7bd6035aa50988f7fb5842764fa775103a377e969755be8786b503963",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/output/pretrained_naip_encoder_d128/training.log",
+      "s3_key": "geoai_veg_map/data/output/naip_encoder_pretrain_d128_20260414_233516/training.log",
+      "size": 12028,
+      "sha256": "cb3039192d71eba601d72ab618bc10b1857d5f34475ae11a7b9631e3b1725ab0",
+      "bundles": [
+        "default",
+        "raster_checkpoints"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/forest_plots_processed.csv",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/forest_plots_processed.csv",
+      "size": 24983,
+      "sha256": "09fab977858fee367dc7f6c054c4af6a0d3a7585f67ec60402da3a86bb38d8ef",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/forest_plots_processed.gpkg",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/forest_plots_processed.gpkg",
+      "size": 131072,
+      "sha256": "07068f7db612f9f4f474870f9124ba40c3c4220f2100f33fb32ef2b561473aea",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/inference_ready/precomputed_forest_plot_tiles_32bit.pt",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/inference_ready/precomputed_forest_plot_tiles_32bit.pt",
+      "size": 21904343860,
+      "sha256": "baec4d6f2804fbe33a2127c8581600865c7f474aa08545f3a2b21637d22b0b1d",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/ood_validation/ood_validation_config.json",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/ood_validation/ood_validation_config.json",
+      "size": 582,
+      "sha256": "64f93ded9454eeb3b25c071dc32338cbd7fc9f2ef41e9d0663b545125b46edbe",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/ood_validation/ood_validation_metadata.json",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/ood_validation/ood_validation_metadata.json",
+      "size": 7939,
+      "sha256": "a7663ff0f0f993f963859e04641657cb6296481c8ab3015db851cdca6a313fce",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/ood_validation/ood_validation_plot_ids.txt",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/ood_validation/ood_validation_plot_ids.txt",
+      "size": 33,
+      "sha256": "820b034d33ba598244380126359f758f9183cd216f966791d632f06f6e5ed970",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/ood_validation/ood_validation_tiles.pt",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/ood_validation/ood_validation_tiles.pt",
+      "size": 99322234,
+      "sha256": "c91209fef22e9a862da4c957892a639839cb8e08da031077e9c84347b0e748d8",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/plot_footprints.gpkg",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/plot_footprints.gpkg",
+      "size": 262144,
+      "sha256": "05759a169c72c2646384285de388fcf440f48736ec3718b1677f35e6778c83c7",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/site_bboxes.txt",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/site_bboxes.txt",
+      "size": 389,
+      "sha256": "958f277bdf7b519b308cfe9c2abcd8854a72ba5f59f9639aa996f36b7981c71e",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/forest_plot_data/site_polygons.gpkg",
+      "s3_key": "geoai_veg_map/data/processed/forest_plot_data/site_polygons.gpkg",
+      "size": 118784,
+      "sha256": "46423ba9f97e8dd0d168852aa00ed7fcd0d2d27a31e9d2323ffbff3d88c3bad1",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/model_data_veg_structure/combined_training_data_veg_structure.pt",
+      "s3_key": "geoai_veg_map/data/processed/model_data_veg_structure/combined_training_data_veg_structure.pt",
+      "size": 5685929686,
+      "sha256": "b9381e3ab2837d44940a8956dbb04ab1364ed0c6a12d7e4a1650a22d1611a31d",
+      "bundles": [
+        "raster_precompute"
+      ]
+    },
+    {
+      "local_path": "data/processed/model_data_veg_structure/coordinate_normalization_stats_train.json",
+      "s3_key": "geoai_veg_map/data/processed/model_data_veg_structure/coordinate_normalization_stats_train.json",
+      "size": 567,
+      "sha256": "dd364c47e9538270747f62e70c58068e26f138eb5875d6ef07f6b7c069423ef8",
+      "bundles": [
+        "default",
+        "raster_training"
+      ]
+    },
+    {
+      "local_path": "data/processed/model_data_veg_structure/precomputed_training_tiles_raster_32bit.pt",
+      "s3_key": "geoai_veg_map/data/processed/model_data_veg_structure/precomputed_training_tiles_raster_32bit.pt",
+      "size": 22536403104,
+      "sha256": "2a813df61b316140e3be8c740c8ac7e7a75e7a7fd4ac953f2956316e0e5fd8cf",
+      "bundles": [
+        "default",
+        "raster_training"
+      ]
+    },
+    {
+      "local_path": "data/processed/model_data_veg_structure/precomputed_validation_tiles_raster_32bit.pt",
+      "s3_key": "geoai_veg_map/data/processed/model_data_veg_structure/precomputed_validation_tiles_raster_32bit.pt",
+      "size": 3870085614,
+      "sha256": "777249c04a69154be8b0dda77eeb4cb48299142cbdd44ac89bf29d272f10ae4d",
+      "bundles": [
+        "default",
+        "raster_training"
+      ]
+    },
+    {
+      "local_path": "data/processed/model_data_veg_structure/target_raster_normalization_stats_train.json",
+      "s3_key": "geoai_veg_map/data/processed/model_data_veg_structure/target_raster_normalization_stats_train.json",
+      "size": 1804,
+      "sha256": "3c20f6d30f411ffcd9107cb27747b44c475dda40d97ccbecc1360fd34d3c83cb",
+      "bundles": [
+        "default",
+        "raster_training"
+      ]
+    },
+    {
+      "local_path": "data/processed/veg_structure_baseline/comparison/baseline_comparison_results.csv",
+      "s3_key": "geoai_veg_map/data/processed/veg_structure_baseline/comparison/baseline_comparison_results.csv",
+      "size": 167819,
+      "sha256": "29d83e265181167cdb7c4ec2399f15a100a4639a63503fdb999d4568a22e8ab4",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/veg_structure_baseline/comparison/baseline_comparison_stats.json",
+      "s3_key": "geoai_veg_map/data/processed/veg_structure_baseline/comparison/baseline_comparison_stats.json",
+      "size": 2191,
+      "sha256": "3d689db82ce7ace81835d5ccd21225bd640611befc76592537b6b0a96483fd73",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/processed/veg_structure_baseline/comparison/baseline_per_site_summary.csv",
+      "s3_key": "geoai_veg_map/data/processed/veg_structure_baseline/comparison/baseline_per_site_summary.csv",
+      "size": 5408,
+      "sha256": "5db4ebe8eb81595b9341506e0364551899dedc1da5fa3b8ad48a4eae52422199",
+      "bundles": [
+        "default",
+        "forest_plot_eval"
+      ]
+    },
+    {
+      "local_path": "data/raw/inference_aoi/LagunaProjectArea.zip",
+      "s3_key": "geoai-raster-veg-structure/data/raw/inference_aoi/LagunaProjectArea.zip",
+      "size": 18960,
+      "sha256": "a502e6e5f77a0e47639a3639e90358af532a5239d1994d2e6060f0e9f43a42b5",
+      "bundles": [
+        "polygon_examples",
+        "laguna_deliverables"
+      ]
+    }
+  ]
+}
